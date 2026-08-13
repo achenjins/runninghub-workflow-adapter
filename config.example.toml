@@ -45,7 +45,7 @@ max_per_user_per_hour = 0
 # [[workflows.items]]
 # name = "动漫生图"
 # workflow_id = "2087492768787685378"
-# instance_type = "Standard"      # Standard 或 Plus
+# instance_type = "Standard"      # Standard / Plus / Ultra
 # region = "overseas"             # overseas=海外(runninghub.ai) / domestic=国内(runninghub.cn)
 # llm_enhance = false             # LLM 扩写开关
 # llm_template_path = ""          # 扩写模板路径（相对插件目录）

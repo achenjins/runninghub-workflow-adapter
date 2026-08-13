@@ -90,7 +90,7 @@ pip install -r runninghub-workflow-adapter/requirements.txt
 |--------|--------|------|
 | `name` | 空 | 工作流显示名称，命令调用用（如 `/跑图 动漫生图 ...`） |
 | `workflow_id` | 空 | RunningHub 工作流 ID |
-| `instance_type` | Standard | 设备类型：`Standard` / `Plus` |
+| `instance_type` | Standard | 设备类型：`Standard` / `Plus` / `Ultra` |
 | `region` | overseas | 区域：`overseas` 国外 / `domestic` 国内，决定用哪个 API |
 | `llm_enhance` | false | 是否先按模板扩写命令文本再传入提示词节点 |
 | `llm_template_path` | 空 | 扩写模板文件路径（相对插件目录，如 `templates/my_template.txt`） |

@@ -272,9 +272,9 @@ class WorkflowItemSection(PluginConfigBase):
         description="RunningHub 工作流 ID",
         json_schema_extra={"label": "工作流 ID", "placeholder": "2087492768787685378"},
     )
-    instance_type: Literal["Standard", "Plus"] = Field(
+    instance_type: Literal["Standard", "Plus", "Ultra"] = Field(
         default="Standard",
-        description="设备类型：Standard 或 Plus",
+        description="设备类型：Standard / Plus / Ultra",
         json_schema_extra={"label": "设备类型"},
     )
     region: Literal["overseas", "domestic"] = Field(

@@ -90,7 +90,7 @@ class RunningHubClient:
         Args:
             node_info_list: 需要覆盖的节点输入列表，如
                 ``[{"nodeId": "353", "fieldName": "prompt", "fieldValue": "..."}]``。
-            instance_type: 设备类型，``Standard`` 或 ``Plus``。
+            instance_type: 设备类型，``Standard`` / ``Plus`` / ``Ultra``。
             workflow_id: 目标工作流 ID；缺省使用客户端配置的工作流。
 
         Returns:
