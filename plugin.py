@@ -1230,6 +1230,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         def _write() -> None:
             if config_path.exists():
                 existing = config_path.read_text(encoding="utf-8")
+                existing = self._strip_root_workflows_array(existing)
                 if existing and not existing.endswith("\n"):
                     existing += "\n"
                 config_path.write_text(existing + block, encoding="utf-8")
@@ -1249,6 +1250,30 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             workflow_name,
             len(nodes),
         )
+
+    @staticmethod
+    def _strip_root_workflows_array(text: str) -> str:
+        """移除根表（首个 [section] 之前）的空 workflows 数组定义。
+
+        WebUI 保存的 config.toml 会在文件顶部写 ``workflows = []``，
+        后续追加 ``[[workflows]]`` 表数组时会与之冲突导致 TOML 解析失败。
+        这里把根表的空数组定义剔除（非空的内联数组保留，避免丢失已有配置）。
+        """
+        lines = text.split("\n")
+        first_section_idx = len(lines)
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                first_section_idx = index
+                break
+        filtered: list[str] = []
+        for index, line in enumerate(lines):
+            if index < first_section_idx:
+                normalized = line.strip().replace(" ", "")
+                if normalized in ("workflows=[]",):
+                    continue
+            filtered.append(line)
+        return "\n".join(filtered)
 
     @staticmethod
     def _detect_input_nodes(workflow_json: dict[str, Any]) -> list[dict[str, str]]:
