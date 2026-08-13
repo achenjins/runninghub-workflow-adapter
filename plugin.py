@@ -847,7 +847,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         waiting_nodes: list[dict[str, Any]],
         collected: list[dict[str, str]],
     ) -> None:
-        """创建交互式收集会话（仅接受该用户的消息），带超时清理。"""
+        """创建交互式收集会话（优先按用户、工具路径回退按会话），带超时清理。"""
+        key = self._session_key(user_id, stream_id)
         session = InputSession(
             user_id=user_id,
             stream_id=stream_id,
@@ -863,12 +864,12 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             ],
             collected=collected,
         )
-        self._input_sessions[user_id] = session
+        self._input_sessions[key] = session
 
         async def _expire() -> None:
             await asyncio.sleep(_INPUT_WAIT_TIMEOUT)
-            if self._input_sessions.get(user_id) is session:
-                self._input_sessions.pop(user_id, None)
+            if self._input_sessions.get(key) is session:
+                self._input_sessions.pop(key, None)
                 if stream_id:
                     try:
                         await self.ctx.send.text("输入等待已超时，本次任务已取消", stream_id)
@@ -877,11 +878,27 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
         session.expire_task = asyncio.create_task(_expire())
 
+    @staticmethod
+    def _session_key(user_id: str, stream_id: str) -> str:
+        """会话键：优先用 user_id（保证群聊中仅触发者可上传），工具路径无 user_id 时退回 stream_id。"""
+        return str(user_id or "").strip() or str(stream_id or "").strip()
+
+    def _find_input_session(self, user_id: str, stream_id: str) -> InputSession | None:
+        """按 user_id 或 stream_id 查找进行中的输入收集会话。"""
+        user_id = str(user_id or "").strip()
+        stream_id = str(stream_id or "").strip()
+        if user_id and user_id in self._input_sessions:
+            return self._input_sessions[user_id]
+        if stream_id and stream_id in self._input_sessions:
+            return self._input_sessions[stream_id]
+        return None
+
     async def _handle_incoming_files(self, user_id: str, stream_id: str, message: dict) -> bool:
         """处理交互式收集中的文件消息，返回是否已消费该消息。"""
-        session = self._input_sessions.get(user_id)
+        session = self._find_input_session(user_id, stream_id)
         if session is None:
             return False
+        key = self._session_key(session.user_id, session.stream_id)
 
         files = self._extract_files_from_message(message)
         if not files:
@@ -897,7 +914,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             self._rebuild_client()
             client = self._client
         if client is None:
-            self._cancel_input_session(user_id)
+            self._cancel_input_session(key)
             return True
 
         for file_type, source in files:
@@ -940,20 +957,19 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             return True
 
         # 收集完成，提交任务
-        await self._submit_collected_session(user_id, stream_id, client, "全部输入已收到，开始运行任务")
+        await self._submit_collected_session(session, key, stream_id, client, "全部输入已收到，开始运行任务")
         return True
 
     async def _submit_collected_session(
         self,
-        user_id: str,
+        session: InputSession,
+        key: str,
         stream_id: str,
         client: RunningHubClient,
         notice: str,
     ) -> None:
         """提交已收集的输入（会话已从 _input_sessions 移除）。"""
-        session = self._input_sessions.pop(user_id, None)
-        if session is None:
-            return
+        self._input_sessions.pop(key, None)
         if session.expire_task is not None:
             session.expire_task.cancel()
         await self.ctx.send.text(notice, stream_id)
@@ -973,15 +989,16 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         skip_remaining: bool = True,
     ) -> bool:
         """跳过剩余文件节点，用已收集的输入直接提交；返回是否已消费该消息。"""
-        session = self._input_sessions.get(user_id)
+        session = self._find_input_session(user_id, stream_id)
         if session is None:
             return False
+        key = self._session_key(session.user_id, session.stream_id)
         client = self._client
         if client is None:
             self._rebuild_client()
             client = self._client
         if client is None:
-            self._cancel_input_session(user_id)
+            self._cancel_input_session(key)
             await self.ctx.send.text("插件客户端未初始化，已取消本次任务", stream_id)
             return True
         skipped = len(session.waiting_nodes)
@@ -991,11 +1008,11 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             )
         else:
             notice = "全部输入已收到，开始运行任务"
-        await self._submit_collected_session(user_id, stream_id, client, notice)
+        await self._submit_collected_session(session, key, stream_id, client, notice)
         return True
 
-    def _cancel_input_session(self, user_id: str) -> None:
-        session = self._input_sessions.pop(user_id, None)
+    def _cancel_input_session(self, key: str) -> None:
+        session = self._input_sessions.pop(key, None)
         if session is not None and session.expire_task is not None:
             session.expire_task.cancel()
 
@@ -1321,14 +1338,19 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     @EventHandler("generic_input_collector", event_type=EventType.ON_MESSAGE)
     async def handle_input_collector(self, **kwargs: Any) -> None:
-        """收集交互式输入会话中的文件消息，并响应跳过/开始等控制词（仅命令触发者有效）。"""
+        """收集交互式输入会话中的文件消息，并响应跳过/开始等控制词。
+
+        会话可按 user_id（命令路径）或 stream_id（工具路径）定位。
+        """
         user_id = str(kwargs.get("user_id") or "")
-        if not user_id or user_id not in self._input_sessions:
-            return
         message = kwargs.get("message")
         if not isinstance(message, dict):
             message = {}
-        stream_id = str(kwargs.get("stream_id") or self._input_sessions[user_id].stream_id or "")
+        stream_id = str(kwargs.get("stream_id") or "")
+        session = self._find_input_session(user_id, stream_id)
+        if session is None:
+            return
+        stream_id = stream_id or session.stream_id
         if self._is_finish_signal(self._extract_text_from_message(message)):
             await self._finish_input_session(user_id, stream_id, skip_remaining=True)
             return
