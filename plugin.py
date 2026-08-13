@@ -1115,8 +1115,12 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     @staticmethod
     def _is_finish_signal(text: str) -> bool:
-        """判断文本是否为"跳过剩余文件、直接开始运行"的触发词。"""
-        normalized = str(text or "").strip().strip("/").strip().lower()
+        """判断文本是否为"跳过剩余文件、直接开始运行"的触发词。
+
+        去掉前导斜杠、中文引号/括号等包裹符后再匹配，兼容「跳过剩余」/『跳过剩余』/（跳过剩余）等写法。
+        """
+        _STRIP = "/「」『』【】()（）[]\"'，。！!?？：: "
+        normalized = str(text or "").strip().strip(_STRIP).lower()
         if not normalized:
             return False
         if normalized in _FINISH_KEYWORDS:
