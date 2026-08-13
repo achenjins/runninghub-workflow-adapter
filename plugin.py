@@ -32,13 +32,13 @@ from maibot_sdk import (
     API,
     Command,
     CONFIG_RELOAD_SCOPE_SELF,
-    EventHandler,
     Field,
+    HookHandler,
     MaiBotPlugin,
     PluginConfigBase,
     Tool,
 )
-from maibot_sdk.types import EventType, ToolParamType, ToolParameterInfo
+from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParamType, ToolParameterInfo
 
 _PLUGIN_DIR = Path(__file__).resolve().parent
 if str(_PLUGIN_DIR) not in sys.path:
@@ -1398,17 +1398,25 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     # ── 命令 / 工具 / API 组件 ────────────────────────────────────
 
-    @EventHandler("generic_input_collector", event_type=EventType.ON_MESSAGE)
-    async def handle_input_collector(self, **kwargs: Any) -> None:
-        """收集交互式输入会话中的文件消息，并响应跳过/开始等控制词。
+    @HookHandler(
+        "chat.receive.before_process",
+        name="generic_input_collector",
+        description="收集交互式输入会话中的文件消息，并响应跳过/开始等控制词",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.EARLY,
+        timeout_ms=60000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def handle_input_collector(self, message: dict | None = None, **kwargs: Any) -> dict | None:
+        """拦截交互式输入会话中的文件/控制词消息（MaiBot 当前版本 ON_MESSAGE 事件已停用，走 Hook 通道）。
 
-        EventHandler 的 kwargs 只含 event_type/message（及可能的 extra_args），
-        user_id/stream_id 需从 message 里取（message_info.user_info.user_id / session_id）。
+        message 为 _session_message_to_dict 序列化后的字典：
+        raw_message 为消息段列表、message_info.user_info.user_id 为用户、session_id 为会话。
         会话可按 user_id（命令路径）或 stream_id（工具路径）定位。
+        命中后返回 {"action": "abort"}，阻止该消息继续进入 LLM。
         """
-        message = kwargs.get("message")
         if not isinstance(message, dict):
-            message = {}
+            return None
         user_id = str(kwargs.get("user_id") or "")
         stream_id = str(kwargs.get("stream_id") or "")
         message_info = message.get("message_info")
@@ -1420,12 +1428,15 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             stream_id = str(message.get("session_id") or message.get("stream_id") or "")
         session = self._find_input_session(user_id, stream_id)
         if session is None:
-            return
+            return None
         stream_id = stream_id or session.stream_id
         if self._is_finish_signal(self._extract_text_from_message(message)):
             await self._finish_input_session(user_id, stream_id, skip_remaining=True)
-            return
-        await self._handle_incoming_files(user_id, stream_id, message)
+            return {"action": "abort"}
+        if self._extract_files_from_message(message):
+            await self._handle_incoming_files(user_id, stream_id, message)
+            return {"action": "abort"}
+        return None
 
     @Command("工作流", description="列出已配置的工作流", pattern=r"^/工作流")
     async def handle_list_workflows(self, **kwargs: Any) -> tuple[bool, str, int]:
