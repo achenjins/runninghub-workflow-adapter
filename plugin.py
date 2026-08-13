@@ -41,7 +41,15 @@ _PLUGIN_DIR = Path(__file__).resolve().parent
 if str(_PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR))
 
-from lib.runninghub_client import RunningHubClient, RunningHubError
+# 热重载兼容：lib 模块可能已在 sys.modules 中缓存旧代码，
+# 每次加载 plugin.py 时强制从磁盘重新加载 lib，确保代码更新随热重载生效。
+import importlib as _importlib
+
+import lib.runninghub_client as _lib_client_module
+
+_lib_client_module = _importlib.reload(_lib_client_module)
+RunningHubClient = _lib_client_module.RunningHubClient
+RunningHubError = _lib_client_module.RunningHubError
 
 __all__ = ["RunningHubGenericPlugin", "create_plugin"]
 
