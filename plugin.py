@@ -1264,6 +1264,23 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 return True, "", 1
 
         self.ctx.logger.info("[识别] 请求 getJsonApiFormat: workflow_id=%s", workflow_id)
+        if not hasattr(client, "get_workflow_json"):
+            self.ctx.logger.error(
+                "[识别] client 缺少 get_workflow_json 方法！client 类=%s 定义模块=%s 文件=%s",
+                type(client).__name__,
+                type(client).__module__,
+                getattr(type(client), "__module__", ""),
+            )
+            import lib.runninghub_client as _check_module
+
+            self.ctx.logger.error(
+                "[识别] lib 模块文件=%s 是否有方法=%s 方法列表=%s",
+                getattr(_check_module, "__file__", "无"),
+                hasattr(_check_module, "get_workflow_json"),
+                [n for n in dir(_check_module) if not n.startswith("_")],
+            )
+            await self.ctx.send.text("插件代码未完全更新，请重启 MaiBot 容器后再试", stream_id)
+            return True, "", 1
         try:
             workflow_json = await client.get_workflow_json(workflow_id)
         except RunningHubError as exc:
