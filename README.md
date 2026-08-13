@@ -336,7 +336,7 @@
 ### 给 AI / 其他插件调用（进阶）
 
 - **LLM 工具**：run_workflow(workflow_name, prompt, stream_id)——让 MaiBot 的 AI 自己决定什么时候跑图。
-- **公开 API**：ctx.api.call("rh-workflow-adapter.run_workflow", workflow_name=..., prompt=..., stream_id=...)——供其他插件调用。
+- **公开 API**：ctx.api.call("github.achenjins.runninghub-workflow-adapter.run_workflow", workflow_name=..., prompt=..., stream_id=...)——供其他插件调用。
 
 普通用户用聊天命令就够了，这两项是给开发者 / 高级玩法用的。
 
