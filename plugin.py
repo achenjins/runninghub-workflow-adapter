@@ -11,7 +11,7 @@
 - 可编辑配置（text 类型）固定在上传后询问用户确认/修改
 - 命令 / 工具 / API 三种触发方式，自动撤回保留（仅 NapCat 适配器生效）
 
-- 命令：``/跑图 <工作流名> <文字内容>``
+- 命令：``/rh运行 <工作流名> <文字内容>``
 - 命令：``/工作流`` 列出已配置工作流
 - 命令：``/识别国内工作流 <工作流ID>`` / ``/识别国外工作流 <工作流ID>`` 识别关键节点（分别配置区域）
 - 命令：``/详细识别国内工作流 <工作流ID>`` / ``/详细识别国外工作流 <工作流ID>`` LLM 详细识别全部节点
@@ -266,7 +266,7 @@ class WorkflowItemSection(PluginConfigBase):
 
     name: str = Field(
         default="",
-        description="工作流显示名称，用于命令调用，如 /跑图 动漫生图",
+        description="工作流显示名称，用于命令调用，如 /rh运行 动漫生图",
         json_schema_extra={"label": "工作流名称", "placeholder": "动漫生图"},
     )
     workflow_id: str = Field(
@@ -2594,17 +2594,17 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         )
         return nodes
 
-    @Command("跑图", description="运行配置好的工作流，例如：/跑图 动漫生图 一只猫", pattern=r"^/跑图")
+    @Command("rh运行", description="运行配置好的工作流，例如：/rh运行 动漫生图 一只猫", pattern=r"^/rh运行")
     async def handle_pao_tu(self, **kwargs: Any) -> tuple[bool, str, int]:
         stream_id = str(kwargs.get("stream_id") or "")
         plain_text = str(kwargs.get("text") or kwargs.get("plain_text") or "")
-        # 解析：/跑图 <工作流名> [描述文本]
-        rest = re.sub(r"^/跑图[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
+        # 解析：/rh运行 <工作流名> [描述文本]
+        rest = re.sub(r"^/rh运行[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
 
         if not rest:
             available = "、".join(w.name for w in self._workflows if w.name) or "（未配置工作流）"
             await self.ctx.send.text(
-                f"用法：/跑图 <工作流名> <描述文本>\n已配置工作流：{available}", stream_id
+                f"用法：/rh运行 <工作流名> <描述文本>\n已配置工作流：{available}", stream_id
             )
             return True, "", 1
 
