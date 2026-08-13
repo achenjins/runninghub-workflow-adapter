@@ -87,7 +87,7 @@ class ServerSection(PluginConfigBase):
     base_url: str = Field(
         default="https://www.runninghub.ai",
         description="海外平台基地址（runninghub.ai）",
-        json_schema_extra={"label": "海外基地址", "placeholder": "https://www.runninghub.ai"},
+        json_schema_extra={"label": "海外基地址", "disabled": True},
     )
     api_key: str = Field(
         default="",
@@ -97,7 +97,7 @@ class ServerSection(PluginConfigBase):
     base_url_cn: str = Field(
         default="https://www.runninghub.cn",
         description="国内平台基地址（runninghub.cn）",
-        json_schema_extra={"label": "国内基地址", "placeholder": "https://www.runninghub.cn"},
+        json_schema_extra={"label": "国内基地址", "disabled": True},
     )
     api_key_cn: str = Field(
         default="",
@@ -126,14 +126,14 @@ class GenerationSection(PluginConfigBase):
 
 
 class CleanupSection(PluginConfigBase):
-    """发送后自动清理（撤回）配置。"""
+    """发送后自动撤回配置。"""
 
-    __ui_label__ = "自动清理"
+    __ui_label__ = "自动撤回"
 
     enable: bool = Field(
         default=False,
         description="启用发送后自动撤回（仅在使用 NapCat 适配器时生效，其他平台无效）",
-        json_schema_extra={"label": "启用自动清理", "hint": "仅 NapCat 适配器生效"},
+        json_schema_extra={"label": "启用自动撤回", "hint": "仅 NapCat 适配器生效"},
     )
     recall_seconds: int = Field(
         default=90,
