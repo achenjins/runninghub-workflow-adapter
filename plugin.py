@@ -188,9 +188,9 @@ class InputNodeSection(PluginConfigBase):
         description="输入内容。填写后作为固定默认值直接使用（不接受修改）；留空则按类型由用户提供",
         json_schema_extra={"label": "输入内容（默认值）", "hint": "留空=等待用户输入；填写=固定默认值"},
     )
-    value_type: Literal["", "default", "text", "image", "audio", "prompt"] = Field(
+    value_type: Literal["", "default", "text", "image", "audio", "video", "prompt"] = Field(
         default="",
-        description="节点用途：prompt=主提示词（接收命令/扩写文本，仅一个）；text=可编辑配置（上传后询问修改）；default=固定默认值；image/audio=上传文件",
+        description="节点用途：prompt=主提示词（接收命令/扩写文本，仅一个）；text=可编辑配置（上传后询问修改）；default=固定默认值；image/audio/video=上传文件",
         json_schema_extra={
             "label": "节点类型",
             "x-widget": "select",
@@ -200,6 +200,7 @@ class InputNodeSection(PluginConfigBase):
                 {"value": "default", "label": "默认值（固定使用输入内容）"},
                 {"value": "image", "label": "图片（等待上传）"},
                 {"value": "audio", "label": "语音（等待上传）"},
+                {"value": "video", "label": "视频（等待上传）"},
             ],
         },
     )
@@ -343,6 +344,7 @@ _LLM_DETECT_PROMPT = """你是 ComfyUI/RunningHub 工作流配置分析器。下
    - 文字类（提示词/描述文本，主提示词）→ value_type="prompt"（整个工作流最多 1 个）
    - 图片类（参考图/LoadImage 等）→ value_type="image"
    - 音频类（参考音频/配音）→ value_type="audio"
+   - 视频类（参考视频/LoadVideo 等）→ value_type="video"
    输入节点的 field_value 一律留空 ""。
 3. 配置节点（值得预设的常见参数：分辨率/宽高、画面比例、步数、采样器、CFG、种子、批次、lora 强度等）→ value_type="text"，field_value 填当前值（字符串形式），label 用简短中文。
    重要：即使节点带有连线输入，它的【标量参数】也必须作为配置节点列出，例如：
@@ -375,6 +377,7 @@ class InputSession:
     text_field_name: str = ""
     uploaded_images: int = 0
     uploaded_audios: int = 0
+    uploaded_videos: int = 0
     # 收集阶段：files=等待文件上传；config=等待用户确认/修改可编辑配置
     phase: str = "files"
     editable_nodes: list[dict[str, str]] = field(default_factory=list)
@@ -480,7 +483,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             }
             if field_name == "value_type":
                 # SelectItem 不允许空字符串 value，用 "auto" 表示自动推断（模型层归一化为 ""）
-                item_field["choices"] = ["auto", "prompt", "text", "default", "image", "audio"]
+                item_field["choices"] = ["auto", "prompt", "text", "default", "image", "audio", "video"]
                 item_field["placeholder"] = "auto=自动推断"
             item_fields[field_name] = item_field
         return item_fields
@@ -679,7 +682,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             return ""
 
     def _describe_file_inputs(self, workflow: WorkflowItemSection) -> str:
-        """汇总该工作流需要用户上传的文件输入（图片/音频的种类与数量）。
+        """汇总该工作流需要用户上传的文件输入（图片/音频/视频的种类与数量）。
 
         仅在未提供实际上传数量时作为兜底，告知工作流所需的文件节点。
         """
@@ -691,6 +694,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             n for n in workflow.input_nodes
             if not str(n.field_value or "").strip() and self._resolve_value_type(n) == "audio"
         ]
+        videos = [
+            n for n in workflow.input_nodes
+            if not str(n.field_value or "").strip() and self._resolve_value_type(n) == "video"
+        ]
         parts: list[str] = []
         if images:
             labels = "、".join(str(n.label or "").strip() or str(n.node_id) for n in images)
@@ -698,16 +705,21 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         if audios:
             labels = "、".join(str(n.label or "").strip() or str(n.node_id) for n in audios)
             parts.append(f"参考音频 {len(audios)} 段（{labels}）")
+        if videos:
+            labels = "、".join(str(n.label or "").strip() or str(n.node_id) for n in videos)
+            parts.append(f"参考视频 {len(videos)} 段（{labels}）")
         return "；".join(parts) if parts else ""
 
     @staticmethod
-    def _format_file_counts(images: int, audios: int) -> str:
+    def _format_file_counts(images: int, audios: int, videos: int = 0) -> str:
         """按实际上传数量生成简短描述（0 的类别省略）。"""
         parts: list[str] = []
         if images:
             parts.append(f"参考图片 {images} 张")
         if audios:
             parts.append(f"参考音频 {audios} 段")
+        if videos:
+            parts.append(f"参考视频 {videos} 段")
         return "；".join(parts)
 
     def _prompt_nodes(self, workflow: WorkflowItemSection) -> list[InputNodeSection]:
@@ -783,13 +795,15 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     def _resolve_value_type(node: InputNodeSection) -> str:
         """解析节点类型：显式选择优先，留空时按字段名自动推断。"""
         explicit = str(node.value_type or "").strip().lower()
-        if explicit in ("default", "text", "image", "audio", "prompt"):
+        if explicit in ("default", "text", "image", "audio", "video", "prompt"):
             return explicit
         field_name = str(node.field_name or "").lower()
         if any(k in field_name for k in ("image", "pic", "photo", "img")):
             return "image"
         if any(k in field_name for k in ("audio", "voice", "sound", "music", "speech")):
             return "audio"
+        if any(k in field_name for k in ("video", "mp4", "mov", "webm", "clip")):
+            return "video"
         return "text"
 
     def _build_node_info_list(
@@ -955,8 +969,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 "waiting": True,
                 "required_files": required_files,
                 "message": (
-                    f"请依次发送以下输入（可一条消息发多个，也可只上传部分）：\n{tips}\n"
-                    "发送「跳过剩余」可直接开始运行，未上传的文件节点将使用工作流默认值"
+                    f"请上传：{tips}（可只传部分，发「跳过剩余」直接开始）"
                 ),
             }
 
@@ -1022,20 +1035,20 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     @staticmethod
     def _format_waiting_summary(waiting: list[dict[str, Any]]) -> str:
-        type_names = {"image": "图片", "audio": "语音", "video": "视频"}
-        groups: dict[str, list[str]] = {}
+        _NAME_UNIT = {"image": ("图片", "张"), "audio": ("音频", "段"), "video": ("视频", "段")}
+        counts: dict[str, int] = {}
         order: list[str] = []
         for item in waiting:
-            type_name = type_names.get(item["value_type"], item["value_type"])
-            if type_name not in groups:
-                groups[type_name] = []
-                order.append(type_name)
-            groups[type_name].append(str(item.get("label") or item.get("field_name") or ""))
-        lines = []
-        for type_name in order:
-            labels = groups[type_name]
-            lines.append(f"{type_name} ×{len(labels)}：{'、'.join(labels) if labels[0] else '—'}")
-        return "\n".join(lines)
+            vtype = item["value_type"]
+            if vtype not in counts:
+                counts[vtype] = 0
+                order.append(vtype)
+            counts[vtype] += 1
+        parts: list[str] = []
+        for vtype in order:
+            name, unit = _NAME_UNIT.get(vtype, (vtype, "个"))
+            parts.append(f"{name} {counts[vtype]} {unit}")
+        return "、".join(parts)
 
     def _create_input_session(
         self,
@@ -1157,18 +1170,19 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 session.uploaded_images += 1
             elif file_type == "audio":
                 session.uploaded_audios += 1
+            elif file_type == "video":
+                session.uploaded_videos += 1
             self.ctx.logger.info("已接收输入 %s: %s", node["label"], file_name)
 
         if session.waiting_nodes:
             await self.ctx.send.text(
-                f"已收到，还需发送：\n{self._build_waiting_tips_from_dicts(session.waiting_nodes)}\n"
-                "（或发送「跳过剩余」直接开始运行）",
+                f"已收到，还剩余：{self._build_waiting_tips_from_dicts(session.waiting_nodes)}（或发「跳过剩余」）",
                 stream_id,
             )
             return True
 
         # 收集完成，进入配置确认或直接提交
-        await self._after_files_collected(session, key, stream_id, client, "全部输入已收到")
+        await self._after_files_collected(session, key, stream_id, client, "输入已收齐")
         return True
 
     async def _after_files_collected(
@@ -1184,14 +1198,11 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             session.phase = "config"
             tips = self._build_config_edit_tips(session.editable_nodes)
             await self.ctx.send.text(
-                f"{notice}。你可修改以下配置：\n{tips}\n"
-                "（直接回复新值，用空格或中英文逗号分隔，按顺序对应上面的配置项；"
-                "某项想保持默认就填「-」；回复「不变」全部使用默认值。"
-                "例如回复「512 16:9」或「512，16:9」）",
+                f"{notice}。可修改：\n{tips}\n（回复新值，如「512 16:9」，- 保持默认，「不变」全默认）",
                 stream_id,
             )
             return
-        await self._submit_collected_session(session, key, stream_id, client, notice + "，开始运行任务")
+        await self._submit_collected_session(session, key, stream_id, client, notice + "，开始运行")
 
     @staticmethod
     def _build_config_edit_tips(editable_nodes: list[dict[str, str]]) -> str:
@@ -1224,7 +1235,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         text = self._extract_text_from_message(message)
         values = self._parse_config_edit(text, len(session.editable_nodes))
         if values is None:
-            await self.ctx.send.text("没看懂，请回复要修改的值（如「0.3, 16:9」），或回复「不变」使用默认值", stream_id)
+            await self.ctx.send.text("没看懂，请回复新值（如「512 16:9」），或「不变」使用默认值", stream_id)
             return
         for index, node in enumerate(session.editable_nodes):
             if index < len(values) and values[index] is not None:
@@ -1241,7 +1252,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             await self.ctx.send.text("插件客户端未初始化，已取消本次任务", stream_id)
             return
         key = self._session_key(session.user_id, session.stream_id)
-        await self._submit_collected_session(session, key, stream_id, client, "配置已更新，开始运行任务")
+        await self._submit_collected_session(session, key, stream_id, client, "配置已更新，开始运行")
 
     async def _submit_collected_session(
         self,
@@ -1263,7 +1274,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             and session.workflow.llm_enhance
         ):
             actual_desc = self._format_file_counts(
-                session.uploaded_images, session.uploaded_audios
+                session.uploaded_images, session.uploaded_audios, session.uploaded_videos
             )
             enhanced = await self._enhance_text(
                 session.workflow, session.command_text, actual_file_desc=actual_desc
@@ -1306,11 +1317,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             return True
         skipped = len(session.waiting_nodes)
         if skipped:
-            notice = (
-                f"已跳过剩余 {skipped} 个文件输入（未上传的节点将使用工作流默认值）"
-            )
+            notice = f"已跳过剩余 {skipped} 个文件"
         else:
-            notice = "全部输入已收到"
+            notice = "输入已收齐"
         await self._after_files_collected(session, key, stream_id, client, notice)
         return True
 
@@ -1350,6 +1359,16 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 source = ("base64://" + b64) if b64 else data_text
                 if source:
                     files.append(("audio", source))
+            elif seg_type == "file":
+                # MaiBot 中视频以 FileComponent（type=file）承载，data 为 payload dict
+                if isinstance(data, dict):
+                    source = str(data.get("url") or data.get("file_url") or "").strip()
+                    if not source:
+                        source = str(data.get("name") or data.get("file_name") or data.get("filename") or "").strip()
+                else:
+                    source = data_text
+                if source:
+                    files.append(("video", source))
         return files
 
     @staticmethod
@@ -1416,7 +1435,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             elif file_data[:6] in (b"GIF87a", b"GIF89a"):
                 ext = ".gif"
         if not ext:
-            ext = ".png" if file_type == "image" else ".mp3"
+            ext = {"image": ".png", "audio": ".mp3", "video": ".mp4"}.get(file_type, ".bin")
         return f"input_{file_type}_{int(time.time())}{ext}"
 
 
@@ -1784,11 +1803,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             self.ctx.logger.warning(
                 "[识别] 未识别出输入节点，工作流节点类型: %s", ", ".join(class_types)
             )
-            await self.ctx.send.text(
-                "未识别出明显的输入节点，请手动在 WebUI 中配置\n"
-                f"工作流节点类型已写入日志：{'、'.join(class_types[:20])}",
-                stream_id,
-            )
+            await self.ctx.send.text("未识别出输入节点，请手动配置", stream_id)
             return True, "", 1
         self.ctx.logger.info(
             "[识别] %s 识别到 %d 个节点: %s",
@@ -1808,23 +1823,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             await self.ctx.send.text(f"写入配置失败：{exc}", stream_id)
             return True, "", 1
 
-        inputs = [n for n in detected if n["value_type"] in ("prompt", "image", "audio")]
-        configs = [n for n in detected if n["value_type"] in ("text", "default")]
-        parts_summary: list[str] = []
-        if inputs:
-            parts_summary.append(
-                "输入节点：" + "、".join(f"{n['node_id']}({n['value_type']})" for n in inputs)
-            )
-        if configs:
-            parts_summary.append(
-                "配置节点：" + "、".join(f"{n['node_id']}({n['label']}={n['field_value']})" for n in configs)
-            )
-        summary = "\n".join(parts_summary) or "（无）"
-        detect_note = "" if detect_method == "LLM" else "（LLM 识别未生效，已回退启发式规则，详见日志 [识别] 行）"
+        detect_note = "" if detect_method == "LLM" else "（LLM 识别未生效，已回退启发式，详见日志）"
         await self.ctx.send.text(
-            f"已自动写入配置并热重载（{detect_method} 识别{detect_note}）：\n"
-            f"工作流「{workflow_name}」（{workflow_id}），共 {len(detected)} 个节点：\n{summary}\n"
-            f"可发送 /工作流 查看；文字节点若需接收命令文本请在 WebUI 开启",
+            f"识别成功（{detect_method}），共 {len(detected)} 个节点，具体请查看插件配置{detect_note}",
             stream_id,
         )
         return True, "", 1
@@ -2119,6 +2120,16 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                         "label": f"语音输入（{class_type}）",
                     }
                 )
+            elif "loadvideo" in cls_compact or "video upload" in cls_lower or "videoupload" in cls_compact or "loadclip" in cls_compact:
+                detected.append(
+                    {
+                        "node_id": node_id,
+                        "field_name": "video",
+                        "value_type": "video",
+                        "field_value": "",
+                        "label": f"视频输入（{class_type}）",
+                    }
+                )
         return detected
 
     @staticmethod
@@ -2179,7 +2190,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             field_name = str(item.get("field_name") or "").strip()
             value_type = str(item.get("value_type") or "").strip().lower()
             label = str(item.get("label") or "").strip()
-            if value_type not in ("prompt", "text", "image", "audio", "default"):
+            if value_type not in ("prompt", "text", "image", "audio", "video", "default"):
                 continue
             node = workflow_json.get(node_id)
             if not isinstance(node, dict):
