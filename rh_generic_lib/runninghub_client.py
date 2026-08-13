@@ -107,7 +107,8 @@ class RunningHubClient:
 
         payload = {
             "nodeInfoList": node_info_list or [],
-            "instanceType": str(instance_type or "Standard"),
+            # RunningHub 的 instanceType 期望小写（standard/plus/ultra）
+            "instanceType": str(instance_type or "Standard").lower(),
             "usePersonalQueue": "false",
         }
         result = await self._post(f"/openapi/v2/run/workflow/{target_workflow}", payload)
