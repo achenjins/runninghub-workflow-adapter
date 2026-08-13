@@ -656,6 +656,28 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             self.ctx.logger.warning("读取扩写模板失败: %s（%s）", resolved, exc)
             return ""
 
+    def _describe_file_inputs(self, workflow: WorkflowItemSection) -> str:
+        """汇总该工作流需要用户上传的文件输入（图片/音频的种类与数量）。
+
+        扩写发生在用户上传之前，因此这里告知的是工作流所需的文件节点，而非实际已收到的文件。
+        """
+        images = [
+            n for n in workflow.input_nodes
+            if not str(n.field_value or "").strip() and self._resolve_value_type(n) == "image"
+        ]
+        audios = [
+            n for n in workflow.input_nodes
+            if not str(n.field_value or "").strip() and self._resolve_value_type(n) == "audio"
+        ]
+        parts: list[str] = []
+        if images:
+            labels = "、".join(str(n.label or "").strip() or str(n.node_id) for n in images)
+            parts.append(f"参考图片 {len(images)} 张（{labels}）")
+        if audios:
+            labels = "、".join(str(n.label or "").strip() or str(n.node_id) for n in audios)
+            parts.append(f"参考音频 {len(audios)} 段（{labels}）")
+        return "；".join(parts) if parts else ""
+
     async def _enhance_text(self, workflow: WorkflowItemSection, text: str) -> str:
         """按工作流配置对文字进行 LLM 扩写（失败回退原文）。"""
         text = str(text or "").strip()
@@ -665,8 +687,16 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         if not template:
             self.ctx.logger.warning("工作流 %s 开启 LLM 扩写但模板为空，使用原文", workflow.name)
             return text
+        file_desc = self._describe_file_inputs(workflow)
+        input_context = (
+            f"本次任务将使用以下文件输入：{file_desc}。"
+            if file_desc
+            else "本次任务无额外文件输入。"
+        )
         prompt_text = (
-            f"{template}\n\n<USER_REQUIREMENT>\n{text}\n</USER_REQUIREMENT>\n"
+            f"{template}\n\n"
+            f"{input_context}\n\n"
+            f"<USER_REQUIREMENT>\n{text}\n</USER_REQUIREMENT>\n"
             "请严格按模板输出最终内容，不要输出任何额外解释"
         )
         try:
