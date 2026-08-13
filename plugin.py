@@ -1511,16 +1511,34 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 if source:
                     files.append(("audio", source))
             elif seg_type == "file":
-                # MaiBot 中视频以 FileComponent（type=file）承载，data 为 payload dict
+                # QQ「文件」消息（type=file）不区分图片/音频/视频，按文件名/URL 扩展名推断真实类型
+                filename = ""
                 if isinstance(data, dict):
                     source = str(data.get("url") or data.get("file_url") or "").strip()
+                    filename = str(data.get("name") or data.get("file_name") or data.get("filename") or "").strip()
                     if not source:
-                        source = str(data.get("name") or data.get("file_name") or data.get("filename") or "").strip()
+                        source = filename
                 else:
                     source = data_text
+                    filename = source
                 if source:
-                    files.append(("video", source))
+                    file_type = RunningHubGenericPlugin._detect_file_type_from_name(filename or source)
+                    files.append((file_type, source))
         return files
+
+    @staticmethod
+    def _detect_file_type_from_name(name: str) -> str:
+        """根据文件名 / URL 的扩展名推断文件类型（image / audio / video）。
+
+        QQ「文件」消息（type=file）不区分图片 / 音频 / 视频，统一走这里按扩展名判断，
+        否则以文件形式发的图片 / 音频会被当成视频而匹配不到对应节点。
+        """
+        path = str(name or "").split("?", 1)[0].strip().lower()
+        if path.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".jfif")):
+            return "image"
+        if path.endswith((".mp3", ".wav", ".amr", ".ogg", ".m4a", ".aac", ".flac", ".silk", ".opus", ".m4r")):
+            return "audio"
+        return "video"
 
     @staticmethod
     def _extract_text_from_message(message: dict) -> str:
