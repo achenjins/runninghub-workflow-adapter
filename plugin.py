@@ -1549,6 +1549,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                     if m_name and m_url:
                         filename = m_name.group(1).strip()
                         url = m_url.group(1).strip()
+                        # QQ 文件下载链接的 fname 参数常为空，补上文件名才能下载到正确内容
+                        if "fname=" in url and not url.rsplit("fname=", 1)[1].strip():
+                            from urllib.parse import quote
+                            url = url.rsplit("fname=", 1)[0] + "fname=" + quote(filename)
                         file_type = RunningHubGenericPlugin._detect_file_type_from_name(filename)
                         files.append((file_type, url))
         return files
