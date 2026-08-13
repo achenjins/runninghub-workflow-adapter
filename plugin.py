@@ -2,15 +2,17 @@
 
 通过配置文件适配 RunningHub 的大部分工作流：
 - 可配置多个工作流（工作流 ID + 设备类型）
-- 每个工作流可自由配置多个输入节点（节点 ID / 字段名 / 默认值 / 类型：文字/图片/语音）
+- 每个工作流可自由配置输入节点（节点 ID / 字段名 / 默认值 / 类型）
+- 节点类型：prompt 主提示词 / text 可编辑配置 / default 固定默认值 / image / audio / video
 - 文字节点可开启 LLM 扩写（可配置扩写模板文件）
-- 图片/语音节点支持交互式收集：命令触发后按节点顺序等待用户上传文件
-- 支持从工作流 ID 自动识别输入节点，生成配置片段
+- 图片/语音/视频节点支持交互式收集，可只传部分、发「跳过剩余」直接开始
+- 可编辑配置（text 类型）固定在上传后询问用户确认/修改
 - 命令 / 工具 / API 三种触发方式，自动撤回保留（仅 NapCat 适配器生效）
 
 - 命令：``/跑图 <工作流名> <文字内容>``
 - 命令：``/工作流`` 列出已配置工作流
-- 命令：``/识别工作流 <工作流ID>`` 自动识别输入节点
+- 命令：``/识别工作流 <工作流ID>`` 简化识别（仅文字/图片/音频/视频/分辨率/长宽比例）
+- 命令：``/详细识别工作流 <工作流ID>`` LLM 详细识别全部节点
 - 工具：``run_workflow``（供 LLM 调用）
 - API：``run_workflow``（public，供其他插件调用）
 """
@@ -943,12 +945,12 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         # 先用原始文本构建节点参数（文字节点暂填原文，扩写见下）
         node_info_list, waiting = self._build_node_info_list(workflow, command_text)
 
-        if not node_info_list and not waiting:
+        if not node_info_list and not waiting and not editable_nodes:
             return {"success": False, "message": f"工作流「{workflow.name}」未配置任何输入节点"}
 
-        if waiting:
-            # 进入交互式收集：文字扩写延后到收集完成，以便告知 LLM 实际上传的文件数量
-            self._create_input_session(
+        if waiting or editable_nodes:
+            # 固定流程：有文件先收文件，收完（或直接）进入可编辑配置确认
+            session = self._create_input_session(
                 user_id=user_id,
                 stream_id=stream_id,
                 workflow=workflow,
@@ -959,21 +961,24 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 text_field_name=text_node.field_name.strip() if text_node else "",
                 editable_nodes=editable_nodes,
             )
-            tips = self._build_waiting_tips(waiting)
-            required_files = [
-                {"type": item["value_type"], "label": item["label"]}
-                for item in waiting
-            ]
-            return {
-                "success": True,
-                "waiting": True,
-                "required_files": required_files,
-                "message": (
-                    f"请上传：{tips}（可只传部分，发「跳过剩余」直接开始）"
-                ),
-            }
+            key = self._session_key(user_id, stream_id)
+            if waiting:
+                tips = self._build_waiting_tips(waiting)
+                required_files = [
+                    {"type": item["value_type"], "label": item["label"]}
+                    for item in waiting
+                ]
+                return {
+                    "success": True,
+                    "waiting": True,
+                    "required_files": required_files,
+                    "message": f"请上传：{tips}（可只传部分，发「跳过剩余」直接开始）",
+                }
+            # 无文件但需确认可编辑配置：直接进入配置确认
+            await self._ask_config_edit(session, stream_id)
+            return {"success": True, "waiting": True, "required_files": [], "message": "请确认配置"}
 
-        # 无文件节点：立即扩写并回填文字节点
+        # 无文件、无可编辑配置：立即扩写并回填文字节点
         if text_node and workflow.llm_enhance:
             enhanced_text = await self._enhance_text(workflow, command_text)
             self._patch_text_value(
@@ -1062,7 +1067,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         text_node_id: str = "",
         text_field_name: str = "",
         editable_nodes: list[dict[str, str]] | None = None,
-    ) -> None:
+    ) -> InputSession:
         """创建交互式收集会话（优先按用户、工具路径回退按会话），带超时清理。"""
         key = self._session_key(user_id, stream_id)
         session = InputSession(
@@ -1097,6 +1102,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                         pass
 
         session.expire_task = asyncio.create_task(_expire())
+        return session
 
     @staticmethod
     def _session_key(user_id: str, stream_id: str) -> str:
@@ -1185,6 +1191,16 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         await self._after_files_collected(session, key, stream_id, client, "输入已收齐")
         return True
 
+    async def _ask_config_edit(self, session: InputSession, stream_id: str, notice: str = "") -> None:
+        """进入可编辑配置确认阶段并向用户发确认提示。"""
+        session.phase = "config"
+        tips = self._build_config_edit_tips(session.editable_nodes)
+        prefix = f"{notice}。" if notice else ""
+        await self.ctx.send.text(
+            f"{prefix}可修改：\n{tips}\n（回复新值，如「512 16:9」，- 保持默认，「不变」全默认）",
+            stream_id,
+        )
+
     async def _after_files_collected(
         self,
         session: InputSession,
@@ -1195,12 +1211,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     ) -> None:
         """文件收集结束后：有可编辑配置则进入确认阶段，否则直接提交。"""
         if session.editable_nodes:
-            session.phase = "config"
-            tips = self._build_config_edit_tips(session.editable_nodes)
-            await self.ctx.send.text(
-                f"{notice}。可修改：\n{tips}\n（回复新值，如「512 16:9」，- 保持默认，「不变」全默认）",
-                stream_id,
-            )
+            await self._ask_config_edit(session, stream_id, notice)
             return
         await self._submit_collected_session(session, key, stream_id, client, notice + "，开始运行")
 
@@ -1734,22 +1745,46 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         await self.ctx.send.text("\n".join(lines), stream_id)
         return True, "", 1
 
-    @Command("识别工作流", description="自动识别工作流输入节点并写入配置，例如：/识别工作流 2087492768787685378 动漫生图", pattern=r"^/识别工作流")
+    @Command("识别工作流", description="简化识别：仅提取文字/图片/音频/视频/分辨率/长宽比例等关键节点，例如：/识别工作流 2087492768787685378 动漫生图", pattern=r"^/识别工作流")
     async def handle_detect_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
         stream_id = str(kwargs.get("stream_id") or "")
         plain_text = str(kwargs.get("text") or kwargs.get("plain_text") or "")
         rest = re.sub(r"^/识别工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
         if not rest:
             await self.ctx.send.text(
-                "用法：/识别工作流 <工作流ID> [工作流名称]\n"
-                "不填名称时默认使用工作流 ID 作为名称", stream_id
+                "用法：/识别工作流 <工作流ID> [工作流名称]（仅提取关键节点）", stream_id
             )
             return True, "", 1
-
         parts = rest.split(maxsplit=1)
         workflow_id = parts[0].strip()
         workflow_name = parts[1].strip() if len(parts) > 1 else workflow_id
-        self.ctx.logger.info("[识别] 开始: workflow_id=%s name=%s", workflow_id, workflow_name)
+        return await self._detect_and_write(workflow_id, workflow_name, stream_id, detailed=False)
+
+    @Command("详细识别工作流", description="详细识别：用 LLM 识别全部输入节点与配置节点（步数/采样器/CFG/种子等），例如：/详细识别工作流 2087492768787685378 动漫生图", pattern=r"^/详细识别工作流")
+    async def handle_detail_detect_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
+        stream_id = str(kwargs.get("stream_id") or "")
+        plain_text = str(kwargs.get("text") or kwargs.get("plain_text") or "")
+        rest = re.sub(r"^/详细识别工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
+        if not rest:
+            await self.ctx.send.text(
+                "用法：/详细识别工作流 <工作流ID> [工作流名称]（LLM 识别全部节点）", stream_id
+            )
+            return True, "", 1
+        parts = rest.split(maxsplit=1)
+        workflow_id = parts[0].strip()
+        workflow_name = parts[1].strip() if len(parts) > 1 else workflow_id
+        return await self._detect_and_write(workflow_id, workflow_name, stream_id, detailed=True)
+
+    async def _detect_and_write(
+        self,
+        workflow_id: str,
+        workflow_name: str,
+        stream_id: str,
+        *,
+        detailed: bool,
+    ) -> tuple[bool, str, int]:
+        """识别工作流节点并写入配置（detailed=True 走 LLM 全量识别）。"""
+        self.ctx.logger.info("[识别] 开始: workflow_id=%s name=%s detailed=%s", workflow_id, workflow_name, detailed)
 
         client = self._client
         if client is None:
@@ -1781,28 +1816,14 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             return True, "", 1
         self.ctx.logger.info("[识别] 工作流 JSON 已获取，节点总数=%d", len(workflow_json))
 
-        detected: list[dict[str, str]] = []
-        detect_method = "启发式"
-        if self.config.detect.use_llm:
-            llm_nodes = await self._detect_input_nodes_with_llm(workflow_json)
-            if llm_nodes is not None:
-                detected = llm_nodes
-                detect_method = "LLM"
-        if not detected:
-            detected = self._detect_input_nodes(workflow_json)
-            detect_method = "启发式"
+        if detailed:
+            detected, detect_method = await self._detect_full(workflow_json)
+        else:
+            detected = self._detect_key_nodes(workflow_json)
+            detect_method = "简化"
 
         if not detected:
-            class_types = sorted(
-                {
-                    str(node.get("class_type") or "?")
-                    for node in workflow_json.values()
-                    if isinstance(node, dict)
-                }
-            )
-            self.ctx.logger.warning(
-                "[识别] 未识别出输入节点，工作流节点类型: %s", ", ".join(class_types)
-            )
+            self.ctx.logger.warning("[识别] 未识别出输入节点")
             await self.ctx.send.text("未识别出输入节点，请手动配置", stream_id)
             return True, "", 1
         self.ctx.logger.info(
@@ -1823,12 +1844,65 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             await self.ctx.send.text(f"写入配置失败：{exc}", stream_id)
             return True, "", 1
 
-        detect_note = "" if detect_method == "LLM" else "（LLM 识别未生效，已回退启发式，详见日志）"
         await self.ctx.send.text(
-            f"识别成功（{detect_method}），共 {len(detected)} 个节点，具体请查看插件配置{detect_note}",
+            f"识别成功（{detect_method}），共 {len(detected)} 个节点，具体请查看插件配置",
             stream_id,
         )
         return True, "", 1
+
+    async def _detect_full(self, workflow_json: dict[str, Any]) -> tuple[list[dict[str, str]], str]:
+        """详细识别：LLM 优先，失败回退启发式。"""
+        if self.config.detect.use_llm:
+            llm_nodes = await self._detect_input_nodes_with_llm(workflow_json)
+            if llm_nodes is not None:
+                return llm_nodes, "LLM"
+        return self._detect_input_nodes(workflow_json), "启发式"
+
+    @staticmethod
+    def _detect_key_nodes(workflow_json: dict[str, Any]) -> list[dict[str, str]]:
+        """简化识别：仅提取文字/图片/音频/视频/分辨率/长宽比例等关键节点。
+
+        文字/图片/音频/视频复用启发式识别；分辨率（width/height/resolution）与
+        长宽比例（aspect/ratio/比例/画幅/宽高比）作为 default 类型；其余一律忽略。
+        """
+        detected = RunningHubGenericPlugin._detect_input_nodes(workflow_json)
+        _RES_KEYWORDS = ("width", "height", "resolution", "分辨率")
+        _ASPECT_KEYWORDS = ("aspect", "ratio", "比例", "画幅", "宽高比")
+        for node_id, node in sorted(workflow_json.items(), key=lambda item: _safe_int(item[0])):
+            if not isinstance(node, dict):
+                continue
+            inputs = node.get("inputs")
+            if not isinstance(inputs, dict) or not inputs:
+                continue
+            # 跳过存在节点连线的内部节点
+            if any(isinstance(v, (list, tuple)) and v for v in inputs.values()):
+                continue
+            for field_name, value in inputs.items():
+                if isinstance(value, (list, tuple, dict)):
+                    continue
+                fn = field_name.lower()
+                if any(k in fn for k in _RES_KEYWORDS):
+                    label = {"width": "宽度", "height": "高度"}.get(fn, "分辨率")
+                    detected.append(
+                        {
+                            "node_id": node_id,
+                            "field_name": field_name,
+                            "value_type": "default",
+                            "field_value": str(value),
+                            "label": label,
+                        }
+                    )
+                elif any(k in fn for k in _ASPECT_KEYWORDS):
+                    detected.append(
+                        {
+                            "node_id": node_id,
+                            "field_name": field_name,
+                            "value_type": "default",
+                            "field_value": str(value),
+                            "label": "长宽比例",
+                        }
+                    )
+        return detected
 
     @staticmethod
     def _toml_string(value: str) -> str:

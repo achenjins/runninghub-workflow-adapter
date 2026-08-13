@@ -75,8 +75,9 @@ LLM 扩写模板路径使用**相对路径**（相对插件目录），如 `temp
 
 - **命令**：`/跑图 <工作流名> <描述文本>`
 - **列出工作流**：`/工作流`
-- **自动识别并写入配置**：`/识别工作流 <工作流ID> [工作流名称]`
-- **工具**：模型自动调用 `run_workflow(workflow_name, prompt, stream_id)`；若工作流需要参考图/参考音频，工具返回 `waiting=true` 与 `required_files`，模型会把文件要求转告用户，插件自动接收文件并继续
+- **简化识别**：`/识别工作流 <工作流ID> [工作流名称]`（仅提取文字/图片/音频/视频/分辨率/长宽比例）
+- **详细识别**：`/详细识别工作流 <工作流ID> [工作流名称]`（LLM 识别全部节点，含步数/采样器/CFG/种子等）
+- **工具**：模型自动调用 `run_workflow(workflow_name, prompt, stream_id)`；若工作流需要参考文件，工具返回 `waiting=true` 与 `required_files`，模型把文件要求转告用户，插件自动接收文件并继续
 - **其他插件**：`ctx.api.call("rh-workflow-adapter.run_workflow", workflow_name=..., prompt=..., stream_id=...)`
 
 ## 自动清理
