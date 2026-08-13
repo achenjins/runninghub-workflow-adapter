@@ -1512,10 +1512,6 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                     files.append(("audio", source))
             elif seg_type == "file":
                 # QQ「文件」消息（type=file）不区分图片/音频/视频，按文件名/URL 扩展名推断真实类型。
-                import logging
-                logging.getLogger("RunningHubGenericPlugin").info(
-                    "[文件识别] file 段完整结构=%r", seg
-                )
                 # NapCat 的 data 字段名不统一：先试常见字段，再遍历 data 值找含扩展名的文件名，
                 # 最后从 URL 的 ?fname= 参数兜底。
                 filename = ""
@@ -1540,11 +1536,6 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 else:
                     source = data_text
                     filename = source
-                if not filename:
-                    import logging
-                    logging.getLogger("RunningHubGenericPlugin").warning(
-                        "[文件识别] 未能从 file 段提取文件名，data=%r", data
-                    )
                 if source:
                     file_type = RunningHubGenericPlugin._detect_file_type_from_name(filename or source)
                     files.append((file_type, source))
@@ -1920,8 +1911,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         命中后返回 {"action": "abort"}，阻止该消息继续进入 LLM。
         """
         # 诊断：无条件打印，确认 notice/文件消息是否经过 before_process hook
-        import logging as _logging
-        _logging.getLogger("RunningHubGenericPlugin").info(
+        self.ctx.logger.info(
             "[输入收集] hook 触发: message_type=%s kwargs_keys=%s",
             type(message).__name__ if message is not None else "None",
             list((kwargs or {}).keys()),
@@ -1933,8 +1923,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         if isinstance(_raw, list):
             _non_text = [s for s in _raw if isinstance(s, dict) and str(s.get("type") or "") != "text"]
             if _non_text:
-                import logging
-                logging.getLogger("RunningHubGenericPlugin").info(
+                self.ctx.logger.info(
                     "[输入收集] 收到非文本消息段: %r", _non_text
                 )
         user_id = str(kwargs.get("user_id") or "")
@@ -1948,8 +1937,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             stream_id = str(message.get("session_id") or message.get("stream_id") or "")
         session = self._find_input_session(user_id, stream_id)
         if session is None:
-            import logging
-            logging.getLogger("RunningHubGenericPlugin").info(
+            self.ctx.logger.info(
                 "[输入收集] 无进行中的上传会话，忽略: user_id=%s stream_id=%s raw_types=%s",
                 user_id, stream_id,
                 [str(s.get("type") or "") for s in (message.get("raw_message") or []) if isinstance(s, dict)],
@@ -1983,8 +1971,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         """
         if not isinstance(message, dict):
             return None
-        import logging
-        logging.getLogger("RunningHubGenericPlugin").info(
+        self.ctx.logger.info(
             "[notice收集] after_process 收到消息: message=%r kwargs_keys=%s",
             message, list((kwargs or {}).keys()),
         )
