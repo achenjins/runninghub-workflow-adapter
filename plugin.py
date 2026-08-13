@@ -1539,6 +1539,18 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 if source:
                     file_type = RunningHubGenericPlugin._detect_file_type_from_name(filename or source)
                     files.append((file_type, source))
+            elif seg_type == "text":
+                # QQ「文件」消息（群文件）在聊天消息里会被转成 text 段：
+                # '[文件] 文件名，大小: xxx，链接: https://.../?fname='
+                # 从中解析文件名与下载链接，再按扩展名推断类型。
+                if data_text.startswith("[文件]"):
+                    m_name = re.search(r"\[文件\]\s*(.+?)，", data_text)
+                    m_url = re.search(r"链接[:：]\s*(https?://\S+)", data_text)
+                    if m_name and m_url:
+                        filename = m_name.group(1).strip()
+                        url = m_url.group(1).strip()
+                        file_type = RunningHubGenericPlugin._detect_file_type_from_name(filename)
+                        files.append((file_type, url))
         return files
 
     @staticmethod
