@@ -1281,8 +1281,18 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             self._cancel_input_session(key)
             return True
 
+        return await self._consume_files(session, key, files, stream_id, client)
+
+    async def _consume_files(
+        self,
+        session: InputSession,
+        key: str,
+        files: list[tuple[str, str]],
+        stream_id: str,
+        client: RunningHubClient,
+    ) -> bool:
+        """把 files 列表按类型分配到等待节点并上传，返回是否已消费。"""
         for file_type, source in files:
-            # 按类型自动分配：找到下一个同类型的等待节点（顺序无关，图对图、音对音）
             index = next(
                 (i for i, n in enumerate(session.waiting_nodes) if n["value_type"] == file_type),
                 None,
@@ -1325,7 +1335,6 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             )
             return True
 
-        # 收集完成，进入配置确认或直接提交
         await self._after_files_collected(session, key, stream_id, client, "输入已收齐")
         return True
 
@@ -1539,22 +1548,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 if source:
                     file_type = RunningHubGenericPlugin._detect_file_type_from_name(filename or source)
                     files.append((file_type, source))
-            elif seg_type == "text":
-                # QQ「文件」消息（群文件）在聊天消息里会被转成 text 段：
-                # '[文件] 文件名，大小: xxx，链接: https://.../?fname='
-                # 从中解析文件名与下载链接，再按扩展名推断类型。
-                if data_text.startswith("[文件]"):
-                    m_name = re.search(r"\[文件\]\s*(.+?)，", data_text)
-                    m_url = re.search(r"链接[:：]\s*(https?://\S+)", data_text)
-                    if m_name and m_url:
-                        filename = m_name.group(1).strip()
-                        url = m_url.group(1).strip()
-                        # QQ 文件下载链接的 fname 参数常为空，补上文件名才能下载到正确内容
-                        if "fname=" in url and not url.rsplit("fname=", 1)[1].strip():
-                            from urllib.parse import quote
-                            url = url.rsplit("fname=", 1)[0] + "fname=" + quote(filename)
-                        file_type = RunningHubGenericPlugin._detect_file_type_from_name(filename)
-                        files.append((file_type, url))
+            # 注意：QQ「文件」消息（群文件）会被转成 text 段（[文件] ... 链接: gzc-download URL），
+            # 但该直链下载到的是错误 ZIP（PK 魔数），不能直接下载；真正的文件内容由
+            # handle_notice_collector（after_process）通过 NapCat get_file API 获取。
         return files
 
     @staticmethod
@@ -1983,16 +1979,125 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         error_policy=ErrorPolicy.SKIP,
     )
     async def handle_notice_collector(self, message: dict | None = None, **kwargs: Any) -> dict | None:
-        """处理 notice 通知消息中的文件（QQ「文件」消息是 notice 类型，只走 after_process）。
-
-        先打诊断日志确认结构，再实现文件提取与上传。
-        """
+        """处理 notice 通知消息中的 QQ 群文件（走 after_process，gzc-download 直链是坏的 ZIP）。"""
         if not isinstance(message, dict):
             return None
-        self.ctx.logger.info(
-            "[notice收集] after_process 收到消息: message=%r kwargs_keys=%s",
-            message, list((kwargs or {}).keys()),
-        )
+        if not message.get("is_notify"):
+            return None
+        message_info = message.get("message_info") or {}
+        additional = message_info.get("additional_config") or {}
+        payload = additional.get("napcat_notice_payload") or {}
+        if not isinstance(payload, dict):
+            return None
+        notice_type = str(additional.get("napcat_notice_type") or payload.get("notice_type") or "")
+        if notice_type != "group_upload":
+            return None
+        file_info = payload.get("file") or {}
+        if not isinstance(file_info, dict):
+            return None
+        filename = str(file_info.get("name") or "").strip()
+        file_id = str(file_info.get("id") or "").strip()
+        if not filename or not file_id:
+            return None
+        file_type = RunningHubGenericPlugin._detect_file_type_from_name(filename)
+        group_id = str(payload.get("group_id") or "").strip()
+
+        user_info = message_info.get("user_info") or {}
+        user_id = str(user_info.get("user_id") or "")
+        stream_id = str(message.get("session_id") or "")
+        session = self._find_input_session(user_id, stream_id)
+        if session is None:
+            return None
+        key = self._session_key(session.user_id, session.stream_id)
+        stream_id = stream_id or session.stream_id
+
+        region = str(session.workflow.region or "overseas").strip()
+        client = self._get_client(region)
+        if client is None:
+            self._rebuild_client()
+            client = self._get_client(region)
+        if client is None:
+            self._cancel_input_session(key)
+            return None
+
+        try:
+            file_data = await self._fetch_napcat_file_bytes(file_id, group_id)
+        except Exception as exc:
+            self.ctx.logger.error("获取 QQ 文件失败: %s", exc)
+            await self.ctx.send.text(f"获取文件失败：{exc}", stream_id)
+            return {"action": "abort"}
+
+        import base64 as _b64
+        source = "base64://" + _b64.b64encode(file_data).decode("ascii")
+        consumed = await self._consume_files(session, key, [(file_type, source)], stream_id, client)
+        if consumed:
+            return {"action": "abort"}
+        return None
+
+    async def _fetch_napcat_file_bytes(self, file_id: str, group_id: str) -> bytes:
+        """通过 NapCat API 获取 QQ 群文件内容（gzc-download 直链下载到的是错误 ZIP）。"""
+        candidates = [
+            ("adapter.napcat.file.get_group_file_url", {"file_id": file_id, "group_id": group_id}),
+            ("adapter.napcat.message.get_group_file_url", {"file_id": file_id, "group_id": group_id}),
+            ("adapter.napcat.file.get_file", {"file_id": file_id}),
+            ("adapter.napcat.message.get_file", {"file_id": file_id}),
+        ]
+        for api_name, params in candidates:
+            try:
+                result = await self.ctx.api.call(api_name, params=params)
+            except Exception as exc:
+                self.ctx.logger.warning("NapCat 文件 API %s 调用失败: %s", api_name, exc)
+                continue
+            self.ctx.logger.info("[NapCat取文件] api=%s result=%s", api_name, str(result)[:300])
+            content = await self._extract_bytes_from_napcat_result(result)
+            if content:
+                return content
+        raise RunningHubError(f"无法通过 NapCat API 获取文件 file_id={file_id}")
+
+    async def _extract_bytes_from_napcat_result(self, result: Any) -> bytes | None:
+        """从 NapCat get_file / get_group_file_url 返回里解析出文件字节。"""
+        import base64 as _b64
+
+        if isinstance(result, str):
+            result = result.strip()
+            if result.startswith("base64://"):
+                return _b64.b64decode(result[len("base64://"):])
+            if result.startswith(("http://", "https://")):
+                client = self._client
+                if client is not None:
+                    return await client.download_bytes(result)
+            return None
+
+        if not isinstance(result, dict):
+            return None
+
+        data = result.get("data")
+        if isinstance(data, dict):
+            b64 = str(data.get("file") or data.get("base64") or data.get("data") or "").strip()
+            if b64.startswith("base64://"):
+                b64 = b64[len("base64://"):]
+            if b64:
+                try:
+                    return _b64.b64decode(b64)
+                except Exception:
+                    pass
+            url = str(data.get("url") or data.get("file_url") or data.get("download_url") or "").strip()
+            if url.startswith(("http://", "https://")):
+                client = self._client
+                if client is not None:
+                    return await client.download_bytes(url)
+            path = str(data.get("path") or data.get("file_path") or "").strip()
+            if path:
+                p = Path(path)
+                if p.is_file():
+                    return await asyncio.to_thread(p.read_bytes)
+
+        url = result.get("url")
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            client = self._client
+            if client is not None:
+                return await client.download_bytes(url)
+
         return None
 
     @Command("工作流", description="列出已配置的工作流", pattern=r"^/工作流")
