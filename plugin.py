@@ -2028,7 +2028,6 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             except Exception as exc:
                 self.ctx.logger.warning("NapCat 文件 API %s 调用失败: %s", api_name, exc)
                 continue
-            self.ctx.logger.debug("[NapCat取文件] api=%s result=%s", api_name, str(result)[:300])
             content = await self._extract_bytes_from_napcat_result(result)
             if content:
                 return content
