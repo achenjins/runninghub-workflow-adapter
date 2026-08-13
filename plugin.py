@@ -1921,6 +1921,15 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         """
         if not isinstance(message, dict):
             return None
+        # 诊断：打印非文本消息段的完整结构，便于定位文件/图片消息的真实格式
+        _raw = message.get("raw_message") or []
+        if isinstance(_raw, list):
+            _non_text = [s for s in _raw if isinstance(s, dict) and str(s.get("type") or "") != "text"]
+            if _non_text:
+                import logging
+                logging.getLogger("RunningHubGenericPlugin").info(
+                    "[输入收集] 收到非文本消息段: %r", _non_text
+                )
         user_id = str(kwargs.get("user_id") or "")
         stream_id = str(kwargs.get("stream_id") or "")
         message_info = message.get("message_info")
