@@ -1624,7 +1624,6 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             if client is None:
                 raise RunningHubError("客户端未初始化")
             data = await client.download_bytes(source)
-            self.ctx.logger.info("[下载诊断] url=%s size=%d head=%r", source, len(data), data[:64])
             return data
         path = Path(source)
         if path.is_file():
@@ -1924,22 +1923,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         会话可按 user_id（命令路径）或 stream_id（工具路径）定位。
         命中后返回 {"action": "abort"}，阻止该消息继续进入 LLM。
         """
-        # 诊断：无条件打印，确认 notice/文件消息是否经过 before_process hook
-        self.ctx.logger.info(
-            "[输入收集] hook 触发: message_type=%s kwargs_keys=%s",
-            type(message).__name__ if message is not None else "None",
-            list((kwargs or {}).keys()),
-        )
         if not isinstance(message, dict):
             return None
-        # 诊断：打印非文本消息段的完整结构，便于定位文件/图片消息的真实格式
-        _raw = message.get("raw_message") or []
-        if isinstance(_raw, list):
-            _non_text = [s for s in _raw if isinstance(s, dict) and str(s.get("type") or "") != "text"]
-            if _non_text:
-                self.ctx.logger.info(
-                    "[输入收集] 收到非文本消息段: %r", _non_text
-                )
         user_id = str(kwargs.get("user_id") or "")
         stream_id = str(kwargs.get("stream_id") or "")
         message_info = message.get("message_info")
@@ -1951,11 +1936,6 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             stream_id = str(message.get("session_id") or message.get("stream_id") or "")
         session = self._find_input_session(user_id, stream_id)
         if session is None:
-            self.ctx.logger.info(
-                "[输入收集] 无进行中的上传会话，忽略: user_id=%s stream_id=%s raw_types=%s",
-                user_id, stream_id,
-                [str(s.get("type") or "") for s in (message.get("raw_message") or []) if isinstance(s, dict)],
-            )
             return None
         stream_id = stream_id or session.stream_id
         if session.phase == "config":
@@ -2048,7 +2028,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             except Exception as exc:
                 self.ctx.logger.warning("NapCat 文件 API %s 调用失败: %s", api_name, exc)
                 continue
-            self.ctx.logger.info("[NapCat取文件] api=%s result=%s", api_name, str(result)[:300])
+            self.ctx.logger.debug("[NapCat取文件] api=%s result=%s", api_name, str(result)[:300])
             content = await self._extract_bytes_from_napcat_result(result)
             if content:
                 return content
