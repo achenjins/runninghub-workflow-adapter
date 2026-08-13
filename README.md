@@ -27,19 +27,22 @@ pip install -r runninghub-workflow-adapter/requirements.txt
 
 在 MaiBot WebUI 插件配置页填写，或编辑 `config.toml`。
 
-**必填**：`server.api_key`
+**必填**：`server.api_key`（海外）或 `server.api_key_cn`（国内），至少填一个。海外走 `runninghub.ai`，国内走 `runninghub.cn`。
 
-**节点识别**：`detect.use_llm` 开启后，`/识别工作流` 会用内置 LLM 识别输入节点（文字/图片/语音）与配置节点（分辨率、画幅、步数、采样器等，自动带当前默认值），LLM 失败时回退启发式规则。`detect.model` 选模型槽位（`utils` 快 / `replyer` 强 / `planner`）。
+**区域**：每个工作流有 `region` 字段（`overseas`=海外 / `domestic`=国内，默认海外）。`/识别工作流` 时会自动用海外/国内 key 依次尝试拉取，哪个通就记哪个区域；运行时也按区域选对应 API。若工作流区域对应的 key 没填，会提示检查配置。
+
+**节点识别**：`/识别工作流`（简化，仅文字/图片/音频/视频/分辨率/长宽比例）与 `/详细识别工作流`（LLM 全量识别，含步数/采样器/CFG/种子等）。`detect.model` 选模型槽位。
 
 **最快上手**：聊天中发送 `/识别工作流 <工作流ID> <名称>`，自动识别输入节点并写入配置，热重载后即可用。
 
-**工作流配置**：WebUI「工作流列表」中可直接增删工作流与输入节点（名称 / 工作流 ID / 设备类型下拉 / LLM 扩写开关 / 输入节点表单），无需手写 TOML。手动编辑 `config.toml` 时的结构如下：
+**工作流配置**：WebUI「工作流列表」中可直接增删工作流与输入节点（名称 / 工作流 ID / 设备类型下拉 / 区域 / LLM 扩写开关 / 输入节点表单），无需手写 TOML。手动编辑 `config.toml` 时的结构如下：
 
 ```toml
 [[workflows.items]]
 name = "动漫生图"
 workflow_id = "2087492768787685378"
 instance_type = "Standard"
+region = "overseas"
 llm_enhance = false
 llm_template_path = ""
 
@@ -47,7 +50,7 @@ llm_template_path = ""
 node_id = "353"
 field_name = "prompt"
 field_value = ""
-value_type = "text"
+value_type = "prompt"
 label = "提示词"
 ```
 

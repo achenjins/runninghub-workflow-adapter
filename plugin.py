@@ -86,13 +86,23 @@ class ServerSection(PluginConfigBase):
 
     base_url: str = Field(
         default="https://www.runninghub.ai",
-        description="RunningHub 平台基地址",
-        json_schema_extra={"label": "平台基地址", "placeholder": "https://www.runninghub.ai"},
+        description="海外平台基地址（runninghub.ai）",
+        json_schema_extra={"label": "海外基地址", "placeholder": "https://www.runninghub.ai"},
     )
     api_key: str = Field(
         default="",
-        description="RunningHub API Key（在平台个人中心获取，务必保密）",
-        json_schema_extra={"label": "API Key", "placeholder": "粘贴你的 API Key", "x-widget": "password"},
+        description="海外 RunningHub API Key（在平台个人中心获取，务必保密）",
+        json_schema_extra={"label": "海外 API Key", "placeholder": "粘贴你的 API Key", "x-widget": "password"},
+    )
+    base_url_cn: str = Field(
+        default="https://www.runninghub.cn",
+        description="国内平台基地址（runninghub.cn）",
+        json_schema_extra={"label": "国内基地址", "placeholder": "https://www.runninghub.cn"},
+    )
+    api_key_cn: str = Field(
+        default="",
+        description="国内 RunningHub API Key（可与海外只填一个；只填一个时拉取默认用该 key）",
+        json_schema_extra={"label": "国内 API Key", "placeholder": "粘贴你的国内 API Key", "x-widget": "password"},
     )
 
 
@@ -240,6 +250,11 @@ class WorkflowItemSection(PluginConfigBase):
         default="Standard",
         description="设备类型：Standard 或 Plus",
         json_schema_extra={"label": "设备类型"},
+    )
+    region: Literal["overseas", "domestic"] = Field(
+        default="overseas",
+        description="区域：overseas=海外（runninghub.ai），domestic=国内（runninghub.cn）；决定用哪个 API 拉取与提交",
+        json_schema_extra={"label": "区域", "hint": "overseas=海外 / domestic=国内"},
     )
     llm_enhance: bool = Field(
         default=False,
@@ -396,6 +411,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._client: RunningHubClient | None = None
+        self._client_cn: RunningHubClient | None = None
         self._semaphore: asyncio.Semaphore = asyncio.Semaphore(2)
         self._pending: dict[str, asyncio.Task] = {}
         self._recall_tasks: set[asyncio.Task] = set()
@@ -553,6 +569,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         self._recall_tasks.clear()
         self._input_sessions.clear()
         self._client = None
+        self._client_cn = None
         self.ctx.logger.info("通用工作流插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
@@ -646,14 +663,24 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     def _rebuild_client(self) -> None:
         cfg = self.config
+        kwargs = {
+            "workflow_id": "",
+            "timeout": cfg.generation.download_timeout,
+            "poll_interval": cfg.generation.poll_interval,
+            "max_wait": cfg.generation.max_wait,
+        }
         self._client = RunningHubClient(
-            base_url=cfg.server.base_url,
-            api_key=cfg.server.api_key,
-            workflow_id="",
-            timeout=cfg.generation.download_timeout,
-            poll_interval=cfg.generation.poll_interval,
-            max_wait=cfg.generation.max_wait,
+            base_url=cfg.server.base_url, api_key=cfg.server.api_key, **kwargs
         )
+        self._client_cn = RunningHubClient(
+            base_url=cfg.server.base_url_cn, api_key=cfg.server.api_key_cn, **kwargs
+        )
+
+    def _get_client(self, region: str) -> RunningHubClient | None:
+        """按区域返回对应客户端（overseas/domestic）。"""
+        if region == "domestic":
+            return self._client_cn
+        return self._client
 
     def _find_workflow(self, name: str) -> WorkflowItemSection | None:
         """按名称查找工作流配置。"""
@@ -914,15 +941,6 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         """查找工作流，构建节点参数，提交任务或进入交互式收集。"""
         stream_id = str(kwargs.pop("stream_id", "") or "")
         user_id = str(kwargs.get("user_id") or "")
-        client = self._client
-        if client is None:
-            self._rebuild_client()
-            client = self._client
-        if client is None:
-            return {"success": False, "message": "插件客户端未初始化，请检查配置"}
-
-        if not self.config.server.api_key:
-            return {"success": False, "message": "未配置 RunningHub API Key，请编辑 config.toml 后重载插件"}
 
         workflow = self._find_workflow(workflow_name)
         if workflow is None:
@@ -931,6 +949,22 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
         if not workflow.workflow_id.strip():
             return {"success": False, "message": f"工作流「{workflow.name}」未配置 workflow_id"}
+
+        # 按工作流区域选择对应客户端（海外/国内）
+        region = str(workflow.region or "overseas").strip()
+        client = self._get_client(region)
+        if client is None:
+            self._rebuild_client()
+            client = self._get_client(region)
+        if client is None:
+            return {"success": False, "message": "插件客户端未初始化，请检查配置"}
+
+        if not self.config.server.api_key and not self.config.server.api_key_cn:
+            return {"success": False, "message": "未配置 RunningHub API Key，请编辑 config.toml 后重载插件"}
+        region_label = "国内" if region == "domestic" else "海外"
+        region_key = self.config.server.api_key_cn if region == "domestic" else self.config.server.api_key
+        if not region_key:
+            return {"success": False, "message": f"该工作流为{region_label}，但对应 API Key 未填写，请检查配置"}
 
         prompt_nodes = self._prompt_nodes(workflow)
         if len(prompt_nodes) > 1:
@@ -1022,7 +1056,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             len(node_info_list),
         )
         poll_task = asyncio.create_task(
-            self._poll_and_send(task_id, stream_id, kwargs=kwargs)
+            self._poll_and_send(task_id, stream_id, client=client, kwargs=kwargs)
         )
         self._pending[task_id] = poll_task
         return {
@@ -1135,10 +1169,11 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             )
             return True
 
-        client = self._client
+        region = str(session.workflow.region or "overseas").strip()
+        client = self._get_client(region)
         if client is None:
             self._rebuild_client()
-            client = self._client
+            client = self._get_client(region)
         if client is None:
             self._cancel_input_session(key)
             return True
@@ -1253,10 +1288,11 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 self._patch_text_value(
                     session.collected, node["node_id"], node["field_name"], values[index]
                 )
-        client = self._client
+        region = str(session.workflow.region or "overseas").strip()
+        client = self._get_client(region)
         if client is None:
             self._rebuild_client()
-            client = self._client
+            client = self._get_client(region)
         if client is None:
             key = self._session_key(session.user_id, session.stream_id)
             self._cancel_input_session(key)
@@ -1318,10 +1354,11 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         if session is None:
             return False
         key = self._session_key(session.user_id, session.stream_id)
-        client = self._client
+        region = str(session.workflow.region or "overseas").strip()
+        client = self._get_client(region)
         if client is None:
             self._rebuild_client()
-            client = self._client
+            client = self._get_client(region)
         if client is None:
             self._cancel_input_session(key)
             await self.ctx.send.text("插件客户端未初始化，已取消本次任务", stream_id)
@@ -1454,12 +1491,19 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     # ── 轮询发送 / 撤回 ──────────────────────────────────────────
 
-    async def _poll_and_send(self, task_id: str, stream_id: str, *, kwargs: dict | None = None) -> None:
+    async def _poll_and_send(
+        self,
+        task_id: str,
+        stream_id: str,
+        *,
+        client: RunningHubClient | None = None,
+        kwargs: dict | None = None,
+    ) -> None:
         """后台轮询任务状态，完成后下载并发送结果；按配置定时撤回。
 
         结果按类型分流：图片直接发送；其他类型（视频等）发送下载链接。
         """
-        client = self._client
+        client = client or self._client
         chat_info = self._extract_chat_info(kwargs or {})
         try:
             try:
@@ -1786,13 +1830,20 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         """识别工作流节点并写入配置（detailed=True 走 LLM 全量识别）。"""
         self.ctx.logger.info("[识别] 开始: workflow_id=%s name=%s detailed=%s", workflow_id, workflow_name, detailed)
 
-        client = self._client
-        if client is None:
-            self._rebuild_client()
-            client = self._client
-        if client is None or not self.config.server.api_key:
-            self.ctx.logger.warning("[识别] 未配置 api_key，无法获取工作流")
-            await self.ctx.send.text("请先在配置中填写 server.api_key", stream_id)
+        # 候选区域：按已填写的 API Key 决定（海外优先，其次国内），客户端缺失时按需重建
+        candidates: list[tuple[str, RunningHubClient]] = []
+        for key_attr, region_name in (("api_key", "overseas"), ("api_key_cn", "domestic")):
+            if not getattr(self.config.server, key_attr):
+                continue
+            client = self._get_client(region_name)
+            if client is None:
+                self._rebuild_client()
+                client = self._get_client(region_name)
+            if client is not None:
+                candidates.append((region_name, client))
+        if not candidates:
+            self.ctx.logger.warning("[识别] 未配置任何 api_key")
+            await self.ctx.send.text("请先填写 RunningHub API Key（海外或国内至少一个）", stream_id)
             return True, "", 1
 
         # 名称冲突检查
@@ -1803,18 +1854,26 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 )
                 return True, "", 1
 
-        self.ctx.logger.info("[识别] 请求 getJsonApiFormat: workflow_id=%s", workflow_id)
-        try:
-            workflow_json = await client.get_workflow_json(workflow_id)
-        except RunningHubError as exc:
-            self.ctx.logger.error("[识别] 获取工作流失败: %s", exc)
-            await self.ctx.send.text(f"获取工作流失败：{exc}", stream_id)
+        # 依次用海外/国内 key 拉取工作流，哪个通就是哪个区域
+        workflow_json: dict[str, Any] | None = None
+        region = "overseas"
+        last_error = ""
+        for cand_region, cand_client in candidates:
+            if cand_client is None:
+                continue
+            self.ctx.logger.info("[识别] 尝试 %s 拉取: workflow_id=%s", cand_region, workflow_id)
+            try:
+                workflow_json = await cand_client.get_workflow_json(workflow_id)
+                region = cand_region
+                break
+            except Exception as exc:
+                last_error = str(exc)
+                self.ctx.logger.info("[识别] %s 拉取失败: %s", cand_region, exc)
+        if workflow_json is None:
+            self.ctx.logger.error("[识别] 获取工作流失败（海外/国内均失败）: %s", last_error)
+            await self.ctx.send.text(f"获取工作流失败，请检查 API Key：{last_error}", stream_id)
             return True, "", 1
-        except Exception as exc:
-            self.ctx.logger.error("[识别] 获取工作流异常: %s", exc, exc_info=True)
-            await self.ctx.send.text(f"获取工作流异常：{exc}", stream_id)
-            return True, "", 1
-        self.ctx.logger.info("[识别] 工作流 JSON 已获取，节点总数=%d", len(workflow_json))
+        self.ctx.logger.info("[识别] 工作流 JSON 已获取（区域=%s），节点总数=%d", region, len(workflow_json))
 
         if detailed:
             detected, detect_method = await self._detect_full(workflow_json)
@@ -1838,14 +1897,16 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 workflow_name=workflow_name,
                 workflow_id=workflow_id,
                 nodes=detected,
+                region=region,
             )
         except Exception as exc:
             self.ctx.logger.error("[识别] 写入 config.toml 失败: %s", exc, exc_info=True)
             await self.ctx.send.text(f"写入配置失败：{exc}", stream_id)
             return True, "", 1
 
+        region_label = "国内" if region == "domestic" else "海外"
         await self.ctx.send.text(
-            f"识别成功（{detect_method}），共 {len(detected)} 个节点，具体请查看插件配置",
+            f"识别成功（{detect_method}·{region_label}），共 {len(detected)} 个节点，具体请查看插件配置",
             stream_id,
         )
         return True, "", 1
@@ -1918,6 +1979,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             lines.append(f"name = {self._toml_string(str(workflow.get('name') or ''))}")
             lines.append(f"workflow_id = {self._toml_string(str(workflow.get('workflow_id') or ''))}")
             lines.append(f"instance_type = {self._toml_string(str(workflow.get('instance_type') or 'Standard'))}")
+            lines.append(f"region = {self._toml_string(str(workflow.get('region') or 'overseas'))}")
             lines.append(f"llm_enhance = {'true' if workflow.get('llm_enhance') else 'false'}")
             lines.append(f"llm_template_path = {self._toml_string(str(workflow.get('llm_template_path') or ''))}")
             lines.append("")
@@ -1937,6 +1999,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         lines.append("[server]")
         lines.append(f"base_url = {self._toml_string(cfg.server.base_url)}")
         lines.append(f"api_key = {self._toml_string(cfg.server.api_key)}")
+        lines.append(f"base_url_cn = {self._toml_string(cfg.server.base_url_cn)}")
+        lines.append(f"api_key_cn = {self._toml_string(cfg.server.api_key_cn)}")
         lines.append("")
         lines.append("[generation]")
         lines.append(f"poll_interval = {cfg.generation.poll_interval}")
@@ -1951,6 +2015,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         lines.append("[detect]")
         lines.append(f"use_llm = {'true' if cfg.detect.use_llm else 'false'}")
         lines.append(f"model = {self._toml_string(cfg.detect.model)}")
+        lines.append("")
+        lines.append("[llm]")
+        lines.append(f"enhance_model = {self._toml_string(cfg.llm.enhance_model)}")
         lines.append("")
         return "\n".join(lines)
 
@@ -2082,6 +2149,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         workflow_name: str,
         workflow_id: str,
         nodes: list[dict[str, str]],
+        region: str = "overseas",
     ) -> None:
         """将识别出的工作流以结构化条目写入 workflows.items 并重建 config.toml。
 
@@ -2091,6 +2159,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             "name": workflow_name,
             "workflow_id": workflow_id,
             "instance_type": "Standard",
+            "region": region,
             "llm_enhance": False,
             "llm_template_path": "",
             "input_nodes": [

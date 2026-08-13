@@ -7,6 +7,8 @@ config_version = "1.1.0"
 [server]
 base_url = "https://www.runninghub.ai"
 api_key = ""
+base_url_cn = "https://www.runninghub.cn"
+api_key_cn = ""
 
 [generation]
 poll_interval = 15
@@ -38,6 +40,7 @@ enhance_model = "utils"
 # name = "动漫生图"
 # workflow_id = "2087492768787685378"
 # instance_type = "Standard"      # Standard 或 Plus
+# region = "overseas"             # overseas=海外(runninghub.ai) / domestic=国内(runninghub.cn)
 # llm_enhance = false             # LLM 扩写开关
 # llm_template_path = ""          # 扩写模板路径（相对插件目录）
 #
