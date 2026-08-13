@@ -56,8 +56,8 @@ class PluginMetaSection(PluginConfigBase):
 
     config_version: str = Field(
         default="1.1.0",
-        description="插件配置版本号",
-        json_schema_extra={"hidden": True},
+        description="插件配置版本号（请勿修改）",
+        json_schema_extra={"disabled": True},
     )
 
 
