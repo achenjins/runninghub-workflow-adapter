@@ -964,7 +964,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 continue
             try:
                 file_data = await self._fetch_file_bytes(source)
-                filename = self._guess_filename(source, file_type)
+                filename = self._guess_filename(source, file_type, file_data)
                 file_name = await client.upload_file(file_data, filename)
             except Exception as exc:
                 self.ctx.logger.error("上传文件到 RunningHub 失败: %s", exc)
@@ -1058,7 +1058,13 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     @staticmethod
     def _extract_files_from_message(message: dict) -> list[tuple[str, str]]:
-        """从消息中提取文件，返回 [(类型 image/audio, 来源 url 或路径)]。"""
+        """从消息中提取文件，返回 [(类型 image/audio, 来源)]。
+
+        MaiBot 消息段真实格式（Host 序列化后）：
+        - 图片: {"type":"image","data":"<内容/url>","hash":"...","binary_data_base64":"<base64 或空>"}
+        - 语音: {"type":"voice","data":"<内容/url>","hash":"...","binary_data_base64":"<base64 或空>"}
+        优先用 binary_data_base64（真实字节，base64:// 前缀），否则回退 data（url/本地路径）。
+        """
         raw = message.get("raw_message") or []
         if not isinstance(raw, list):
             return []
@@ -1067,22 +1073,22 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             if not isinstance(seg, dict):
                 continue
             seg_type = str(seg.get("type") or "")
-            data = seg.get("data") or {}
-            if not isinstance(data, dict):
-                continue
+            data = seg.get("data")
+            data_text = str(data).strip() if isinstance(data, str) else ""
+            b64 = str(seg.get("binary_data_base64") or "").strip()
             if seg_type == "image":
-                source = str(data.get("url") or data.get("file") or "").strip()
+                source = ("base64://" + b64) if b64 else data_text
                 if source:
                     files.append(("image", source))
-            elif seg_type in ("record", "audio", "voice"):
-                source = str(data.get("url") or data.get("file") or data.get("path") or "").strip()
+            elif seg_type in ("voice", "record", "audio"):
+                source = ("base64://" + b64) if b64 else data_text
                 if source:
                     files.append(("audio", source))
         return files
 
     @staticmethod
     def _extract_text_from_message(message: dict) -> str:
-        """从消息中提取纯文本内容（用于识别跳过/完成等控制词）。"""
+        """从消息中提取纯文本内容（text 段 data 为字符串）。"""
         raw = message.get("raw_message") or []
         if not isinstance(raw, list):
             return ""
@@ -1092,9 +1098,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 continue
             if str(seg.get("type") or "") != "text":
                 continue
-            data = seg.get("data") or {}
-            if isinstance(data, dict):
-                parts.append(str(data.get("text") or ""))
+            data = seg.get("data")
+            if isinstance(data, str):
+                parts.append(data)
         return "".join(parts).strip()
 
     @staticmethod
@@ -1108,7 +1114,11 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         return normalized.startswith("跳过") or normalized.startswith("开始运行")
 
     async def _fetch_file_bytes(self, source: str) -> bytes:
-        """从 URL 或本地路径获取文件字节。"""
+        """从 base64 数据、URL 或本地路径获取文件字节。"""
+        if source.startswith("base64://"):
+            import base64
+
+            return base64.b64decode(source[len("base64://"):])
         if source.startswith(("http://", "https://")):
             client = self._client
             if client is None:
@@ -1120,14 +1130,24 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         raise RunningHubError(f"无法读取文件: {source}")
 
     @staticmethod
-    def _guess_filename(source: str, file_type: str) -> str:
-        """根据来源猜测文件名（含扩展名）。"""
-        import os
-
+    def _guess_filename(source: str, file_type: str, file_data: bytes | None = None) -> str:
+        """根据来源/字节猜测文件名（含扩展名，图片按魔数识别真实格式）。"""
         base = source.split("?", 1)[0].rsplit("/", 1)[-1]
-        if base and "." in base:
+        if base and "." in base and not base.startswith("base64:"):
             return base
-        return f"input_{file_type}_{int(time.time())}{'.png' if file_type == 'image' else '.mp3'}"
+        ext = ""
+        if file_type == "image" and file_data:
+            if file_data[:3] == b"\xff\xd8\xff":
+                ext = ".jpg"
+            elif file_data[:8] == b"\x89PNG\r\n\x1a\n":
+                ext = ".png"
+            elif len(file_data) >= 12 and file_data[:4] == b"RIFF" and file_data[8:12] == b"WEBP":
+                ext = ".webp"
+            elif file_data[:6] in (b"GIF87a", b"GIF89a"):
+                ext = ".gif"
+        if not ext:
+            ext = ".png" if file_type == "image" else ".mp3"
+        return f"input_{file_type}_{int(time.time())}{ext}"
 
 
 
@@ -1372,13 +1392,22 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     async def handle_input_collector(self, **kwargs: Any) -> None:
         """收集交互式输入会话中的文件消息，并响应跳过/开始等控制词。
 
+        EventHandler 的 kwargs 只含 event_type/message（及可能的 extra_args），
+        user_id/stream_id 需从 message 里取（message_info.user_info.user_id / session_id）。
         会话可按 user_id（命令路径）或 stream_id（工具路径）定位。
         """
-        user_id = str(kwargs.get("user_id") or "")
         message = kwargs.get("message")
         if not isinstance(message, dict):
             message = {}
+        user_id = str(kwargs.get("user_id") or "")
         stream_id = str(kwargs.get("stream_id") or "")
+        message_info = message.get("message_info")
+        if isinstance(message_info, dict):
+            user_info = message_info.get("user_info")
+            if isinstance(user_info, dict) and not user_id:
+                user_id = str(user_info.get("user_id") or "")
+        if not stream_id:
+            stream_id = str(message.get("session_id") or message.get("stream_id") or "")
         session = self._find_input_session(user_id, stream_id)
         if session is None:
             return
