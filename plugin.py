@@ -1185,7 +1185,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             tips = self._build_config_edit_tips(session.editable_nodes)
             await self.ctx.send.text(
                 f"{notice}。你可修改以下配置：\n{tips}\n"
-                "（回复新值，如「0.3, 16:9」按顺序对应上述配置；某项用「-」表示保持默认；回复「不变」全部使用默认值）",
+                "（直接回复新值，用空格或中英文逗号分隔，按顺序对应上面的配置项；"
+                "某项想保持默认就填「-」；回复「不变」全部使用默认值。"
+                "例如回复「512 16:9」或「512，16:9」）",
                 stream_id,
             )
             return
