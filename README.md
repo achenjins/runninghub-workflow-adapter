@@ -62,7 +62,7 @@ use_command_text = true
 - **列出工作流**：`/工作流`
 - **自动识别并写入配置**：`/识别工作流 <工作流ID> [工作流名称]`——自动识别输入节点（文字/图片/语音）并追加写入 config.toml，Runner 热重载后即可用
 - **工具**：模型自动调用 `run_workflow(workflow_name, prompt, stream_id)`
-- **其他插件**：`ctx.api.call("runninghub-workflow-adapter.run_workflow", workflow_name=..., prompt=..., stream_id=...)`
+- **其他插件**：`ctx.api.call("rh-workflow-adapter.run_workflow", workflow_name=..., prompt=..., stream_id=...)`
 
 ## 自动清理
 

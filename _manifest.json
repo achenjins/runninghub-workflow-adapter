@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "id": "runninghub-workflow-adapter",
+  "id": "rh-workflow-adapter",
   "version": "1.0.0",
   "name": "RunningHub 通用工作流插件",
   "description": "通过配置适配 RunningHub 的大部分工作流：可配置多个工作流，每个工作流可自由增加输入节点（节点 ID / 字段名 / 默认值），命令、工具与公开 API 三种触发方式，任务完成后自动发送结果，支持自动撤回。",
