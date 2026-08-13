@@ -356,6 +356,12 @@ class InputSession:
     collected: list[dict[str, str]] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     expire_task: asyncio.Task | None = None
+    # 文字扩写延后到收集完成：记录原始文本、文字节点身份与实际上传的文件数量
+    command_text: str = ""
+    text_node_id: str = ""
+    text_field_name: str = ""
+    uploaded_images: int = 0
+    uploaded_audios: int = 0
 
 
 class RunningHubGenericPlugin(MaiBotPlugin):
@@ -659,7 +665,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     def _describe_file_inputs(self, workflow: WorkflowItemSection) -> str:
         """汇总该工作流需要用户上传的文件输入（图片/音频的种类与数量）。
 
-        扩写发生在用户上传之前，因此这里告知的是工作流所需的文件节点，而非实际已收到的文件。
+        仅在未提供实际上传数量时作为兜底，告知工作流所需的文件节点。
         """
         images = [
             n for n in workflow.input_nodes
@@ -678,8 +684,49 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             parts.append(f"参考音频 {len(audios)} 段（{labels}）")
         return "；".join(parts) if parts else ""
 
-    async def _enhance_text(self, workflow: WorkflowItemSection, text: str) -> str:
-        """按工作流配置对文字进行 LLM 扩写（失败回退原文）。"""
+    @staticmethod
+    def _format_file_counts(images: int, audios: int) -> str:
+        """按实际上传数量生成简短描述（0 的类别省略）。"""
+        parts: list[str] = []
+        if images:
+            parts.append(f"参考图片 {images} 张")
+        if audios:
+            parts.append(f"参考音频 {audios} 段")
+        return "；".join(parts)
+
+    def _primary_text_node(self, workflow: WorkflowItemSection) -> InputNodeSection | None:
+        """返回第一个无默认值的文字节点（接收命令文本的节点）。"""
+        for node in self._ordered_nodes(workflow):
+            if not str(node.field_value or "").strip() and self._resolve_value_type(node) == "text":
+                return node
+        return None
+
+    @staticmethod
+    def _patch_text_value(
+        node_info_list: list[dict[str, str]],
+        node_id: str,
+        field_name: str,
+        text: str,
+    ) -> list[dict[str, str]]:
+        """回填文字节点的 fieldValue。"""
+        for entry in node_info_list:
+            if entry.get("nodeId") == node_id and entry.get("fieldName") == field_name:
+                entry["fieldValue"] = text
+                break
+        return node_info_list
+
+    async def _enhance_text(
+        self,
+        workflow: WorkflowItemSection,
+        text: str,
+        *,
+        actual_file_desc: str | None = None,
+    ) -> str:
+        """按工作流配置对文字进行 LLM 扩写（失败回退原文）。
+
+        actual_file_desc 传实际的"参考图片 N 张；参考音频 M 段"描述；
+        为 None 时回退为工作流配置的文件节点汇总。
+        """
         text = str(text or "").strip()
         if not text or not workflow.llm_enhance:
             return text
@@ -687,10 +734,11 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         if not template:
             self.ctx.logger.warning("工作流 %s 开启 LLM 扩写但模板为空，使用原文", workflow.name)
             return text
-        file_desc = self._describe_file_inputs(workflow)
+        if actual_file_desc is None:
+            actual_file_desc = self._describe_file_inputs(workflow)
         input_context = (
-            f"本次任务将使用以下文件输入：{file_desc}。"
-            if file_desc
+            f"本次任务将使用以下文件输入：{actual_file_desc}。"
+            if actual_file_desc
             else "本次任务无额外文件输入。"
         )
         prompt_text = (
@@ -814,24 +862,25 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         if not workflow.workflow_id.strip():
             return {"success": False, "message": f"工作流「{workflow.name}」未配置 workflow_id"}
 
-        # LLM 扩写（仅文字命令节点）
-        enhanced_text = await self._enhance_text(workflow, command_text)
+        text_node = self._primary_text_node(workflow)
 
-        node_info_list, waiting = self._build_node_info_list(
-            workflow, command_text, enhanced_text=enhanced_text
-        )
+        # 先用原始文本构建节点参数（文字节点暂填原文，扩写见下）
+        node_info_list, waiting = self._build_node_info_list(workflow, command_text)
 
         if not node_info_list and not waiting:
             return {"success": False, "message": f"工作流「{workflow.name}」未配置任何输入节点"}
 
         if waiting:
-            # 进入交互式收集
+            # 进入交互式收集：文字扩写延后到收集完成，以便告知 LLM 实际上传的文件数量
             self._create_input_session(
                 user_id=user_id,
                 stream_id=stream_id,
                 workflow=workflow,
                 waiting_nodes=waiting,
                 collected=node_info_list,
+                command_text=command_text,
+                text_node_id=text_node.node_id.strip() if text_node else "",
+                text_field_name=text_node.field_name.strip() if text_node else "",
             )
             tips = self._build_waiting_tips(waiting)
             required_files = [
@@ -847,6 +896,16 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                     "发送「跳过剩余」可直接开始运行，未上传的文件节点将使用工作流默认值"
                 ),
             }
+
+        # 无文件节点：立即扩写并回填文字节点
+        if text_node and workflow.llm_enhance:
+            enhanced_text = await self._enhance_text(workflow, command_text)
+            self._patch_text_value(
+                node_info_list,
+                text_node.node_id.strip(),
+                text_node.field_name.strip(),
+                enhanced_text,
+            )
 
         return await self._submit_and_poll(client, workflow, node_info_list, stream_id, kwargs)
 
@@ -923,6 +982,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         workflow: WorkflowItemSection,
         waiting_nodes: list[dict[str, Any]],
         collected: list[dict[str, str]],
+        command_text: str = "",
+        text_node_id: str = "",
+        text_field_name: str = "",
     ) -> None:
         """创建交互式收集会话（优先按用户、工具路径回退按会话），带超时清理。"""
         key = self._session_key(user_id, stream_id)
@@ -940,6 +1002,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 for item in waiting_nodes
             ],
             collected=collected,
+            command_text=command_text,
+            text_node_id=text_node_id,
+            text_field_name=text_field_name,
         )
         self._input_sessions[key] = session
 
@@ -1023,6 +1088,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                     "fieldValue": file_name,
                 }
             )
+            if file_type == "image":
+                session.uploaded_images += 1
+            elif file_type == "audio":
+                session.uploaded_audios += 1
             self.ctx.logger.info("已接收输入 %s: %s", node["label"], file_name)
 
         if session.waiting_nodes:
@@ -1049,6 +1118,26 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         self._input_sessions.pop(key, None)
         if session.expire_task is not None:
             session.expire_task.cancel()
+
+        # 文字扩写延后到此刻：用实际上传的文件数量重新扩写并回填文字节点
+        if (
+            session.command_text
+            and session.text_node_id
+            and session.workflow.llm_enhance
+        ):
+            actual_desc = self._format_file_counts(
+                session.uploaded_images, session.uploaded_audios
+            )
+            enhanced = await self._enhance_text(
+                session.workflow, session.command_text, actual_file_desc=actual_desc
+            )
+            session.collected = self._patch_text_value(
+                session.collected,
+                session.text_node_id,
+                session.text_field_name,
+                enhanced,
+            )
+
         await self.ctx.send.text(notice, stream_id)
         result = await self._submit_and_poll(
             client, session.workflow, session.collected, stream_id, {}
