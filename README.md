@@ -43,14 +43,32 @@
 - 如果回复「尚未配置任何工作流」→ 插件已成功加载，继续下一步。
 - 如果没反应 → 去 MaiBot 的插件 / 日志页面确认插件是否启用、有没有报错。
 
-### 第 1 步：填 API Key
+### 第 1 步：注册并填 API Key
 
 这是最重要的一步，不填后面全都会失败。
 
-1. 登录 RunningHub 网站，进入「个人中心 / 设置」，找到 **API Key（令牌）**，复制。
-   - 用国外的 runninghub.ai → 填「国外 API Key」
-   - 用国内的 runninghub.cn → 填「国内 API Key」（两边账号不通用，用哪个填哪个，也可以都填）
-2. 打开 MaiBot 的**插件配置页**，找到本插件的「RunningHub 服务」一栏，把 Key 粘进去，保存。
+**① 注册账号（用邀请码注册，可得 500 RH 币）**
+
+打开对应平台的注册链接（邀请码已内置在链接里）：
+
+- 国内站：[https://www.runninghub.cn?inviteCode=8cq8uhl8](https://www.runninghub.cn?inviteCode=8cq8uhl8)
+- 海外站：[https://www.runninghub.ai?inviteCode=bvhsaqdr](https://www.runninghub.ai?inviteCode=bvhsaqdr)
+
+**② 获取 API Key**
+
+注册并登录后，打开对应平台的 API 页面，复制页面里的 API Key：
+
+- 国内站：[https://www.runninghub.cn/enterprise-api/consumerApi](https://www.runninghub.cn/enterprise-api/consumerApi)
+- 海外站：[https://www.runninghub.ai/enterprise-api/consumerApi](https://www.runninghub.ai/enterprise-api/consumerApi)
+
+**③ 填进插件**
+
+打开 MaiBot 的**插件配置页**，找到本插件的「RunningHub 服务」一栏：
+
+- 用国内站（runninghub.cn）→ 把 Key 填进「国内 API Key」
+- 用海外站（runninghub.ai）→ 把 Key 填进「国外 API Key」
+
+两边账号和 Key 不通用，用哪个填哪个，也可以都填。
 
 > 填完通常需要「重载插件」或「保存配置」才生效。
 
