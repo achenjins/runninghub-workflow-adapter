@@ -384,6 +384,38 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         self._workflows = list(self.config.workflows.items)
         self.ctx.logger.info("[配置] 已加载 %d 个工作流", len(self._workflows))
 
+    def _workflow_names(self) -> list[str]:
+        """返回当前已配置的工作流名称列表（配置未就绪时回退缓存）。"""
+        try:
+            return [str(w.name or "").strip() for w in self.config.workflows.items if str(w.name or "").strip()]
+        except Exception:
+            return [str(w.name or "").strip() for w in self._workflows if str(w.name or "").strip()]
+
+    def get_components(self) -> list[dict[str, Any]]:
+        """收集组件，并把当前已配置的工作流名称注入 run_workflow 工具描述。
+
+        LLM 调用工具前只能看到工具描述，若不列出确切的工作流名称，它会瞎猜
+        workflow_name 甚至干脆不调用（幻觉已完成），因此在这里动态注入名称列表。
+        """
+        components = super().get_components()
+        names = self._workflow_names()
+        name_list = "、".join(names) if names else "（尚未配置任何工作流，请先让用户发送 /识别工作流 添加）"
+        for comp in components:
+            if comp.get("type") != "TOOL" or comp.get("name") != "run_workflow":
+                continue
+            metadata = dict(comp.get("metadata") or {})
+            description = (
+                "运行配置好的 RunningHub 工作流生成图片或视频。"
+                f"当前已配置的工作流名称：{name_list}。"
+                "workflow_name 必须从上述名称中精确选择一个；prompt 填生成内容描述（可留空）。"
+                "调用后若返回 waiting=true，说明该工作流还需要用户上传参考图/参考音频，"
+                "必须把 required_files 里的要求如实转告用户，让用户直接发送文件到会话。"
+            )
+            metadata["description"] = description
+            metadata["brief_description"] = description
+            comp["metadata"] = metadata
+        return components
+
     def get_webui_config_schema(self, **kwargs: Any) -> dict[str, Any]:
         """生成 WebUI 配置 Schema，并补全二级嵌套列表（input_nodes）的元素字段定义。
 
@@ -1953,6 +1985,19 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         **kwargs: Any,
     ) -> dict[str, Any]:
         kwargs["stream_id"] = stream_id
+        workflow_name = str(workflow_name or "").strip()
+        names = self._workflow_names()
+        if not workflow_name:
+            # 自述用法：让 LLM 知道有哪些工作流、怎么传参
+            return {
+                "success": False,
+                "message": (
+                    "未指定 workflow_name。用法：workflow_name 从已配置的工作流名称中精确选一个，"
+                    "prompt 填生成内容描述（可留空），stream_id 填当前聊天流 ID。"
+                    "当前已配置的工作流："
+                    + ("、".join(names) if names else "（无，请先让用户发送 /识别工作流 添加）")
+                ),
+            }
         result = await self._start_workflow(workflow_name, prompt, **kwargs)
         if result["success"]:
             return {
@@ -1962,7 +2007,14 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 "waiting": bool(result.get("waiting")),
                 "required_files": result.get("required_files") or [],
             }
-        return {"success": False, "message": result["message"]}
+        # 未找到工作流时，_start_workflow 的消息里已带上可用列表；这里补充用法提示
+        message = result["message"]
+        if "未找到工作流" in message:
+            message += (
+                "\n用法：workflow_name 从已配置的工作流名称中精确选一个；"
+                "prompt 填生成内容描述；若返回 waiting=true 就把 required_files 转告用户上传文件。"
+            )
+        return {"success": False, "message": message}
 
     @API("run_workflow", description="运行配置好的 RunningHub 工作流", version="1", public=True)
     async def handle_run_workflow_api(
