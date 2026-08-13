@@ -59,6 +59,9 @@ _INPUT_WAIT_TIMEOUT = 600
 # 单个工作流的输入/配置节点总数上限（含参考图、配置节点，原 8 个对多参考图工作流不够）
 _MAX_NODES = 32
 
+# 上传/下载单个文件的最大字节数（512MB），防止异常或恶意超大内容撑爆内存
+_MAX_FILE_BYTES = 512 * 1024 * 1024
+
 # 交互收集会话中，用于"跳过剩余文件、直接开始运行"的触发词
 _FINISH_KEYWORDS = {
     "完成", "开始", "开始运行", "运行", "提交", "结束",
@@ -137,7 +140,7 @@ class CleanupSection(PluginConfigBase):
     )
     recall_seconds: int = Field(
         default=90,
-        ge=10,
+        ge=0,
         description="图片发送后自动撤回的秒数（0 表示不撤回）",
         json_schema_extra={"label": "撤回延迟（秒）", "hint": "0 表示不撤回"},
     )
@@ -169,6 +172,29 @@ class LLMSection(PluginConfigBase):
         default="utils",
         description="扩写使用的模型任务槽位（utils=通用快模型；replyer=主回复模型；planner=规划快模型）",
         json_schema_extra={"label": "模型槽位", "hint": "要快选 utils，要效果选 replyer"},
+    )
+
+
+class AccessSection(PluginConfigBase):
+    """访问控制与费用保护（默认全部放行，与旧版行为一致）。"""
+
+    __ui_label__ = "访问控制"
+
+    allow_users: list[str] = Field(
+        default_factory=list,
+        description="允许使用本插件的用户 ID 白名单；留空表示不限制任何用户",
+        json_schema_extra={"label": "用户白名单", "placeholder": "用户ID，每行一个"},
+    )
+    allow_groups: list[str] = Field(
+        default_factory=list,
+        description="允许使用本插件的群组 ID 白名单；留空表示不限制群组（私聊不受群组白名单约束）",
+        json_schema_extra={"label": "群组白名单", "placeholder": "群号，每行一个"},
+    )
+    max_per_user_per_hour: int = Field(
+        default=0,
+        ge=0,
+        description="每个用户每小时最多触发的任务数（0 表示不限制）",
+        json_schema_extra={"label": "每用户每小时上限", "hint": "0 表示不限制"},
     )
 
 
@@ -298,6 +324,7 @@ class GenericConfig(PluginConfigBase):
     cleanup: CleanupSection = Field(default_factory=CleanupSection)
     detect: DetectSection = Field(default_factory=DetectSection)
     llm: LLMSection = Field(default_factory=LLMSection)
+    access: AccessSection = Field(default_factory=AccessSection)
     workflows: WorkflowsSection = Field(default_factory=WorkflowsSection)
 
     @field_validator("workflows", mode="before")
@@ -444,6 +471,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         self._cleanup_task: asyncio.Task | None = None
         self._cache_dir: Path | None = None
         self._workflows: list[WorkflowItemSection] = []
+        self._user_requests: dict[str, list[float]] = {}
 
     # ── 工作流配置访问 ────────────────────────────────────────────
 
@@ -601,6 +629,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         if scope != CONFIG_RELOAD_SCOPE_SELF:
             return
         self._rebuild_client()
+        self._semaphore = asyncio.Semaphore(max(1, self.config.generation.max_concurrent))
         self._refresh_workflows()
         self._validate_workflows()
         self.ctx.logger.info(
@@ -716,6 +745,38 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             if workflow.name.strip() == name:
                 return workflow
         return None
+
+    def _check_access(self, user_id: str, group_id: str) -> tuple[bool, str]:
+        """访问控制：白名单 + 每用户每小时频率限制。
+
+        默认（未配置任何限制）返回 (True, "")，与旧版行为完全一致；
+        配置后才按白名单/频率拦截，返回 (False, 提示信息)。
+        """
+        cfg = self.config.access
+        uid = str(user_id or "").strip()
+        gid = str(group_id or "").strip()
+
+        if cfg.allow_users:
+            allowed_users = {str(u).strip() for u in cfg.allow_users if str(u).strip()}
+            if not uid or uid not in allowed_users:
+                return False, "你没有使用本插件的权限"
+
+        if cfg.allow_groups and gid:
+            allowed_groups = {str(g).strip() for g in cfg.allow_groups if str(g).strip()}
+            if gid not in allowed_groups:
+                return False, "当前群组没有使用本插件的权限"
+
+        if cfg.max_per_user_per_hour > 0:
+            if not uid:
+                return False, "无法识别用户身份，已阻止本次请求（已开启频率限制）"
+            now = time.time()
+            bucket = self._user_requests.setdefault(uid, [])
+            bucket[:] = [t for t in bucket if now - t < 3600]
+            if len(bucket) >= cfg.max_per_user_per_hour:
+                return False, "你本小时的生成次数已达上限，请稍后再试"
+            bucket.append(now)
+
+        return True, ""
 
     def _ordered_nodes(self, workflow: WorkflowItemSection) -> list[InputNodeSection]:
         """按配置顺序返回有效节点（最多 _MAX_NODES 个）。"""
@@ -966,6 +1027,11 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         """查找工作流，构建节点参数，提交任务或进入交互式收集。"""
         stream_id = str(kwargs.pop("stream_id", "") or "")
         user_id = str(kwargs.get("user_id") or "")
+        chat_info = self._extract_chat_info(kwargs)
+        group_id = str(chat_info.get("group_id") or "")
+        allowed, deny_msg = self._check_access(user_id, group_id)
+        if not allowed:
+            return {"success": False, "message": deny_msg}
 
         workflow = self._find_workflow(workflow_name)
         if workflow is None:
@@ -1476,11 +1542,19 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         return normalized.startswith("跳过") or normalized.startswith("开始运行")
 
     async def _fetch_file_bytes(self, source: str) -> bytes:
-        """从 base64 数据、URL 或本地路径获取文件字节。"""
+        """从 base64 数据、URL 或本地路径获取文件字节（带大小上限）。
+
+        注意：本地路径（如适配器传入的 /data/voice.amr 或缓存文件）是合法来源，
+        必须保留；这里只限制大小，不限制来源类型。
+        """
         if source.startswith("base64://"):
             import base64
 
-            return base64.b64decode(source[len("base64://"):])
+            encoded = source[len("base64://"):]
+            # base64 解码后约 3/4 大小，先按编码长度预估，避免解码超大内容
+            if len(encoded) > _MAX_FILE_BYTES * 4 // 3:
+                raise RunningHubError(f"上传内容超过 {_MAX_FILE_BYTES} 字节上限，已拒绝")
+            return base64.b64decode(encoded)
         if source.startswith(("http://", "https://")):
             client = self._client
             if client is None:
@@ -1488,6 +1562,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             return await client.download_bytes(source)
         path = Path(source)
         if path.is_file():
+            if path.stat().st_size > _MAX_FILE_BYTES:
+                raise RunningHubError(f"文件超过 {_MAX_FILE_BYTES} 字节上限，已拒绝: {source}")
             return await asyncio.to_thread(path.read_bytes)
         raise RunningHubError(f"无法读取文件: {source}")
 
@@ -1648,18 +1724,26 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         user_id = str(chat_info.get("user_id") or "")
 
         if group_id or user_id:
-            if group_id:
-                action = "send_group_msg"
-                params = {
-                    "group_id": int(group_id),
-                    "message": [{"type": "image", "data": {"file": f"base64://{image_base64}"}}],
-                }
-            else:
-                action = "send_private_msg"
-                params = {
-                    "user_id": int(user_id),
-                    "message": [{"type": "image", "data": {"file": f"base64://{image_base64}"}}],
-                }
+            try:
+                if group_id:
+                    action = "send_group_msg"
+                    params = {
+                        "group_id": int(group_id),
+                        "message": [{"type": "image", "data": {"file": f"base64://{image_base64}"}}],
+                    }
+                else:
+                    action = "send_private_msg"
+                    params = {
+                        "user_id": int(user_id),
+                        "message": [{"type": "image", "data": {"file": f"base64://{image_base64}"}}],
+                    }
+            except (TypeError, ValueError):
+                self.ctx.logger.warning(
+                    "群号/用户号不是数字（group_id=%s user_id=%s），回退 ctx.send.image",
+                    group_id, user_id,
+                )
+                await self.ctx.send.image(image_base64, stream_id)
+                return ""
             self.ctx.logger.debug(
                 "尝试 NapCat 直发图片: action=%s group_id=%s user_id=%s", action, group_id, user_id
             )
@@ -2014,8 +2098,33 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     @staticmethod
     def _toml_string(value: str) -> str:
-        """将字符串转义为 TOML 基础字符串字面量。"""
-        return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+        """将字符串转义为 TOML 基础字符串字面量。
+
+        除反斜杠与双引号外，额外转义换行/制表符等控制字符，避免字段值
+        含多行文本（如工作流默认提示词）时写出非法 TOML 导致下次配置解析失败。
+        """
+        out: list[str] = ['"']
+        for ch in str(value):
+            if ch == "\\":
+                out.append("\\\\")
+            elif ch == '"':
+                out.append('\\"')
+            elif ch == "\b":
+                out.append("\\b")
+            elif ch == "\t":
+                out.append("\\t")
+            elif ch == "\n":
+                out.append("\\n")
+            elif ch == "\f":
+                out.append("\\f")
+            elif ch == "\r":
+                out.append("\\r")
+            elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+                out.append("\\u%04X" % ord(ch))
+            else:
+                out.append(ch)
+        out.append('"')
+        return "".join(out)
 
     def _serialize_config_file(self, items: list[dict[str, Any]]) -> str:
         """将完整配置序列化为 config.toml 文本（工作流为结构化表数组）。"""
@@ -2065,6 +2174,11 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         lines.append("")
         lines.append("[llm]")
         lines.append(f"enhance_model = {self._toml_string(cfg.llm.enhance_model)}")
+        lines.append("")
+        lines.append("[access]")
+        lines.append(f"allow_users = {json.dumps([str(u) for u in cfg.access.allow_users], ensure_ascii=False)}")
+        lines.append(f"allow_groups = {json.dumps([str(g) for g in cfg.access.allow_groups], ensure_ascii=False)}")
+        lines.append(f"max_per_user_per_hour = {cfg.access.max_per_user_per_hour}")
         lines.append("")
         return "\n".join(lines)
 
@@ -2534,8 +2648,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
         if result.get("waiting"):
             files = result.get("required_files") or []
+            _type_name = {"image": "图片", "audio": "语音", "video": "视频"}
             desc = "；".join(
-                f"{i + 1}.{f['label']}（{'图片' if f['type'] == 'image' else '语音'}）"
+                f"{i + 1}.{f['label']}（{_type_name.get(f['type'], '文件')}）"
                 for i, f in enumerate(files)
             )
             return {

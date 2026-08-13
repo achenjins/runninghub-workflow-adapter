@@ -21,6 +21,9 @@ import requests
 
 __all__ = ["RunningHubError", "RunningHubClient"]
 
+# 下载结果/上传文件的最大字节数（512MB），防止异常或恶意超大文件一次性读入内存
+_MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
+
 
 class RunningHubError(RuntimeError):
     """RunningHub API 调用失败时抛出的异常。"""
@@ -127,26 +130,28 @@ class RunningHubClient:
 
     async def download_base64(self, url: str) -> str:
         """下载图片并以 base64 字符串返回（供 send.image 使用）。"""
-
-        def _do() -> bytes:
-            try:
-                response = requests.get(url, timeout=self.timeout)
-                response.raise_for_status()
-                return response.content
-            except requests.RequestException as exc:
-                raise RunningHubError(f"下载失败: {exc}") from exc
-
-        content = await asyncio.to_thread(_do)
+        content = await self.download_bytes(url)
         return base64.b64encode(content).decode("ascii")
 
     async def download_bytes(self, url: str) -> bytes:
-        """下载文件并返回原始字节（供二次上传使用）。"""
+        """下载文件并返回原始字节（供二次上传使用），带最大字节数限制。"""
 
         def _do() -> bytes:
             try:
-                response = requests.get(url, timeout=self.timeout)
+                response = requests.get(url, timeout=self.timeout, stream=True)
                 response.raise_for_status()
-                return response.content
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > _MAX_DOWNLOAD_BYTES:
+                        raise RunningHubError(
+                            f"下载内容超过 {_MAX_DOWNLOAD_BYTES} 字节上限，已拒绝"
+                        )
+                    chunks.append(chunk)
+                return b"".join(chunks)
             except requests.RequestException as exc:
                 raise RunningHubError(f"下载失败: {exc}") from exc
 

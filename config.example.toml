@@ -27,6 +27,12 @@ model = "utils"
 [llm]
 enhance_model = "utils"
 
+[access]
+# 访问控制（留空=不限制；max_per_user_per_hour = 0 表示不限频）
+allow_users = []
+allow_groups = []
+max_per_user_per_hour = 0
+
 # ────────────────────────────────────────────────────────────
 # 工作流列表（结构化配置，可在 WebUI「工作流列表」中增删）
 #

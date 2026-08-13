@@ -72,6 +72,16 @@ pip install -r runninghub-workflow-adapter/requirements.txt
 |--------|--------|------|
 | `enhance_model` | utils | 扩写用的模型任务槽位 |
 
+### [access] 访问控制
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `allow_users` | [] | 允许使用的用户 ID 白名单；留空表示不限制 |
+| `allow_groups` | [] | 允许使用的群组 ID 白名单；留空表示不限制（私聊不受群组白名单约束） |
+| `max_per_user_per_hour` | 0 | 每用户每小时任务上限；0 表示不限制 |
+
+> 默认全部放行，与旧版行为一致；配置白名单或频率上限后才生效。
+
 ### [workflows] 工作流列表
 
 每个工作流一项（WebUI 中可自由增删）：
