@@ -148,16 +148,27 @@ class DetectSection(PluginConfigBase):
     )
 
 
+class LLMSection(PluginConfigBase):
+    """提示词扩写 LLM 配置。"""
+
+    __ui_label__ = "提示词扩写"
+
+    enhance_model: Literal["utils", "replyer", "planner"] = Field(
+        default="utils",
+        description="扩写使用的模型任务槽位（utils=通用快模型；replyer=主回复模型；planner=规划快模型）",
+        json_schema_extra={"label": "模型槽位", "hint": "要快选 utils，要效果选 replyer"},
+    )
+
+
 class InputNodeSection(PluginConfigBase):
     """单个工作流输入节点配置（可自由增加数量，最多 32 个）。
 
-    只需三个核心字段：节点 ID、字段名、输入内容。
     类型下拉框选择该节点的用途：
-    - 默认值：输入内容作为固定默认值直接使用，不接受修改
-    - 文字：输入内容留空时接收命令文本（仅一个节点生效）
-    - 图片 / 语音：输入内容留空时按顺序等待用户上传
+    - prompt：主提示词，接收命令/LLM 扩写文本（整个工作流仅一个，多了报错）
+    - text：可编辑配置（带默认值），上传文件后询问用户是否修改
+    - default：固定默认值，直接使用不询问
+    - image / audio：上传文件（留空则等待上传）
     - 自动推断：按字段名推断（含 image→图片、audio/voice→语音、其余→文字）
-    任何类型只要填写了输入内容，都作为固定默认值使用。
     """
 
     __ui_label__ = "输入节点"
@@ -177,15 +188,16 @@ class InputNodeSection(PluginConfigBase):
         description="输入内容。填写后作为固定默认值直接使用（不接受修改）；留空则按类型由用户提供",
         json_schema_extra={"label": "输入内容（默认值）", "hint": "留空=等待用户输入；填写=固定默认值"},
     )
-    value_type: Literal["", "default", "text", "image", "audio"] = Field(
+    value_type: Literal["", "default", "text", "image", "audio", "prompt"] = Field(
         default="",
-        description="节点用途：默认值 / 文字 / 图片 / 语音 / 自动推断",
+        description="节点用途：prompt=主提示词（接收命令/扩写文本，仅一个）；text=可编辑配置（上传后询问修改）；default=固定默认值；image/audio=上传文件",
         json_schema_extra={
             "label": "节点类型",
             "x-widget": "select",
             "options": [
+                {"value": "prompt", "label": "主提示词（接收命令/扩写文本）"},
+                {"value": "text", "label": "可编辑配置（上传后询问修改）"},
                 {"value": "default", "label": "默认值（固定使用输入内容）"},
-                {"value": "text", "label": "文字（接收命令文本）"},
                 {"value": "image", "label": "图片（等待上传）"},
                 {"value": "audio", "label": "语音（等待上传）"},
             ],
@@ -267,6 +279,7 @@ class GenericConfig(PluginConfigBase):
     generation: GenerationSection = Field(default_factory=GenerationSection)
     cleanup: CleanupSection = Field(default_factory=CleanupSection)
     detect: DetectSection = Field(default_factory=DetectSection)
+    llm: LLMSection = Field(default_factory=LLMSection)
     workflows: WorkflowsSection = Field(default_factory=WorkflowsSection)
 
     @field_validator("workflows", mode="before")
@@ -322,16 +335,16 @@ _LLM_DETECT_PROMPT = """你是 ComfyUI/RunningHub 工作流配置分析器。下
 请判断哪些字段是【用户输入节点】、哪些是【推荐预设的配置节点】，只输出一个 JSON 对象，不要输出任何解释、代码块围栏或多余文本。
 
 输出格式（严格遵守）：
-{{"nodes":[{{"node_id":"6","field_name":"text","value_type":"text","field_value":"","label":"提示词"}},{{"node_id":"3","field_name":"steps","value_type":"default","field_value":"20","label":"步数"}}]}}
+{{"nodes":[{{"node_id":"6","field_name":"text","value_type":"prompt","field_value":"","label":"提示词"}},{{"node_id":"5","field_name":"width","value_type":"text","field_value":"512","label":"宽度"}}]}}
 
 判定规则：
 1. node_id 与 field_name 必须真实存在于上面清单中，禁止编造；<连线> 字段不可编辑，一律不得输出。
 2. 输入节点（终端用户需要提供）：
-   - 文字类（提示词/描述文本）→ value_type="text"
+   - 文字类（提示词/描述文本，主提示词）→ value_type="prompt"（整个工作流最多 1 个）
    - 图片类（参考图/LoadImage 等）→ value_type="image"
    - 音频类（参考音频/配音）→ value_type="audio"
    输入节点的 field_value 一律留空 ""。
-3. 配置节点（值得预设的常见参数）→ value_type="default"，field_value 填当前值（字符串形式），label 用简短中文。
+3. 配置节点（值得预设的常见参数：分辨率/宽高、画面比例、步数、采样器、CFG、种子、批次、lora 强度等）→ value_type="text"，field_value 填当前值（字符串形式），label 用简短中文。
    重要：即使节点带有连线输入，它的【标量参数】也必须作为配置节点列出，例如：
    - KSampler：steps / cfg / sampler_name / seed / denoise
    - EmptyLatentImage：width / height / batch_size
@@ -362,6 +375,9 @@ class InputSession:
     text_field_name: str = ""
     uploaded_images: int = 0
     uploaded_audios: int = 0
+    # 收集阶段：files=等待文件上传；config=等待用户确认/修改可编辑配置
+    phase: str = "files"
+    editable_nodes: list[dict[str, str]] = field(default_factory=list)
 
 
 class RunningHubGenericPlugin(MaiBotPlugin):
@@ -464,7 +480,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             }
             if field_name == "value_type":
                 # SelectItem 不允许空字符串 value，用 "auto" 表示自动推断（模型层归一化为 ""）
-                item_field["choices"] = ["auto", "default", "text", "image", "audio"]
+                item_field["choices"] = ["auto", "prompt", "text", "default", "image", "audio"]
                 item_field["placeholder"] = "auto=自动推断"
             item_fields[field_name] = item_field
         return item_fields
@@ -694,10 +710,14 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             parts.append(f"参考音频 {audios} 段")
         return "；".join(parts)
 
-    def _primary_text_node(self, workflow: WorkflowItemSection) -> InputNodeSection | None:
-        """返回第一个无默认值的文字节点（接收命令文本的节点）。"""
+    def _prompt_nodes(self, workflow: WorkflowItemSection) -> list[InputNodeSection]:
+        """返回所有主提示词节点（prompt 类型，最多允许一个）。"""
+        return [n for n in self._ordered_nodes(workflow) if self._resolve_value_type(n) == "prompt"]
+
+    def _primary_prompt_node(self, workflow: WorkflowItemSection) -> InputNodeSection | None:
+        """返回第一个无默认值的主提示词节点（接收命令/扩写文本的节点）。"""
         for node in self._ordered_nodes(workflow):
-            if not str(node.field_value or "").strip() and self._resolve_value_type(node) == "text":
+            if self._resolve_value_type(node) == "prompt" and not str(node.field_value or "").strip():
                 return node
         return None
 
@@ -748,7 +768,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             "请严格按模板输出最终内容，不要输出任何额外解释"
         )
         try:
-            result = await self.ctx.llm.generate(prompt=prompt_text)
+            result = await self.ctx.llm.generate(
+                prompt=prompt_text,
+                model=self.config.llm.enhance_model,
+            )
         except Exception as exc:
             self.ctx.logger.warning("LLM 扩写失败，回退原文: %s", exc)
             return text
@@ -760,7 +783,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     def _resolve_value_type(node: InputNodeSection) -> str:
         """解析节点类型：显式选择优先，留空时按字段名自动推断。"""
         explicit = str(node.value_type or "").strip().lower()
-        if explicit in ("default", "text", "image", "audio"):
+        if explicit in ("default", "text", "image", "audio", "prompt"):
             return explicit
         field_name = str(node.field_name or "").lower()
         if any(k in field_name for k in ("image", "pic", "photo", "img")):
@@ -778,12 +801,11 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
         """构建 nodeInfoList 并返回需要等待用户输入的节点列表。
 
-        规则：
-        - 填写了输入内容（field_value）→ 作为固定默认值直接使用，不接受修改
-        - 类型为"默认值"且无输入内容 → 跳过该节点
-        - 输入内容留空：
-          - 文字节点 → 接收命令文本（仅第一个生效，其余跳过）
-          - 图片/语音节点 → 按配置顺序等待用户上传
+        规则（新节点类型语义）：
+        - prompt：主提示词，接收命令/扩写文本（有默认值时用默认值），仅第一个生效
+        - text：可编辑配置，先用默认值（可为空），上传文件后询问用户修改
+        - default：固定默认值，不询问；无默认值时跳过
+        - image / audio：有默认值直接使用；无默认值按顺序等待上传
 
         Returns:
             (node_info_list, waiting_nodes)：已确定的节点参数与待收集节点
@@ -801,29 +823,44 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             node_id = node.node_id.strip()
             field_name = node.field_name.strip() or "prompt"
 
-            if field_value:
-                # 有默认值：直接使用，不接受修改（任何类型均适用）
+            if vtype == "prompt":
+                # 主提示词：有默认值用默认值，否则接收命令/扩写文本（仅第一个生效）
+                if field_value:
+                    node_info_list.append(
+                        {"nodeId": node_id, "fieldName": field_name, "fieldValue": field_value}
+                    )
+                elif not text_filled and text_to_fill:
+                    node_info_list.append(
+                        {"nodeId": node_id, "fieldName": field_name, "fieldValue": text_to_fill}
+                    )
+                    text_filled = True
+                else:
+                    self.ctx.logger.info("主提示词节点 %s 未接收文本，已跳过", node_id)
+                continue
+
+            if vtype == "text":
+                # 可编辑配置：先用默认值（可为空），上传文件后询问用户修改
                 node_info_list.append(
                     {"nodeId": node_id, "fieldName": field_name, "fieldValue": field_value}
                 )
                 continue
 
             if vtype == "default":
-                # 类型为默认值但未填写输入内容：跳过
-                self.ctx.logger.info("节点 %s 类型为默认值但未填写输入内容，已跳过", node_id)
-                continue
-
-            if vtype == "text":
-                # 无默认值的文字节点：仅第一个接收命令文本，其余跳过
-                if not text_filled and text_to_fill:
+                # 固定默认值：有值直接使用，无值跳过
+                if field_value:
                     node_info_list.append(
-                        {"nodeId": node_id, "fieldName": field_name, "fieldValue": text_to_fill}
+                        {"nodeId": node_id, "fieldName": field_name, "fieldValue": field_value}
                     )
-                    text_filled = True
                 else:
-                    self.ctx.logger.info("文字节点 %s 未接收命令文本，已跳过", node_id)
+                    self.ctx.logger.info("节点 %s 类型为默认值但未填写输入内容，已跳过", node_id)
                 continue
 
+            # image / audio
+            if field_value:
+                node_info_list.append(
+                    {"nodeId": node_id, "fieldName": field_name, "fieldValue": field_value}
+                )
+                continue
             waiting.append(
                 {
                     "node": node,
@@ -834,6 +871,23 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 }
             )
         return node_info_list, waiting
+
+    def _editable_config_nodes(self, workflow: WorkflowItemSection) -> list[dict[str, str]]:
+        """返回上传文件后需要询问用户修改的可编辑配置节点（text 类型）。"""
+        result: list[dict[str, str]] = []
+        for node in self._ordered_nodes(workflow):
+            if self._resolve_value_type(node) != "text":
+                continue
+            node_id = node.node_id.strip()
+            result.append(
+                {
+                    "node_id": node_id,
+                    "field_name": node.field_name.strip() or "prompt",
+                    "field_value": str(node.field_value or ""),
+                    "label": str(node.label or "").strip() or node_id,
+                }
+            )
+        return result
 
     async def _start_workflow(
         self,
@@ -862,7 +916,15 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         if not workflow.workflow_id.strip():
             return {"success": False, "message": f"工作流「{workflow.name}」未配置 workflow_id"}
 
-        text_node = self._primary_text_node(workflow)
+        prompt_nodes = self._prompt_nodes(workflow)
+        if len(prompt_nodes) > 1:
+            return {
+                "success": False,
+                "message": f"工作流「{workflow.name}」配置了 {len(prompt_nodes)} 个主提示词节点（prompt 类型），仅允许一个",
+            }
+
+        text_node = self._primary_prompt_node(workflow)
+        editable_nodes = self._editable_config_nodes(workflow)
 
         # 先用原始文本构建节点参数（文字节点暂填原文，扩写见下）
         node_info_list, waiting = self._build_node_info_list(workflow, command_text)
@@ -881,6 +943,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 command_text=command_text,
                 text_node_id=text_node.node_id.strip() if text_node else "",
                 text_field_name=text_node.field_name.strip() if text_node else "",
+                editable_nodes=editable_nodes,
             )
             tips = self._build_waiting_tips(waiting)
             required_files = [
@@ -985,6 +1048,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         command_text: str = "",
         text_node_id: str = "",
         text_field_name: str = "",
+        editable_nodes: list[dict[str, str]] | None = None,
     ) -> None:
         """创建交互式收集会话（优先按用户、工具路径回退按会话），带超时清理。"""
         key = self._session_key(user_id, stream_id)
@@ -1005,6 +1069,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             command_text=command_text,
             text_node_id=text_node_id,
             text_field_name=text_field_name,
+            editable_nodes=editable_nodes or [],
         )
         self._input_sessions[key] = session
 
@@ -1102,9 +1167,79 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             )
             return True
 
-        # 收集完成，提交任务
-        await self._submit_collected_session(session, key, stream_id, client, "全部输入已收到，开始运行任务")
+        # 收集完成，进入配置确认或直接提交
+        await self._after_files_collected(session, key, stream_id, client, "全部输入已收到")
         return True
+
+    async def _after_files_collected(
+        self,
+        session: InputSession,
+        key: str,
+        stream_id: str,
+        client: RunningHubClient,
+        notice: str,
+    ) -> None:
+        """文件收集结束后：有可编辑配置则进入确认阶段，否则直接提交。"""
+        if session.editable_nodes:
+            session.phase = "config"
+            tips = self._build_config_edit_tips(session.editable_nodes)
+            await self.ctx.send.text(
+                f"{notice}。你可修改以下配置：\n{tips}\n"
+                "（回复新值，如「0.3, 16:9」按顺序对应上述配置；某项用「-」表示保持默认；回复「不变」全部使用默认值）",
+                stream_id,
+            )
+            return
+        await self._submit_collected_session(session, key, stream_id, client, notice + "，开始运行任务")
+
+    @staticmethod
+    def _build_config_edit_tips(editable_nodes: list[dict[str, str]]) -> str:
+        """构建可编辑配置的确认提示。"""
+        lines = []
+        for index, node in enumerate(editable_nodes, 1):
+            lines.append(f"{index}.{node['label']}：{node['field_value']}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_config_edit(text: str, count: int) -> list[str | None]:
+        """解析用户对可编辑配置的回复，返回与 editable_nodes 对齐的值列表。
+
+        元素为 None 表示保持默认；回复「不变/跳过/默认」等返回空列表（全部保持默认）。
+        """
+        normalized = str(text or "").strip()
+        if normalized in ("", "不变", "跳过", "跳过剩余", "默认", "确认", "ok", "go", "好了", "不修改"):
+            return []
+        tokens = re.split(r"[\s,，、]+", normalized)
+        values: list[str | None] = []
+        for token in tokens[:count]:
+            if token in ("-", "不变", "默认", "保持", "跳过"):
+                values.append(None)
+            else:
+                values.append(token)
+        return values
+
+    async def _handle_config_edit(self, session: InputSession, stream_id: str, message: dict) -> None:
+        """处理可编辑配置的确认/修改回复。"""
+        text = self._extract_text_from_message(message)
+        values = self._parse_config_edit(text, len(session.editable_nodes))
+        if values is None:
+            await self.ctx.send.text("没看懂，请回复要修改的值（如「0.3, 16:9」），或回复「不变」使用默认值", stream_id)
+            return
+        for index, node in enumerate(session.editable_nodes):
+            if index < len(values) and values[index] is not None:
+                self._patch_text_value(
+                    session.collected, node["node_id"], node["field_name"], values[index]
+                )
+        client = self._client
+        if client is None:
+            self._rebuild_client()
+            client = self._client
+        if client is None:
+            key = self._session_key(session.user_id, session.stream_id)
+            self._cancel_input_session(key)
+            await self.ctx.send.text("插件客户端未初始化，已取消本次任务", stream_id)
+            return
+        key = self._session_key(session.user_id, session.stream_id)
+        await self._submit_collected_session(session, key, stream_id, client, "配置已更新，开始运行任务")
 
     async def _submit_collected_session(
         self,
@@ -1170,11 +1305,11 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         skipped = len(session.waiting_nodes)
         if skipped:
             notice = (
-                f"已跳过剩余 {skipped} 个文件输入，开始运行任务（未上传的节点将使用工作流默认值）"
+                f"已跳过剩余 {skipped} 个文件输入（未上传的节点将使用工作流默认值）"
             )
         else:
-            notice = "全部输入已收到，开始运行任务"
-        await self._submit_collected_session(session, key, stream_id, client, notice)
+            notice = "全部输入已收到"
+        await self._after_files_collected(session, key, stream_id, client, notice)
         return True
 
     def _cancel_input_session(self, key: str) -> None:
@@ -1553,6 +1688,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         if session is None:
             return None
         stream_id = stream_id or session.stream_id
+        if session.phase == "config":
+            await self._handle_config_edit(session, stream_id, message)
+            return {"action": "abort"}
         if self._is_finish_signal(self._extract_text_from_message(message)):
             await self._finish_input_session(user_id, stream_id, skip_remaining=True)
             return {"action": "abort"}
@@ -1668,8 +1806,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             await self.ctx.send.text(f"写入配置失败：{exc}", stream_id)
             return True, "", 1
 
-        inputs = [n for n in detected if n["value_type"] in ("text", "image", "audio")]
-        configs = [n for n in detected if n["value_type"] == "default"]
+        inputs = [n for n in detected if n["value_type"] in ("prompt", "image", "audio")]
+        configs = [n for n in detected if n["value_type"] in ("text", "default")]
         parts_summary: list[str] = []
         if inputs:
             parts_summary.append(
@@ -1935,7 +2073,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                         {
                             "node_id": node_id,
                             "field_name": "text",
-                            "value_type": "text",
+                            "value_type": "prompt",
                             "field_value": "",
                             "label": f"文本输入（{class_type}）",
                         }
@@ -1954,7 +2092,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                     {
                         "node_id": node_id,
                         "field_name": field_name,
-                        "value_type": "text",
+                        "value_type": "prompt",
                         "field_value": "",
                         "label": f"文本输入（{class_type}）",
                     }
@@ -2039,7 +2177,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             field_name = str(item.get("field_name") or "").strip()
             value_type = str(item.get("value_type") or "").strip().lower()
             label = str(item.get("label") or "").strip()
-            if value_type not in ("text", "image", "audio", "default"):
+            if value_type not in ("prompt", "text", "image", "audio", "default"):
                 continue
             node = workflow_json.get(node_id)
             if not isinstance(node, dict):
@@ -2051,7 +2189,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             if isinstance(inputs.get(field_name), (list, tuple)):
                 continue
             field_value = ""
-            if value_type == "default":
+            if value_type in ("text", "default"):
                 field_value = str(item.get("field_value") or "").strip()
                 current = inputs.get(field_name)
                 if not field_value and not isinstance(current, (list, tuple, dict)):
