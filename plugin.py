@@ -11,8 +11,8 @@
 
 - 命令：``/跑图 <工作流名> <文字内容>``
 - 命令：``/工作流`` 列出已配置工作流
-- 命令：``/识别工作流 <工作流ID>`` 简化识别（仅文字/图片/音频/视频/分辨率/长宽比例）
-- 命令：``/详细识别工作流 <工作流ID>`` LLM 详细识别全部节点
+- 命令：``/识别国内工作流 <工作流ID>`` / ``/识别国外工作流 <工作流ID>`` 简化识别关键节点（分别配置区域）
+- 命令：``/详细识别工作流 <工作流ID>`` LLM 详细识别全部节点（自动判断区域）
 - 工具：``run_workflow``（供 LLM 调用）
 - API：``run_workflow``（public，供其他插件调用）
 """
@@ -86,13 +86,13 @@ class ServerSection(PluginConfigBase):
 
     base_url: str = Field(
         default="https://www.runninghub.ai",
-        description="海外平台基地址（runninghub.ai）",
-        json_schema_extra={"label": "海外基地址", "disabled": True},
+        description="国外平台基地址（runninghub.ai）",
+        json_schema_extra={"label": "国外基地址", "disabled": True},
     )
     api_key: str = Field(
         default="",
-        description="海外 RunningHub API Key（在平台个人中心获取，务必保密）",
-        json_schema_extra={"label": "海外 API Key", "placeholder": "粘贴你的 API Key", "x-widget": "password"},
+        description="国外 RunningHub API Key（在平台个人中心获取，务必保密）",
+        json_schema_extra={"label": "国外 API Key", "placeholder": "粘贴你的 API Key", "x-widget": "password"},
     )
     base_url_cn: str = Field(
         default="https://www.runninghub.cn",
@@ -101,7 +101,7 @@ class ServerSection(PluginConfigBase):
     )
     api_key_cn: str = Field(
         default="",
-        description="国内 RunningHub API Key（可与海外只填一个；只填一个时拉取默认用该 key）",
+        description="国内 RunningHub API Key（可与国外只填一个；只填一个时拉取默认用该 key）",
         json_schema_extra={"label": "国内 API Key", "placeholder": "粘贴你的国内 API Key", "x-widget": "password"},
     )
 
@@ -253,8 +253,8 @@ class WorkflowItemSection(PluginConfigBase):
     )
     region: Literal["overseas", "domestic"] = Field(
         default="overseas",
-        description="区域：overseas=海外（runninghub.ai），domestic=国内（runninghub.cn）；决定用哪个 API 拉取与提交",
-        json_schema_extra={"label": "区域", "hint": "overseas=海外 / domestic=国内"},
+        description="区域：overseas=国外（runninghub.ai），domestic=国内（runninghub.cn）；决定用哪个 API 拉取与提交",
+        json_schema_extra={"label": "区域", "hint": "overseas=国外 / domestic=国内"},
     )
     llm_enhance: bool = Field(
         default=False,
@@ -950,7 +950,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         if not workflow.workflow_id.strip():
             return {"success": False, "message": f"工作流「{workflow.name}」未配置 workflow_id"}
 
-        # 按工作流区域选择对应客户端（海外/国内）
+        # 按工作流区域选择对应客户端（国外/国内）
         region = str(workflow.region or "overseas").strip()
         client = self._get_client(region)
         if client is None:
@@ -961,7 +961,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
         if not self.config.server.api_key and not self.config.server.api_key_cn:
             return {"success": False, "message": "未配置 RunningHub API Key，请编辑 config.toml 后重载插件"}
-        region_label = "国内" if region == "domestic" else "海外"
+        region_label = "国内" if region == "domestic" else "国外"
         region_key = self.config.server.api_key_cn if region == "domestic" else self.config.server.api_key
         if not region_key:
             return {"success": False, "message": f"该工作流为{region_label}，但对应 API Key 未填写，请检查配置"}
@@ -1789,20 +1789,31 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         await self.ctx.send.text("\n".join(lines), stream_id)
         return True, "", 1
 
-    @Command("识别工作流", description="简化识别：仅提取文字/图片/音频/视频/分辨率/长宽比例等关键节点，例如：/识别工作流 2087492768787685378 动漫生图", pattern=r"^/识别工作流")
-    async def handle_detect_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
+    @Command("识别国内工作流", description="识别国内工作流（runninghub.cn），仅提取文字/图片/音频/视频/分辨率/长宽比例等关键节点，例如：/识别国内工作流 2087492768787685378 动漫生图", pattern=r"^/识别国内工作流")
+    async def handle_detect_domestic_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
         stream_id = str(kwargs.get("stream_id") or "")
         plain_text = str(kwargs.get("text") or kwargs.get("plain_text") or "")
-        rest = re.sub(r"^/识别工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
+        rest = re.sub(r"^/识别国内工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
         if not rest:
-            await self.ctx.send.text(
-                "用法：/识别工作流 <工作流ID> [工作流名称]（仅提取关键节点）", stream_id
-            )
+            await self.ctx.send.text("用法：/识别国内工作流 <工作流ID> [工作流名称]", stream_id)
             return True, "", 1
         parts = rest.split(maxsplit=1)
         workflow_id = parts[0].strip()
         workflow_name = parts[1].strip() if len(parts) > 1 else workflow_id
-        return await self._detect_and_write(workflow_id, workflow_name, stream_id, detailed=False)
+        return await self._detect_and_write(workflow_id, workflow_name, stream_id, detailed=False, region="domestic")
+
+    @Command("识别国外工作流", description="识别国外工作流（runninghub.ai），仅提取文字/图片/音频/视频/分辨率/长宽比例等关键节点，例如：/识别国外工作流 2087492768787685378 动漫生图", pattern=r"^/识别国外工作流")
+    async def handle_detect_overseas_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
+        stream_id = str(kwargs.get("stream_id") or "")
+        plain_text = str(kwargs.get("text") or kwargs.get("plain_text") or "")
+        rest = re.sub(r"^/识别国外工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
+        if not rest:
+            await self.ctx.send.text("用法：/识别国外工作流 <工作流ID> [工作流名称]", stream_id)
+            return True, "", 1
+        parts = rest.split(maxsplit=1)
+        workflow_id = parts[0].strip()
+        workflow_name = parts[1].strip() if len(parts) > 1 else workflow_id
+        return await self._detect_and_write(workflow_id, workflow_name, stream_id, detailed=False, region="overseas")
 
     @Command("详细识别工作流", description="详细识别：用 LLM 识别全部输入节点与配置节点（步数/采样器/CFG/种子等），例如：/详细识别工作流 2087492768787685378 动漫生图", pattern=r"^/详细识别工作流")
     async def handle_detail_detect_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
@@ -1826,24 +1837,45 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         stream_id: str,
         *,
         detailed: bool,
+        region: str | None = None,
     ) -> tuple[bool, str, int]:
-        """识别工作流节点并写入配置（detailed=True 走 LLM 全量识别）。"""
-        self.ctx.logger.info("[识别] 开始: workflow_id=%s name=%s detailed=%s", workflow_id, workflow_name, detailed)
+        """识别工作流节点并写入配置。
 
-        # 候选区域：按已填写的 API Key 决定（海外优先，其次国内），客户端缺失时按需重建
+        detailed=True 走 LLM 全量识别；region 指定时只用该区域 key 拉取，
+        region=None 时按已填写的 key 自动判断区域。
+        """
+        self.ctx.logger.info(
+            "[识别] 开始: workflow_id=%s name=%s detailed=%s region=%s",
+            workflow_id, workflow_name, detailed, region,
+        )
+
+        # 候选区域
         candidates: list[tuple[str, RunningHubClient]] = []
-        for key_attr, region_name in (("api_key", "overseas"), ("api_key_cn", "domestic")):
+        if region is not None:
+            key_attr = "api_key_cn" if region == "domestic" else "api_key"
             if not getattr(self.config.server, key_attr):
-                continue
-            client = self._get_client(region_name)
+                label = "国内" if region == "domestic" else "国外"
+                await self.ctx.send.text(f"{label} API Key 未填写，请先在插件配置中配置", stream_id)
+                return True, "", 1
+            client = self._get_client(region)
             if client is None:
                 self._rebuild_client()
-                client = self._get_client(region_name)
+                client = self._get_client(region)
             if client is not None:
-                candidates.append((region_name, client))
+                candidates.append((region, client))
+        else:
+            for key_attr, region_name in (("api_key", "overseas"), ("api_key_cn", "domestic")):
+                if not getattr(self.config.server, key_attr):
+                    continue
+                client = self._get_client(region_name)
+                if client is None:
+                    self._rebuild_client()
+                    client = self._get_client(region_name)
+                if client is not None:
+                    candidates.append((region_name, client))
         if not candidates:
             self.ctx.logger.warning("[识别] 未配置任何 api_key")
-            await self.ctx.send.text("请先填写 RunningHub API Key（海外或国内至少一个）", stream_id)
+            await self.ctx.send.text("请先填写 RunningHub API Key（国外或国内至少一个）", stream_id)
             return True, "", 1
 
         # 名称冲突检查
@@ -1854,7 +1886,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 )
                 return True, "", 1
 
-        # 依次用海外/国内 key 拉取工作流，哪个通就是哪个区域
+        # 依次用候选 key 拉取工作流，哪个通就是哪个区域
         workflow_json: dict[str, Any] | None = None
         region = "overseas"
         last_error = ""
@@ -1870,7 +1902,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 last_error = str(exc)
                 self.ctx.logger.info("[识别] %s 拉取失败: %s", cand_region, exc)
         if workflow_json is None:
-            self.ctx.logger.error("[识别] 获取工作流失败（海外/国内均失败）: %s", last_error)
+            self.ctx.logger.error("[识别] 获取工作流失败（国外/国内均失败）: %s", last_error)
             await self.ctx.send.text(f"获取工作流失败，请检查 API Key：{last_error}", stream_id)
             return True, "", 1
         self.ctx.logger.info("[识别] 工作流 JSON 已获取（区域=%s），节点总数=%d", region, len(workflow_json))
@@ -1904,7 +1936,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             await self.ctx.send.text(f"写入配置失败：{exc}", stream_id)
             return True, "", 1
 
-        region_label = "国内" if region == "domestic" else "海外"
+        region_label = "国内" if region == "domestic" else "国外"
         await self.ctx.send.text(
             f"识别成功（{detect_method}·{region_label}），共 {len(detected)} 个节点，具体请查看插件配置",
             stream_id,

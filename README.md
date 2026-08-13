@@ -1,6 +1,6 @@
 # RunningHub 通用工作流插件
 
-通过配置适配 [RunningHub](https://www.runninghub.ai)（海外）/ [RunningHub 国内](https://www.runninghub.cn) 的大部分工作流，无需修改代码即可跑文生图、图生视频、参考图/音频/视频工作流等。
+通过配置适配 [RunningHub](https://www.runninghub.ai)（国外）/ [RunningHub 国内](https://www.runninghub.cn) 的大部分工作流，无需修改代码即可跑文生图、图生视频、参考图/音频/视频工作流等。
 
 ## 功能特性
 
@@ -9,7 +9,7 @@
 - 节点类型：主提示词 / 可编辑配置 / 固定默认值 / 图片 / 音频 / 视频
 - 文字节点支持 LLM 扩写（可配置模板文件路径）
 - 文件节点（图/音/视频）交互式收集，可只传部分，发「跳过剩余」直接开始
-- `/识别工作流` 自动识别并写入配置，自动判断国内/海外区域
+- `/识别工作流` 自动识别并写入配置，自动判断国内/国外区域
 - 命令、LLM 工具、公开 API 三种触发方式
 - 发送后自动撤回（仅 NapCat 适配器生效）
 
@@ -25,8 +25,8 @@ pip install -r runninghub-workflow-adapter/requirements.txt
 
 ## 快速上手
 
-1. **填 API Key**：在 WebUI 插件配置页填 `server.api_key`（海外）或 `server.api_key_cn`（国内），至少填一个。
-2. **识别工作流**：在聊天中发送 `/识别工作流 <工作流ID> <名称>`，插件自动识别输入节点并写入配置。
+1. **填 API Key**：在 WebUI 插件配置页填 `server.api_key`（国外）或 `server.api_key_cn`（国内），至少填一个。
+2. **识别工作流**：国内工作流发 `/识别国内工作流 <工作流ID> <名称>`，国外工作流发 `/识别国外工作流 <工作流ID> <名称>`，插件自动识别输入节点并写入配置。
 3. **运行**：`/跑图 <工作流名> <描述文本>`，按提示上传参考文件、确认配置，等待结果自动发回。
 
 ## 配置项说明
@@ -35,13 +35,13 @@ pip install -r runninghub-workflow-adapter/requirements.txt
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `base_url` | `https://www.runninghub.ai` | 海外平台基地址（不可修改） |
-| `api_key` | 空 | 海外 API Key（与国内至少填一个） |
+| `base_url` | `https://www.runninghub.ai` | 国外平台基地址（不可修改） |
+| `api_key` | 空 | 国外 API Key（与国内至少填一个） |
 | `base_url_cn` | `https://www.runninghub.cn` | 国内平台基地址（不可修改） |
 | `api_key_cn` | 空 | 国内 API Key |
 
-- 海外走 `runninghub.ai`，国内走 `runninghub.cn`；两者可只填一个。
-- 只填一个 key 时，识别工作流默认用该 key 拉取；失败提示检查 API Key。
+- 国外走 `runninghub.ai`，国内走 `runninghub.cn`；两者可只填一个。
+- 识别国内/国外工作流分别用对应区域的 key 拉取；对应 key 未填会提示检查配置。
 
 ### [generation] 生成参数
 
@@ -81,7 +81,7 @@ pip install -r runninghub-workflow-adapter/requirements.txt
 | `name` | 空 | 工作流显示名称，命令调用用（如 `/跑图 动漫生图 ...`） |
 | `workflow_id` | 空 | RunningHub 工作流 ID |
 | `instance_type` | Standard | 设备类型：`Standard` / `Plus` |
-| `region` | overseas | 区域：`overseas` 海外 / `domestic` 国内，决定用哪个 API |
+| `region` | overseas | 区域：`overseas` 国外 / `domestic` 国内，决定用哪个 API |
 | `llm_enhance` | false | 是否先按模板扩写命令文本再传入提示词节点 |
 | `llm_template_path` | 空 | 扩写模板文件路径（相对插件目录，如 `templates/my_template.txt`） |
 | `input_nodes` | [] | 输入节点列表 |
@@ -116,8 +116,9 @@ pip install -r runninghub-workflow-adapter/requirements.txt
 |------|------|
 | `/跑图 <工作流名> <描述文本>` | 运行配置好的工作流 |
 | `/工作流` | 列出已配置的工作流 |
-| `/识别工作流 <工作流ID> [名称]` | 简化识别：仅提取文字/图片/音频/视频/分辨率/长宽比例（分辨率/长宽比例为固定默认值） |
-| `/详细识别工作流 <工作流ID> [名称]` | LLM 详细识别：识别全部输入节点与配置节点（步数/采样器/CFG/种子等，配置节点为可编辑） |
+| `/识别国内工作流 <工作流ID> [名称]` | 识别国内工作流（region=domestic），仅提取文字/图片/音频/视频/分辨率/长宽比例 |
+| `/识别国外工作流 <工作流ID> [名称]` | 识别国外工作流（region=overseas），仅提取文字/图片/音频/视频/分辨率/长宽比例 |
+| `/详细识别工作流 <工作流ID> [名称]` | LLM 详细识别全部输入节点与配置节点（自动判断区域） |
 
 ## 执行流程
 
@@ -130,7 +131,7 @@ pip install -r runninghub-workflow-adapter/requirements.txt
 5. **提交**：调用对应区域的 API 提交任务。
 6. **轮询发送**：后台轮询任务状态，完成后结果自动发回（图片直接发图，视频等发下载链接），按配置可自动撤回。
 
-`/识别工作流` 流程：填 API Key → 依次用海外/国内 key 尝试拉取工作流（哪个通记哪个区域）→ 识别关键节点 → 写入配置 → 回复「识别成功」。
+`/识别国内工作流` / `/识别国外工作流` 流程：用对应区域的 key 拉取工作流 → 识别关键节点 → 写入配置（区域已设定）→ 回复「识别成功」。
 
 ## 工具与 API
 
