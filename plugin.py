@@ -1919,6 +1919,13 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         会话可按 user_id（命令路径）或 stream_id（工具路径）定位。
         命中后返回 {"action": "abort"}，阻止该消息继续进入 LLM。
         """
+        # 诊断：无条件打印，确认 notice/文件消息是否经过 before_process hook
+        import logging as _logging
+        _logging.getLogger("RunningHubGenericPlugin").info(
+            "[输入收集] hook 触发: message_type=%s kwargs_keys=%s",
+            type(message).__name__ if message is not None else "None",
+            list((kwargs or {}).keys()),
+        )
         if not isinstance(message, dict):
             return None
         # 诊断：打印非文本消息段的完整结构，便于定位文件/图片消息的真实格式
