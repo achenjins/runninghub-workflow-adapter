@@ -54,17 +54,24 @@ class RunningHubClient:
         }
 
     async def _post(self, path: str, payload: dict[str, Any], *, use_api_key_header: bool = True) -> dict[str, Any]:
-        """异步发起 POST 请求并解析 JSON 响应。"""
+        """异步发起 POST 请求并解析 JSON 响应。
+
+        所有 requests 异常（HTTPError/超时/断网等）统一包装为 RunningHubError，
+        避免调用方只捕获 RunningHubError 时被未捕获异常打断。
+        """
 
         def _do() -> dict[str, Any]:
-            response = requests.post(
-                f"{self.base_url}{path}",
-                json=payload,
-                headers=self._headers(self.api_key) if use_api_key_header else {"Content-Type": "application/json"},
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            return response.json()
+            try:
+                response = requests.post(
+                    f"{self.base_url}{path}",
+                    json=payload,
+                    headers=self._headers(self.api_key) if use_api_key_header else {"Content-Type": "application/json"},
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                return response.json()
+            except requests.RequestException as exc:
+                raise RunningHubError(f"请求失败: {exc}") from exc
 
         return await asyncio.to_thread(_do)
 
@@ -122,9 +129,12 @@ class RunningHubClient:
         """下载图片并以 base64 字符串返回（供 send.image 使用）。"""
 
         def _do() -> bytes:
-            response = requests.get(url, timeout=self.timeout)
-            response.raise_for_status()
-            return response.content
+            try:
+                response = requests.get(url, timeout=self.timeout)
+                response.raise_for_status()
+                return response.content
+            except requests.RequestException as exc:
+                raise RunningHubError(f"下载失败: {exc}") from exc
 
         content = await asyncio.to_thread(_do)
         return base64.b64encode(content).decode("ascii")
@@ -133,9 +143,12 @@ class RunningHubClient:
         """下载文件并返回原始字节（供二次上传使用）。"""
 
         def _do() -> bytes:
-            response = requests.get(url, timeout=self.timeout)
-            response.raise_for_status()
-            return response.content
+            try:
+                response = requests.get(url, timeout=self.timeout)
+                response.raise_for_status()
+                return response.content
+            except requests.RequestException as exc:
+                raise RunningHubError(f"下载失败: {exc}") from exc
 
         return await asyncio.to_thread(_do)
 
@@ -159,14 +172,17 @@ class RunningHubClient:
         """
 
         def _do() -> dict[str, Any]:
-            response = requests.post(
-                f"{self.base_url}/openapi/v2/media/upload/binary",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                files={"file": (filename, file_data)},
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            return response.json()
+            try:
+                response = requests.post(
+                    f"{self.base_url}/openapi/v2/media/upload/binary",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    files={"file": (filename, file_data)},
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                return response.json()
+            except requests.RequestException as exc:
+                raise RunningHubError(f"上传失败: {exc}") from exc
 
         result = await asyncio.to_thread(_do)
         code = result.get("code")
@@ -209,20 +225,29 @@ class RunningHubClient:
         }
 
         def _do() -> dict[str, Any]:
-            response = requests.post(
-                f"{self.base_url}/api/openapi/getJsonApiFormat",
-                json=payload,
-                headers=headers,
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            return response.json()
+            try:
+                response = requests.post(
+                    f"{self.base_url}/api/openapi/getJsonApiFormat",
+                    json=payload,
+                    headers=headers,
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                return response.json()
+            except requests.RequestException as exc:
+                raise RunningHubError(f"获取工作流失败: {exc}") from exc
 
         result = await asyncio.to_thread(_do)
-        if result.get("code") not in (0, None):
-            raise RunningHubError(f"获取工作流失败: {result.get('msg') or result}")
+        code = result.get("code")
+        # 兼容新旧成功码：文档为 0，新接口（如上传）实际返回 200
+        if code not in (0, 200, None):
+            raise RunningHubError(
+                f"获取工作流失败: {result.get('msg') or result.get('message') or json.dumps(result, ensure_ascii=False)[:500]}"
+            )
         data = result.get("data") or {}
-        prompt = data.get("prompt") or "{}"
+        prompt = data.get("prompt")
+        if prompt is None:
+            raise RunningHubError(f"获取工作流失败: 响应缺少 data.prompt: {json.dumps(result, ensure_ascii=False)[:500]}")
         import json as _json
 
         try:

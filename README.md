@@ -31,17 +31,17 @@ pip install -r runninghub-workflow-adapter/requirements.txt
 
 **最快上手**：聊天中发送 `/识别工作流 <工作流ID> <名称>`，自动识别输入节点并写入配置，热重载后即可用。
 
-**工作流配置示例**：
+**工作流配置**：WebUI「工作流列表」中可直接增删工作流与输入节点（名称 / 工作流 ID / 设备类型下拉 / LLM 扩写开关 / 输入节点表单），无需手写 TOML。手动编辑 `config.toml` 时的结构如下：
 
 ```toml
-[[workflows]]
+[[workflows.items]]
 name = "动漫生图"
 workflow_id = "2087492768787685378"
 instance_type = "Standard"
 llm_enhance = false
 llm_template_path = ""
 
-[[workflows.input_nodes]]
+[[workflows.items.input_nodes]]
 node_id = "353"
 field_name = "prompt"
 field_value = ""

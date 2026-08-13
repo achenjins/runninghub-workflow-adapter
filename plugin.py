@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
+from pydantic import field_validator
+
 from maibot_sdk import (
     API,
     Command,
@@ -41,15 +43,10 @@ _PLUGIN_DIR = Path(__file__).resolve().parent
 if str(_PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR))
 
-# 热重载兼容：lib 模块可能已在 sys.modules 中缓存旧代码，
-# 每次加载 plugin.py 时强制从磁盘重新加载 lib，确保代码更新随热重载生效。
-import importlib as _importlib
-
-import lib.runninghub_client as _lib_client_module
-
-_lib_client_module = _importlib.reload(_lib_client_module)
-RunningHubClient = _lib_client_module.RunningHubClient
-RunningHubError = _lib_client_module.RunningHubError
+# 包名必须全局唯一：多个 RunningHub 插件同进程加载时，通用名 lib 会互相抢占
+# sys.modules，导致拿到对方的旧版 client（缺少 get_workflow_json 等方法）。
+# 热重载交给 Runner 整体重载插件，不要在这里对子模块做部分 reload。
+from rh_generic_lib.runninghub_client import RunningHubClient, RunningHubError
 
 __all__ = ["RunningHubGenericPlugin", "create_plugin"]
 
@@ -215,6 +212,18 @@ class WorkflowItemSection(PluginConfigBase):
     )
 
 
+class WorkflowsSection(PluginConfigBase):
+    """工作流列表配置（WebUI 中可自由增删工作流与输入节点）。"""
+
+    __ui_label__ = "工作流列表"
+
+    items: list[WorkflowItemSection] = Field(
+        default_factory=list,
+        description="工作流列表，可自由增删；每个工作流包含名称、工作流 ID、设备类型、LLM 扩写开关与输入节点",
+        json_schema_extra={"label": "工作流列表", "min_items": 0, "max_items": 20},
+    )
+
+
 class GenericConfig(PluginConfigBase):
     """插件完整配置。"""
 
@@ -222,19 +231,24 @@ class GenericConfig(PluginConfigBase):
     server: ServerSection = Field(default_factory=ServerSection)
     generation: GenerationSection = Field(default_factory=GenerationSection)
     cleanup: CleanupSection = Field(default_factory=CleanupSection)
-    workflows_toml: str = Field(
-        default="",
-        description=(
-            "工作流配置（TOML 文本）。在此粘贴/编辑 [[workflows]] 段，"
-            "支持多个工作流和多个输入节点。也可在聊天中用 /识别工作流 命令自动生成"
-        ),
-        json_schema_extra={
-            "label": "工作流配置（TOML）",
-            "x-widget": "textarea",
-            "rows": 15,
-            "placeholder": '[[workflows]]\nname = "动漫生图"\nworkflow_id = "2087492768787685378"\ninstance_type = "Standard"\n\n[[workflows.input_nodes]]\nnode_id = "353"\nfield_name = "prompt"\nfield_value = ""\nvalue_type = "text"\nlabel = "提示词"',
-        },
-    )
+    workflows: WorkflowsSection = Field(default_factory=WorkflowsSection)
+
+    @field_validator("workflows", mode="before")
+    @classmethod
+    def _coerce_legacy_workflows(cls, value: Any) -> Any:
+        """兼容最老版本配置：顶层 ``workflows = [ {...}, ... ]`` 数组形态。
+
+        该形态会被归一化为 ``{"items": [...]}``，加载后由 on_load 的迁移逻辑
+        落盘为新结构，避免旧配置直接导致激活失败。
+        """
+        if isinstance(value, list):
+            return {
+                "items": [
+                    item.model_dump(mode="python") if isinstance(item, WorkflowItemSection) else item
+                    for item in value
+                ]
+            }
+        return value
 
 
 # NapCat 动作候选 API（兼容 napcat-adapter 与 SnowLuma 命名空间）
@@ -299,60 +313,55 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         self._cache_dir: Path | None = None
         self._workflows: list[WorkflowItemSection] = []
 
-    # ── 工作流 TOML 解析 ──────────────────────────────────────────
+    # ── 工作流配置访问 ────────────────────────────────────────────
 
-    def _parse_workflows(self) -> None:
-        """从 workflows_toml 文本解析工作流列表（解析失败时保留空列表并记日志）。"""
-        toml_text = str(self.config.workflows_toml or "").strip()
-        if not toml_text:
-            self._workflows = []
-            return
-        try:
-            import tomllib
+    def _refresh_workflows(self) -> None:
+        """从结构化配置同步工作流列表（pydantic 已校验，无需 TOML 解析）。"""
+        self._workflows = list(self.config.workflows.items)
+        self.ctx.logger.info("[配置] 已加载 %d 个工作流", len(self._workflows))
 
-            data = tomllib.loads(toml_text)
-        except Exception as exc:
-            self.ctx.logger.error("[配置] workflows_toml 解析失败: %s", exc)
-            self._workflows = []
-            return
-        raw_workflows = data.get("workflows")
-        if not isinstance(raw_workflows, list):
-            self.ctx.logger.error("[配置] workflows_toml 缺少 [[workflows]] 表数组")
-            self._workflows = []
-            return
-        workflows: list[WorkflowItemSection] = []
-        for raw in raw_workflows:
-            if not isinstance(raw, dict):
-                continue
-            raw_nodes = raw.get("input_nodes")
-            nodes = raw_nodes if isinstance(raw_nodes, list) else []
-            try:
-                workflows.append(
-                    WorkflowItemSection.model_validate(
-                        {
-                            "name": str(raw.get("name") or ""),
-                            "workflow_id": str(raw.get("workflow_id") or ""),
-                            "instance_type": raw.get("instance_type", "Standard"),
-                            "llm_enhance": bool(raw.get("llm_enhance", False)),
-                            "llm_template_path": str(raw.get("llm_template_path") or ""),
-                            "input_nodes": [
-                                {
-                                    "node_id": str(n.get("node_id") or ""),
-                                    "field_name": str(n.get("field_name") or "prompt"),
-                                    "field_value": str(n.get("field_value") or ""),
-                                    "value_type": str(n.get("value_type") or ""),
-                                    "label": str(n.get("label") or ""),
-                                }
-                                for n in nodes
-                                if isinstance(n, dict)
-                            ],
-                        }
-                    )
-                )
-            except Exception as exc:
-                self.ctx.logger.error("[配置] 工作流条目解析失败: %s", exc)
-        self._workflows = workflows
-        self.ctx.logger.info("[配置] 已解析 %d 个工作流", len(workflows))
+    def get_webui_config_schema(self, **kwargs: Any) -> dict[str, Any]:
+        """生成 WebUI 配置 Schema，并补全二级嵌套列表（input_nodes）的元素字段定义。
+
+        SDK 的 schema 生成只展开一层 list[PluginConfigBase]：workflows.items 的
+        item_fields 里 input_nodes 只会标成 {"type": "array"}，没有自己的
+        item_fields，WebUI 会把它渲染成字符串列表。这里手动补上
+        item_type/item_fields，让输入节点也能用表单增删。
+        """
+        schema = super().get_webui_config_schema(**kwargs)
+        if not isinstance(schema, dict):
+            return schema
+        section = (schema.get("sections") or {}).get("workflows") or {}
+        items_field = (section.get("fields") or {}).get("items")
+        if not isinstance(items_field, dict):
+            return schema
+        item_fields = items_field.get("item_fields")
+        if not isinstance(item_fields, dict):
+            return schema
+        input_nodes_field = item_fields.get("input_nodes")
+        if isinstance(input_nodes_field, dict):
+            input_nodes_field["item_type"] = "object"
+            input_nodes_field["item_fields"] = self._build_input_node_item_fields()
+        return schema
+
+    @staticmethod
+    def _build_input_node_item_fields() -> dict[str, dict[str, Any]]:
+        """为输入节点列表元素构造字段定义（供 WebUI 渲染嵌套表单）。"""
+        default_values = InputNodeSection().model_dump(mode="python")
+        item_fields: dict[str, dict[str, Any]] = {}
+        for field_name, field_info in InputNodeSection.model_fields.items():
+            extra = getattr(field_info, "json_schema_extra", None)
+            json_extra = dict(extra) if isinstance(extra, dict) else {}
+            item_field: dict[str, Any] = {
+                "type": "select" if field_name == "value_type" else "string",
+                "label": str(json_extra.get("label") or field_info.description or field_name),
+                "placeholder": str(json_extra.get("placeholder") or ""),
+                "default": default_values.get(field_name),
+            }
+            if field_name == "value_type":
+                item_field["choices"] = ["", "default", "text", "image", "audio"]
+            item_fields[field_name] = item_field
+        return item_fields
 
     # ── 生命周期 ──────────────────────────────────────────────────
 
@@ -377,7 +386,11 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         cfg = self.config
         self._semaphore = asyncio.Semaphore(max(1, cfg.generation.max_concurrent))
         self._rebuild_client()
-        self._parse_workflows()
+
+        # 旧版配置迁移：把历史上 TOML 文本 / 顶层数组形态统一落盘为结构化
+        # [[workflows.items]]（文件监听随后触发一次幂等的热更新），并立即应用到当前实例。
+        self._migrate_legacy_workflows_toml()
+        self._refresh_workflows()
 
         if not cfg.server.api_key:
             self.ctx.logger.warning("未配置 RunningHub API Key，请编辑插件目录下 config.toml 的 server.api_key")
@@ -419,7 +432,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         if scope != CONFIG_RELOAD_SCOPE_SELF:
             return
         self._rebuild_client()
-        self._parse_workflows()
+        self._refresh_workflows()
         self._validate_workflows()
         self.ctx.logger.info(
             "插件配置已热更新: version=%s 工作流数量=%d",
@@ -1219,35 +1232,35 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 return True, "", 1
 
         self.ctx.logger.info("[识别] 请求 getJsonApiFormat: workflow_id=%s", workflow_id)
-        if not hasattr(client, "get_workflow_json"):
-            self.ctx.logger.error(
-                "[识别] client 缺少 get_workflow_json 方法！client 类=%s 定义模块=%s 文件=%s",
-                type(client).__name__,
-                type(client).__module__,
-                getattr(type(client), "__module__", ""),
-            )
-            import lib.runninghub_client as _check_module
-
-            self.ctx.logger.error(
-                "[识别] lib 模块文件=%s 是否有方法=%s 方法列表=%s",
-                getattr(_check_module, "__file__", "无"),
-                hasattr(_check_module, "get_workflow_json"),
-                [n for n in dir(_check_module) if not n.startswith("_")],
-            )
-            await self.ctx.send.text("插件代码未完全更新，请重启 MaiBot 容器后再试", stream_id)
-            return True, "", 1
         try:
             workflow_json = await client.get_workflow_json(workflow_id)
         except RunningHubError as exc:
             self.ctx.logger.error("[识别] 获取工作流失败: %s", exc)
             await self.ctx.send.text(f"获取工作流失败：{exc}", stream_id)
             return True, "", 1
+        except Exception as exc:
+            self.ctx.logger.error("[识别] 获取工作流异常: %s", exc, exc_info=True)
+            await self.ctx.send.text(f"获取工作流异常：{exc}", stream_id)
+            return True, "", 1
         self.ctx.logger.info("[识别] 工作流 JSON 已获取，节点总数=%d", len(workflow_json))
 
         detected = self._detect_input_nodes(workflow_json)
         if not detected:
-            self.ctx.logger.warning("[识别] 未识别出输入节点")
-            await self.ctx.send.text("未识别出明显的输入节点，请手动在 WebUI 中配置", stream_id)
+            class_types = sorted(
+                {
+                    str(node.get("class_type") or "?")
+                    for node in workflow_json.values()
+                    if isinstance(node, dict)
+                }
+            )
+            self.ctx.logger.warning(
+                "[识别] 未识别出输入节点，工作流节点类型: %s", ", ".join(class_types)
+            )
+            await self.ctx.send.text(
+                "未识别出明显的输入节点，请手动在 WebUI 中配置\n"
+                f"工作流节点类型已写入日志：{'、'.join(class_types[:20])}",
+                stream_id,
+            )
             return True, "", 1
         self.ctx.logger.info(
             "[识别] 识别到 %d 个输入节点: %s",
@@ -1282,37 +1295,28 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         """将字符串转义为 TOML 基础字符串字面量。"""
         return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
-    @staticmethod
-    def _build_workflow_toml_block(workflow_name: str, workflow_id: str, nodes: list[dict[str, str]]) -> str:
-        """构造一个工作流的 TOML 块（[[workflows]] + 节点）。"""
-        lines: list[str] = []
-        lines.append("[[workflows]]")
-        lines.append(f"name = {RunningHubGenericPlugin._toml_string(workflow_name)}")
-        lines.append(f"workflow_id = {RunningHubGenericPlugin._toml_string(workflow_id)}")
-        lines.append('instance_type = "Standard"')
-        lines.append("llm_enhance = false")
-        lines.append('llm_template_path = ""')
-        lines.append("")
-        for node in nodes:
-            lines.append("[[workflows.input_nodes]]")
-            lines.append(f"node_id = {RunningHubGenericPlugin._toml_string(node['node_id'])}")
-            lines.append(f"field_name = {RunningHubGenericPlugin._toml_string(node['field_name'])}")
-            lines.append(f"value_type = {RunningHubGenericPlugin._toml_string(node['value_type'])}")
-            lines.append('field_value = ""')
-            lines.append(f"label = {RunningHubGenericPlugin._toml_string(node['hint'])}")
-            lines.append("")
-        return "\n".join(lines)
-
-    def _serialize_config_file(self, workflows_toml: str) -> str:
-        """将完整配置序列化为 config.toml 文本（workflows_toml 用字面多行字符串）。"""
+    def _serialize_config_file(self, items: list[dict[str, Any]]) -> str:
+        """将完整配置序列化为 config.toml 文本（工作流为结构化表数组）。"""
         cfg = self.config
         lines: list[str] = []
-        if workflows_toml:
-            escaped = workflows_toml.replace("'''", "'''''")  # 规避字面字符串结束符
-            lines.append("workflows_toml = '''")
-            lines.append(escaped)
-            lines.append("'''")
+        for workflow in items:
+            lines.append("[[workflows.items]]")
+            lines.append(f"name = {self._toml_string(str(workflow.get('name') or ''))}")
+            lines.append(f"workflow_id = {self._toml_string(str(workflow.get('workflow_id') or ''))}")
+            lines.append(f"instance_type = {self._toml_string(str(workflow.get('instance_type') or 'Standard'))}")
+            lines.append(f"llm_enhance = {'true' if workflow.get('llm_enhance') else 'false'}")
+            lines.append(f"llm_template_path = {self._toml_string(str(workflow.get('llm_template_path') or ''))}")
             lines.append("")
+            for node in workflow.get("input_nodes") or []:
+                if not isinstance(node, dict):
+                    continue
+                lines.append("[[workflows.items.input_nodes]]")
+                lines.append(f"node_id = {self._toml_string(str(node.get('node_id') or ''))}")
+                lines.append(f"field_name = {self._toml_string(str(node.get('field_name') or ''))}")
+                lines.append(f"field_value = {self._toml_string(str(node.get('field_value') or ''))}")
+                lines.append(f"value_type = {self._toml_string(str(node.get('value_type') or ''))}")
+                lines.append(f"label = {self._toml_string(str(node.get('label') or ''))}")
+                lines.append("")
         lines.append("[plugin]")
         lines.append(f"config_version = {self._toml_string(cfg.plugin.config_version)}")
         lines.append("")
@@ -1332,6 +1336,128 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         lines.append("")
         return "\n".join(lines)
 
+    def _write_config_file(self, items: list[dict[str, Any]]) -> None:
+        """按结构化工作流列表重建 config.toml（同步写盘）。"""
+        config_path = _PLUGIN_DIR / "config.toml"
+        content = self._serialize_config_file(items)
+        config_path.write_text(content, encoding="utf-8")
+
+    def _workflow_dicts_from_toml_text(self, text: str) -> list[dict[str, Any]]:
+        """解析旧版 workflows_toml 文本为工作流 dict 列表（供迁移使用）。"""
+        import tomllib
+
+        data = tomllib.loads(text)
+        raw_workflows = data.get("workflows")
+        if not isinstance(raw_workflows, list):
+            raise ValueError("TOML 缺少 [[workflows]] 表数组")
+        result: list[dict[str, Any]] = []
+        for raw in raw_workflows:
+            if not isinstance(raw, dict):
+                continue
+            raw_nodes = raw.get("input_nodes")
+            nodes = raw_nodes if isinstance(raw_nodes, list) else []
+            result.append(
+                {
+                    "name": str(raw.get("name") or ""),
+                    "workflow_id": str(raw.get("workflow_id") or ""),
+                    "instance_type": str(raw.get("instance_type") or "Standard"),
+                    "llm_enhance": bool(raw.get("llm_enhance", False)),
+                    "llm_template_path": str(raw.get("llm_template_path") or ""),
+                    "input_nodes": [
+                        {
+                            "node_id": str(node.get("node_id") or ""),
+                            "field_name": str(node.get("field_name") or "prompt"),
+                            "field_value": str(node.get("field_value") or ""),
+                            "value_type": str(node.get("value_type") or ""),
+                            "label": str(node.get("label") or ""),
+                        }
+                        for node in nodes
+                        if isinstance(node, dict)
+                    ],
+                }
+            )
+        return result
+
+    def _migrate_legacy_workflows_toml(self) -> bool:
+        """迁移历史配置形态到结构化 [[workflows.items]]。
+
+        兼容三种旧形态：
+        1. 顶层 ``[[workflows]]`` 表数组（最老版本的数组模型）；
+        2. 顶层 ``workflows_toml = '''...'''`` 字符串（更早版本）；
+        3. ``[workflows] workflows_toml = '''...'''`` 字符串（上一版本）。
+
+        迁移会重建 config.toml（文件监听随后触发一次幂等的热更新），
+        并立即应用到当前实例。
+
+        Returns:
+            bool: 是否发生了迁移。
+        """
+        config_path = _PLUGIN_DIR / "config.toml"
+        if not config_path.is_file():
+            return False
+        try:
+            import tomllib
+
+            raw = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.ctx.logger.warning("[配置] 读取 config.toml 失败，跳过旧配置迁移: %s", exc)
+            return False
+        if not isinstance(raw, dict):
+            return False
+
+        workflows_raw = raw.get("workflows")
+        legacy_items: list[dict[str, Any]] = []
+        legacy_text = ""
+
+        if isinstance(workflows_raw, dict):
+            legacy_text = str(workflows_raw.get("workflows_toml") or "").strip()
+        elif isinstance(workflows_raw, list):
+            # 形态 1：顶层数组，已是结构化 dict，直接搬运
+            legacy_items = [
+                {
+                    **{str(k): v for k, v in workflow.items() if k != "input_nodes"},
+                    "input_nodes": [
+                        {str(k2): v2 for k2, v2 in (node.items() if isinstance(node, dict) else [])}
+                        for node in (workflow.get("input_nodes") or [])
+                        if isinstance(node, dict)
+                    ],
+                }
+                for workflow in workflows_raw
+                if isinstance(workflow, dict)
+            ]
+        else:
+            # 形态 2：顶层字符串
+            legacy_text = str(raw.get("workflows_toml") or "").strip()
+
+        if not legacy_items and legacy_text:
+            try:
+                legacy_items = self._workflow_dicts_from_toml_text(legacy_text)
+            except Exception as exc:
+                self.ctx.logger.error(
+                    "[配置] 旧版 workflows_toml 解析失败，配置内容保留在文件中，请检查: %s", exc
+                )
+                return False
+
+        existing = [workflow.model_dump(mode="python") for workflow in self.config.workflows.items]
+        if existing and not legacy_items:
+            return False  # 已是结构化配置，无旧内容可迁移
+        merged = existing + legacy_items
+        if not merged:
+            return False
+
+        try:
+            self._write_config_file(merged)
+        except OSError as exc:
+            self.ctx.logger.warning("[配置] 旧配置迁移写盘失败: %s", exc)
+            return False
+
+        current = self.get_plugin_config_data()
+        current["workflows"] = {"items": merged}
+        self.set_plugin_config(current)
+        self._refresh_workflows()
+        self.ctx.logger.info("[配置] 已迁移 %d 个旧版工作流为结构化配置", len(legacy_items))
+        return True
+
     async def _append_workflow_to_config(
         self,
         *,
@@ -1339,24 +1465,42 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         workflow_id: str,
         nodes: list[dict[str, str]],
     ) -> None:
-        """将识别出的工作流合并进 workflows_toml 并重建 config.toml（触发热重载）。"""
-        block = self._build_workflow_toml_block(workflow_name, workflow_id, nodes)
-        current = str(self.config.workflows_toml or "").strip()
-        merged = (current + "\n\n" + block).strip() if current else block
+        """将识别出的工作流以结构化条目写入 workflows.items 并重建 config.toml。
+
+        写盘后立即应用到当前实例（不必等待文件监听的热更新回环）。
+        """
+        workflow_dict: dict[str, Any] = {
+            "name": workflow_name,
+            "workflow_id": workflow_id,
+            "instance_type": "Standard",
+            "llm_enhance": False,
+            "llm_template_path": "",
+            "input_nodes": [
+                {
+                    "node_id": str(node.get("node_id") or ""),
+                    "field_name": str(node.get("field_name") or ""),
+                    "field_value": "",
+                    "value_type": str(node.get("value_type") or ""),
+                    "label": str(node.get("hint") or node.get("label") or ""),
+                }
+                for node in nodes
+            ],
+        }
+        # pydantic 校验，非法值在写入前暴露
+        WorkflowItemSection.model_validate(workflow_dict)
+
+        merged = [workflow.model_dump(mode="python") for workflow in self.config.workflows.items]
+        merged.append(workflow_dict)
+
+        await asyncio.to_thread(self._write_config_file, merged)
+
+        current = self.get_plugin_config_data()
+        current["workflows"] = {"items": merged}
+        self.set_plugin_config(current)
+        self._refresh_workflows()
         self.ctx.logger.info(
-            "[识别] 合并后的 workflows_toml 长度=%d", len(merged)
-        )
-
-        config_path = _PLUGIN_DIR / "config.toml"
-
-        def _write() -> None:
-            content = self._serialize_config_file(merged)
-            config_path.write_text(content, encoding="utf-8")
-
-        await asyncio.to_thread(_write)
-        self.ctx.logger.info(
-            "[识别] 已重建 config.toml: %s（%d 个节点），等待热重载",
-            config_path,
+            "[识别] 已写入结构化配置: %s（%d 个节点），并热重载",
+            _PLUGIN_DIR / "config.toml",
             len(nodes),
         )
 
@@ -1364,7 +1508,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     def _detect_input_nodes(workflow_json: dict[str, Any]) -> list[dict[str, str]]:
         """从工作流 JSON 自动识别可能的输入节点。
 
-        规则：class_type 命中白名单，且所有 inputs 均为标量值（非节点连线）。
+        规则：class_type 命中白名单。普通节点要求所有 inputs 均为标量值
+        （非节点连线）；CLIPTextEncode 例外——它通常带有 clip 等连线输入，
+        但只要 text 字段是标量，就是典型文字输入节点。
         """
         detected: list[dict[str, str]] = []
         for node_id, node in sorted(workflow_json.items(), key=lambda item: _safe_int(item[0])):
@@ -1374,12 +1520,31 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             inputs = node.get("inputs")
             if not isinstance(inputs, dict) or not inputs:
                 continue
-            # 排除存在节点连线（["id", 0] 形式）的节点
-            if any(isinstance(v, (list, tuple)) and v for v in inputs.values()):
-                continue
             cls_lower = class_type.lower()
-            if "prompt text" in cls_lower or "primitivestring" in cls_lower:
-                field_name = "prompt" if "prompt text" in cls_lower else ("text" if "text" in inputs else ("value" if "value" in inputs else "prompt"))
+            cls_compact = cls_lower.replace(" ", "")
+            has_links = any(isinstance(v, (list, tuple)) and v for v in inputs.values())
+
+            if "cliptextencode" in cls_compact or "text encode" in cls_lower:
+                # CLIPTextEncode：text 为标量即视为文字输入（连线输入不影响判定）
+                if isinstance(inputs.get("text"), str):
+                    detected.append(
+                        {
+                            "node_id": node_id,
+                            "field_name": "text",
+                            "value_type": "text",
+                            "hint": f"文本输入（{class_type}）",
+                        }
+                    )
+                continue
+            # 其余节点：存在节点连线（["id", 0] 形式）则排除
+            if has_links:
+                continue
+            if "prompt text" in cls_lower or "primitivestring" in cls_compact or "stringmultiline" in cls_compact:
+                field_name = (
+                    "prompt"
+                    if "prompt text" in cls_lower
+                    else ("text" if "text" in inputs else ("value" if "value" in inputs else "prompt"))
+                )
                 detected.append(
                     {
                         "node_id": node_id,
@@ -1388,7 +1553,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                         "hint": f"文本输入（{class_type}）",
                     }
                 )
-            elif "loadimage" in cls_lower.replace(" ", "") or "load image" in cls_lower:
+            elif "loadimage" in cls_compact or "load image" in cls_lower:
                 detected.append(
                     {
                         "node_id": node_id,
@@ -1397,7 +1562,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                         "hint": f"图片输入（{class_type}）",
                     }
                 )
-            elif "loadaudio" in cls_lower.replace(" ", "") or "audio upload" in cls_lower or "audioupload" in cls_lower.replace(" ", ""):
+            elif "loadaudio" in cls_compact or "audio upload" in cls_lower or "audioupload" in cls_compact:
                 detected.append(
                     {
                         "node_id": node_id,
@@ -1485,13 +1650,6 @@ def type_name_of(file_type: str) -> str:
 
 
 def _safe_int(value: Any) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _safe_int(value):
     try:
         return int(value)
     except (TypeError, ValueError):

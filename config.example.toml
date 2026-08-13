@@ -19,24 +19,26 @@ enable = false
 recall_seconds = 90
 
 # ────────────────────────────────────────────────────────────
-# 工作流配置说明（可自由增加数量）
+# 工作流列表（结构化配置，可在 WebUI「工作流列表」中增删）
 #
-# 推荐方式：聊天中发送 /识别工作流 <工作流ID> <名称>，自动写入配置。
+# 推荐方式：聊天中发送 /识别工作流 <工作流ID> <名称>，自动识别输入节点并写入；
+# 或在 WebUI 的「工作流列表」表单里手动增删工作流与输入节点。
 #
-# 手动配置示例（数组内的表，[[...]] 表示追加一项）：
+# 每个工作流一项 [[workflows.items]]，节点再追加
+# [[workflows.items.input_nodes]]（追加到最近一个工作流项下）。
 #
-# [[workflows]]
+# [[workflows.items]]
 # name = "动漫生图"
 # workflow_id = "2087492768787685378"
-# instance_type = "Standard"
-# llm_enhance = false              # LLM 扩写开关
-# llm_template_path = ""           # 扩写模板路径（相对插件目录）
+# instance_type = "Standard"      # Standard 或 Plus
+# llm_enhance = false             # LLM 扩写开关
+# llm_template_path = ""          # 扩写模板路径（相对插件目录）
 #
-# [[workflows.input_nodes]]
+# [[workflows.items.input_nodes]]
 # node_id = "353"
 # field_name = "prompt"
-# field_value = ""                 # 留空：由用户提供；填写：固定默认值
-# value_type = "text"              # default=默认值 / text=文字 / image=图片 / audio=语音 / 空=自动推断
+# field_value = ""                # 留空：由用户提供；填写：固定默认值
+# value_type = "text"             # default=默认值 / text=文字 / image=图片 / audio=语音 / 空=自动推断
 # label = "提示词"
 #
 # 节点规则：
