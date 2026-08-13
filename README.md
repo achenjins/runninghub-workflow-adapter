@@ -58,8 +58,8 @@
 
 注册并登录后，打开对应平台的 API 页面，复制页面里的 API Key：
 
-- 国内站：[https://www.runninghub.cn/enterprise-api/consumerApi](https://www.runninghub.cn/enterprise-api/consumerApi)
-- 海外站：[https://www.runninghub.ai/enterprise-api/consumerApi](https://www.runninghub.ai/enterprise-api/consumerApi)
+- 国内站：[https://www.runninghub.cn/enterprise-api/consumerApi?inviteCode=8cq8uhl8](https://www.runninghub.cn/enterprise-api/consumerApi?inviteCode=8cq8uhl8)
+- 海外站：[https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=bvhsaqdr](https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=bvhsaqdr)
 
 **③ 填进插件**
 
@@ -72,23 +72,29 @@
 
 > 填完通常需要「重载插件」或「保存配置」才生效。
 
-### 第 2 步：识别（导入）一个工作流
+### 第 2 步：识别（导入）一个体验工作流
 
-先到 RunningHub 网站上打开你想用的工作流，复制它的**工作流 ID**（网址里那一长串数字，见[概念 1](#1-工作流-id-从哪找)）。
+先给大家一个现成的**文生图体验工作流**，直接打开就能用：
 
-然后在聊天里发：
+- 海外版：[https://www.runninghub.ai/zh-cn/workflow/2087492768787685378](https://www.runninghub.ai/zh-cn/workflow/2087492768787685378)
+- 国内版：[https://www.runninghub.cn/workflow/2087939838371786753](https://www.runninghub.cn/workflow/2087939838371786753)
 
-    /识别国外工作流 2087492768787685378 动漫生图
+然后在聊天里发（按你的平台二选一）：
 
-- 工作流在 **runninghub.ai（国外）** 上用 **/识别国外工作流**
-- 工作流在 **runninghub.cn（国内）** 上用 **/识别国内工作流**
-- 最后的「动漫生图」是你给它起的名字，之后跑图就用这个名字；不写就用工作流 ID 当名字
+    /识别国外工作流 2087492768787685378 文生图
 
-插件会自动分析这个工作流需要哪些输入，并保存配置。看到「识别成功」就说明导入了。
+    /识别国内工作流 2087939838371786753 文生图
+
+看到「识别成功」即导入完成。
+
+**导入后，做两件事**：
+
+1. **删掉多余节点**：进入 MaiBot 插件配置页 → 工作流列表 → 找到「文生图」，把识别出来的输入节点**只保留「提示词」节点（海外工作流的提示词节点是 353 号）**，其余节点全部删除。
+2. **配置专属提示词模板**：把这个工作流的「启用 LLM 扩写」打开，并在「扩写模板路径」里填 prompt/anima3_prompt_template.txt（这个模板文件已随插件一起提供，就在仓库的 prompt/ 目录下）。
 
 ### 第 3 步：跑一张图
 
-    /跑图 动漫生图 一只戴着红色帽子的橘猫，坐在窗边，暖光
+    /跑图 文生图 一只戴着红色帽子的橘猫，坐在窗边，暖光
 
 - 如果这个工作流还需要**参考图 / 参考音频**，机器人会提示你「请上传：图片 1 张、音频 1 段」，直接把文件发到聊天里即可；不想传就回「**跳过剩余**」。
 - 如果识别出了一些**可修改参数**（如分辨率），机器人会问你「可修改：1.宽度=512 …」，直接回复新值，或回「**不变**」用默认值。
