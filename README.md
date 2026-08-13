@@ -74,12 +74,12 @@
 
 ### 第 2 步：识别（导入）一个体验工作流
 
-先给大家一个现成的**文生图体验工作流**，直接打开就能用：
+先给大家一个我**魔改**的**文生图体验工作流**（注意：打开不能直接使用，想体验原版可去下方 up 主的视频里）：
 
 - 海外版：[https://www.runninghub.ai/zh-cn/workflow/2087492768787685378?inviteCode=bvhsaqdr](https://www.runninghub.ai/zh-cn/workflow/2087492768787685378?inviteCode=bvhsaqdr)
 - 国内版：[https://www.runninghub.cn/workflow/2087939838371786753?inviteCode=8cq8uhl8](https://www.runninghub.cn/workflow/2087939838371786753?inviteCode=8cq8uhl8)
 
-> 这个体验工作流修改自 B 站视频教程 [BV1arGt6wExL](https://www.bilibili.com/video/BV1arGt6wExL)，特别感谢 up 主 [@每日提钢小助手5号](https://space.bilibili.com/3690999272442168) 的分享！
+> 这个工作流魔改自 B 站视频教程 [BV1arGt6wExL](https://www.bilibili.com/video/BV1arGt6wExL)，感谢 up 主 [@每日提钢小助手5号](https://space.bilibili.com/3690999272442168) 分享的工作流，如侵权可联系删除。
 
 **设备与费用参考**（这个文生图体验工作流）：
 
@@ -103,7 +103,9 @@
 
 ### 第 3 步：跑一张图
 
-    /跑图 文生图 一只戴着红色帽子的橘猫，坐在窗边，暖光
+    /跑图 文生图 原神刻晴
+
+    /跑图 文生图 原神刻晴与甘雨，室内
 
 - 如果这个工作流还需要**参考图 / 参考音频**，机器人会提示你「请上传：图片 1 张、音频 1 段」，直接把文件发到聊天里即可；不想传就回「**跳过剩余**」。
 - 如果识别出了一些**可修改参数**（如分辨率），机器人会问你「可修改：1.宽度=512 …」，直接回复新值，或回「**不变**」用默认值。
