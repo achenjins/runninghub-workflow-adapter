@@ -280,6 +280,51 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     # ── 生命周期 ──────────────────────────────────────────────────
 
+    def get_webui_config_schema(self, **kwargs: Any) -> dict[str, Any]:
+        """生成 WebUI 配置 Schema，并修复嵌套列表（input_nodes）的元素字段定义。
+
+        SDK 默认只对一层 list[PluginConfigBase] 生成 item_fields，
+        嵌套的 list[InputNodeSection] 会被渲染成单个空位；这里手动补齐。
+        """
+        schema = super().get_webui_config_schema(**kwargs)
+        if not isinstance(schema, dict):
+            return schema
+        general = (schema.get("sections") or {}).get("general") or {}
+        workflows_field = (general.get("fields") or {}).get("workflows")
+        if not isinstance(workflows_field, dict):
+            return schema
+        item_fields = workflows_field.get("item_fields")
+        if not isinstance(item_fields, dict):
+            return schema
+        input_nodes_field = item_fields.get("input_nodes")
+        if not isinstance(input_nodes_field, dict):
+            return schema
+        input_nodes_field["item_type"] = "object"
+        input_nodes_field["item_fields"] = self._build_input_node_item_fields()
+        return schema
+
+    @staticmethod
+    def _build_input_node_item_fields() -> dict[str, dict[str, Any]]:
+        """为输入节点列表元素构造字段定义（供 WebUI 渲染多个输入框）。"""
+        default_values = InputNodeSection().model_dump()
+        item_fields: dict[str, dict[str, Any]] = {}
+        for field_name, field_info in InputNodeSection.model_fields.items():
+            json_extra = {}
+            extra = getattr(field_info, "json_schema_extra", None)
+            if isinstance(extra, dict):
+                json_extra = extra
+            item_field: dict[str, Any] = {
+                "type": "select" if field_name == "value_type" else "string",
+                "label": str(json_extra.get("label") or field_info.description or field_name),
+                "placeholder": str(json_extra.get("placeholder") or ""),
+                "default": default_values.get(field_name),
+            }
+            if field_name == "value_type":
+                item_field["type"] = "select"
+                item_field["choices"] = ["default", "text", "image", "audio"]
+            item_fields[field_name] = item_field
+        return item_fields
+
     async def on_load(self) -> None:
         cfg = self.config
         self._semaphore = asyncio.Semaphore(max(1, cfg.generation.max_concurrent))
