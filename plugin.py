@@ -1511,16 +1511,36 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 if source:
                     files.append(("audio", source))
             elif seg_type == "file":
-                # QQ「文件」消息（type=file）不区分图片/音频/视频，按文件名/URL 扩展名推断真实类型
+                # QQ「文件」消息（type=file）不区分图片/音频/视频，按文件名/URL 扩展名推断真实类型。
+                # NapCat 的 data 字段名不统一：先试常见字段，再遍历 data 值找含扩展名的文件名，
+                # 最后从 URL 的 ?fname= 参数兜底。
                 filename = ""
                 if isinstance(data, dict):
                     source = str(data.get("url") or data.get("file_url") or "").strip()
-                    filename = str(data.get("name") or data.get("file_name") or data.get("filename") or "").strip()
+                    filename = str(
+                        data.get("name") or data.get("file_name") or data.get("filename") or data.get("file") or ""
+                    ).strip()
+                    if not filename:
+                        for key, val in data.items():
+                            if key in ("url", "file_url"):
+                                continue
+                            if isinstance(val, str) and RunningHubGenericPlugin._detect_file_type_from_name(val) != "video":
+                                filename = val.strip()
+                                break
                     if not source:
                         source = filename
+                    if not filename:
+                        m = re.search(r"[?&]fname=([^&]+)", source)
+                        if m:
+                            filename = m.group(1)
                 else:
                     source = data_text
                     filename = source
+                if not filename:
+                    import logging
+                    logging.getLogger("RunningHubGenericPlugin").warning(
+                        "[文件识别] 未能从 file 段提取文件名，data=%r", data
+                    )
                 if source:
                     file_type = RunningHubGenericPlugin._detect_file_type_from_name(filename or source)
                     files.append((file_type, source))
