@@ -1359,8 +1359,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 "配置节点：" + "、".join(f"{n['node_id']}({n['label']}={n['field_value']})" for n in configs)
             )
         summary = "\n".join(parts_summary) or "（无）"
+        detect_note = "" if detect_method == "LLM" else "（LLM 识别未生效，已回退启发式规则，详见日志 [识别] 行）"
         await self.ctx.send.text(
-            f"已自动写入配置并热重载（{detect_method} 识别）：\n"
+            f"已自动写入配置并热重载（{detect_method} 识别{detect_note}）：\n"
             f"工作流「{workflow_name}」（{workflow_id}），共 {len(detected)} 个节点：\n{summary}\n"
             f"可发送 /工作流 查看；文字节点若需接收命令文本请在 WebUI 开启",
             stream_id,
@@ -1410,6 +1411,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         lines.append("[cleanup]")
         lines.append(f"enable = {'true' if cfg.cleanup.enable else 'false'}")
         lines.append(f"recall_seconds = {cfg.cleanup.recall_seconds}")
+        lines.append("")
+        lines.append("[detect]")
+        lines.append(f"use_llm = {'true' if cfg.detect.use_llm else 'false'}")
+        lines.append(f"model = {self._toml_string(cfg.detect.model)}")
         lines.append("")
         return "\n".join(lines)
 
@@ -1749,19 +1754,27 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             result = await self.ctx.llm.generate(
                 prompt=prompt,
                 model=self.config.detect.model,
-                temperature=0.0,
+                temperature=0.2,
+                max_tokens=1500,
             )
         except Exception as exc:
-            self.ctx.logger.warning("[识别] LLM 识别调用失败，将回退启发式: %s", exc)
+            self.ctx.logger.warning("[识别] LLM 识别调用异常，回退启发式: %s", exc, exc_info=True)
             return None
         if not isinstance(result, dict) or not result.get("success"):
-            self.ctx.logger.warning("[识别] LLM 识别未成功，将回退启发式: %s", str(result)[:200])
+            self.ctx.logger.warning("[识别] LLM 识别未成功，回退启发式: %s", str(result)[:300])
             return None
-        nodes = self._parse_llm_nodes(result.get("response") or "", workflow_json)
+        raw_response = str(result.get("response") or "")
+        nodes = self._parse_llm_nodes(raw_response, workflow_json)
         if not nodes:
-            self.ctx.logger.warning("[识别] LLM 输出校验失败，将回退启发式")
+            self.ctx.logger.warning(
+                "[识别] LLM 输出解析/校验失败，回退启发式；原始响应: %s", raw_response[:500]
+            )
             return None
-        self.ctx.logger.info("[识别] LLM 识别出 %d 个节点", len(nodes))
+        self.ctx.logger.info(
+            "[识别] LLM 识别出 %d 个节点: %s",
+            len(nodes),
+            ", ".join(f"{n['node_id']}/{n['field_name']}/{n['value_type']}" for n in nodes),
+        )
         return nodes
 
     @Command("跑图", description="运行配置好的工作流，例如：/跑图 动漫生图 一只猫", pattern=r"^/跑图")
