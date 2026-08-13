@@ -116,7 +116,16 @@ class CleanupSection(PluginConfigBase):
 
 
 class InputNodeSection(PluginConfigBase):
-    """单个工作流输入节点配置（可自由增加数量，最多 8 个）。"""
+    """单个工作流输入节点配置（可自由增加数量，最多 8 个）。
+
+    只需三个核心字段：节点 ID、字段名、输入内容。
+    类型下拉框选择该节点的用途：
+    - 默认值：输入内容作为固定默认值直接使用，不接受修改
+    - 文字：输入内容留空时接收命令文本（仅一个节点生效）
+    - 图片 / 语音：输入内容留空时按顺序等待用户上传
+    - 自动推断：按字段名推断（含 image→图片、audio/voice→语音、其余→文字）
+    任何类型只要填写了输入内容，都作为固定默认值使用。
+    """
 
     __ui_label__ = "输入节点"
 
@@ -127,31 +136,28 @@ class InputNodeSection(PluginConfigBase):
     )
     field_name: str = Field(
         default="prompt",
-        description="节点字段名（如 prompt / text / image / audio）",
+        description="节点字段名，可自定义；自动识别时会自动填写（如 prompt / text / image / audio）",
         json_schema_extra={"label": "字段名", "placeholder": "prompt"},
     )
-    value_type: Literal["text", "image", "audio"] = Field(
-        default="text",
-        description="节点输入类型：文字 / 图片 / 语音",
+    field_value: str = Field(
+        default="",
+        description="输入内容。填写后作为固定默认值直接使用（不接受修改）；留空则按类型由用户提供",
+        json_schema_extra={"label": "输入内容（默认值）", "hint": "留空=等待用户输入；填写=固定默认值"},
+    )
+    value_type: Literal["", "default", "text", "image", "audio"] = Field(
+        default="",
+        description="节点用途：默认值 / 文字 / 图片 / 语音 / 自动推断",
         json_schema_extra={
-            "label": "输入类型",
+            "label": "节点类型",
             "x-widget": "select",
             "options": [
-                {"value": "text", "label": "文字"},
-                {"value": "image", "label": "图片"},
-                {"value": "audio", "label": "语音"},
+                {"value": "", "label": "自动推断"},
+                {"value": "default", "label": "默认值（固定使用输入内容）"},
+                {"value": "text", "label": "文字（接收命令文本）"},
+                {"value": "image", "label": "图片（等待上传）"},
+                {"value": "audio", "label": "语音（等待上传）"},
             ],
         },
-    )
-    default_value: str = Field(
-        default="",
-        description="该字段的默认值（文字节点：固定文本；图片/语音节点：已上传的文件名如 openapi/xxx.png）",
-        json_schema_extra={"label": "默认值", "hint": "有默认值时不等待用户上传"},
-    )
-    use_command_text: bool = Field(
-        default=False,
-        description="仅文字节点有效：开启后命令文本填入该字段（覆盖默认值）。每个工作流只允许一个文字节点开启，其余文字节点使用默认值",
-        json_schema_extra={"label": "接收命令文本", "hint": "每个工作流仅一个文字节点可开启"},
     )
     label: str = Field(
         default="",
@@ -182,17 +188,21 @@ class WorkflowItemSection(PluginConfigBase):
     )
     llm_enhance: bool = Field(
         default=False,
-        description="开启后，文字节点的命令文本先按模板扩写再传入节点",
+        description="开启后，命令文本先按模板扩写再传入文字节点",
         json_schema_extra={"label": "启用 LLM 扩写"},
     )
     llm_template_path: str = Field(
         default="",
-        description="LLM 扩写提示词模板文件路径（相对插件目录或绝对路径）",
-        json_schema_extra={"label": "扩写模板路径", "placeholder": "templates/my_template.txt"},
+        description="LLM 扩写提示词模板文件路径，使用相对路径（相对插件目录，如 templates/my_template.txt）",
+        json_schema_extra={
+            "label": "扩写模板路径（相对插件目录）",
+            "placeholder": "templates/my_template.txt",
+            "hint": "相对路径相对插件目录解析",
+        },
     )
     input_nodes: list[InputNodeSection] = Field(
         default_factory=list,
-        description="输入节点列表，按此顺序接收用户上传的文件（最多 8 个）",
+        description="输入节点列表，按此顺序接收用户输入（最多 8 个）",
         json_schema_extra={"label": "输入节点"},
     )
 
@@ -371,14 +381,22 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     # ── 配置校验 ──────────────────────────────────────────────────
 
     def _validate_workflows(self) -> None:
-        """校验配置约束：文字命令节点最多 1 个、总节点最多 8 个。"""
+        """校验配置约束：总节点最多 8 个、无默认值的文字节点仅一个生效。"""
         for workflow in self.config.workflows:
             nodes = [n for n in workflow.input_nodes if str(n.node_id or "").strip()]
             if len(nodes) > 8:
                 self.ctx.logger.warning("工作流 %s 输入节点 %d 个，超过 8 个上限，多余节点将被忽略", workflow.name, len(nodes))
-            text_nodes = [n for n in nodes if n.value_type == "text" and n.use_command_text]
-            if len(text_nodes) > 1:
-                self.ctx.logger.warning("工作流 %s 有 %d 个文字命令节点，仅第一个生效", workflow.name, len(text_nodes))
+            empty_text_nodes = [
+                n for n in nodes
+                if not str(n.field_value or "").strip()
+                and self._resolve_value_type(n) == "text"
+            ]
+            if len(empty_text_nodes) > 1:
+                self.ctx.logger.warning(
+                    "工作流 %s 有 %d 个无默认值的文字节点，仅第一个接收命令文本，其余将被跳过",
+                    workflow.name,
+                    len(empty_text_nodes),
+                )
 
     # ── 内部工具方法 ──────────────────────────────────────────────
 
@@ -443,55 +461,83 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             return text
         return str(result.get("response") or "").strip() or text
 
+    @staticmethod
+    def _resolve_value_type(node: InputNodeSection) -> str:
+        """解析节点类型：显式选择优先，留空时按字段名自动推断。"""
+        explicit = str(node.value_type or "").strip().lower()
+        if explicit in ("default", "text", "image", "audio"):
+            return explicit
+        field_name = str(node.field_name or "").lower()
+        if any(k in field_name for k in ("image", "pic", "photo", "img")):
+            return "image"
+        if any(k in field_name for k in ("audio", "voice", "sound", "music", "speech")):
+            return "audio"
+        return "text"
+
     def _build_node_info_list(
         self,
         workflow: WorkflowItemSection,
         command_text: str,
         *,
         enhanced_text: str | None = None,
-    ) -> tuple[list[dict[str, str]], list[InputNodeSection]]:
-        """构建 nodeInfoList 并返回需要等待上传的节点列表。
+    ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+        """构建 nodeInfoList 并返回需要等待用户输入的节点列表。
 
-        Args:
-            workflow: 工作流配置。
-            command_text: 命令文本（未扩写）。
-            enhanced_text: 扩写后的文本（可选）。
+        规则：
+        - 填写了输入内容（field_value）→ 作为固定默认值直接使用，不接受修改
+        - 类型为"默认值"且无输入内容 → 跳过该节点
+        - 输入内容留空：
+          - 文字节点 → 接收命令文本（仅第一个生效，其余跳过）
+          - 图片/语音节点 → 按配置顺序等待用户上传
 
         Returns:
-            (node_info_list, waiting_nodes)：已确定的节点参数与待收集文件节点。
+            (node_info_list, waiting_nodes)：已确定的节点参数与待收集节点
+            （waiting 元素为 dict：node/field_name/value_type/label）。
         """
         nodes = self._ordered_nodes(workflow)
-        command_nodes = [n for n in nodes if n.value_type == "text" and n.use_command_text]
-        # 文字命令节点只保留第一个
-        first_command_node = command_nodes[0] if command_nodes else None
         text_to_fill = enhanced_text if enhanced_text is not None else command_text
+        text_filled = False
 
         node_info_list: list[dict[str, str]] = []
-        waiting: list[InputNodeSection] = []
+        waiting: list[dict[str, Any]] = []
         for node in nodes:
-            field_value = str(node.default_value or "")
-            if node.value_type == "text":
-                if node is first_command_node and text_to_fill:
-                    field_value = text_to_fill
+            field_value = str(node.field_value or "")
+            vtype = self._resolve_value_type(node)
+            node_id = node.node_id.strip()
+            field_name = node.field_name.strip() or "prompt"
+
+            if field_value:
+                # 有默认值：直接使用，不接受修改（任何类型均适用）
                 node_info_list.append(
-                    {
-                        "nodeId": node.node_id.strip(),
-                        "fieldName": node.field_name.strip() or "prompt",
-                        "fieldValue": field_value,
-                    }
+                    {"nodeId": node_id, "fieldName": field_name, "fieldValue": field_value}
                 )
-            else:
-                # 图片/语音节点：有默认值直接用，否则等待上传
-                if field_value:
+                continue
+
+            if vtype == "default":
+                # 类型为默认值但未填写输入内容：跳过
+                self.ctx.logger.info("节点 %s 类型为默认值但未填写输入内容，已跳过", node_id)
+                continue
+
+            if vtype == "text":
+                # 无默认值的文字节点：仅第一个接收命令文本，其余跳过
+                if not text_filled and text_to_fill:
                     node_info_list.append(
-                        {
-                            "nodeId": node.node_id.strip(),
-                            "fieldName": node.field_name.strip(),
-                            "fieldValue": field_value,
-                        }
+                        {"nodeId": node_id, "fieldName": field_name, "fieldValue": text_to_fill}
                     )
+                    text_filled = True
                 else:
-                    waiting.append(node)
+                    self.ctx.logger.info("文字节点 %s 未接收命令文本，已跳过", node_id)
+                continue
+
+            waiting.append(
+                {
+                    "node": node,
+                    "node_id": node_id,
+                    "field_name": field_name,
+                    "value_type": vtype,
+                    "label": node.label.strip() or node_id,
+                }
+            )
         return node_info_list, waiting
 
     async def _start_workflow(
@@ -592,14 +638,13 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     # ── 交互式输入收集 ────────────────────────────────────────────
 
-    def _build_waiting_tips(self, waiting: list[InputNodeSection]) -> str:
+    def _build_waiting_tips(self, waiting: list[dict[str, Any]]) -> str:
         """构建等待上传的提示文本（含节点顺序）。"""
         lines = []
         type_names = {"image": "图片", "audio": "语音"}
-        for index, node in enumerate(waiting, 1):
-            type_name = type_names.get(node.value_type, node.value_type)
-            label = node.label.strip() or node.node_id.strip()
-            lines.append(f"{index}. {type_name}（{label}）")
+        for index, item in enumerate(waiting, 1):
+            type_name = type_names.get(item["value_type"], item["value_type"])
+            lines.append(f"{index}. {type_name}（{item['label']}）")
         return "\n".join(lines)
 
     def _create_input_session(
@@ -608,7 +653,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         user_id: str,
         stream_id: str,
         workflow: WorkflowItemSection,
-        waiting_nodes: list[InputNodeSection],
+        waiting_nodes: list[dict[str, Any]],
         collected: list[dict[str, str]],
     ) -> None:
         """创建交互式收集会话（仅接受该用户的消息），带超时清理。"""
@@ -618,12 +663,12 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             workflow=workflow,
             waiting_nodes=[
                 {
-                    "node_id": n.node_id.strip(),
-                    "field_name": n.field_name.strip(),
-                    "value_type": n.value_type,
-                    "label": n.label.strip() or n.node_id.strip(),
+                    "node_id": item["node_id"],
+                    "field_name": item["field_name"],
+                    "value_type": item["value_type"],
+                    "label": item["label"],
                 }
-                for n in waiting_nodes
+                for item in waiting_nodes
             ],
             collected=collected,
         )
@@ -1130,8 +1175,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             lines.append(f"node_id = {self._toml_string(node['node_id'])}")
             lines.append(f"field_name = {self._toml_string(node['field_name'])}")
             lines.append(f"value_type = {self._toml_string(node['value_type'])}")
-            lines.append('default_value = ""')
-            lines.append("use_command_text = false")
+            lines.append('field_value = ""')
             lines.append(f"label = {self._toml_string(node['hint'])}")
             lines.append("")
         block = "\n".join(lines)

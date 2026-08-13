@@ -2,7 +2,7 @@
 # 注意：config.toml 已被 .gitignore 排除，不会提交到仓库
 
 [plugin]
-config_version = "1.0.0"
+config_version = "1.1.0"
 
 [server]
 base_url = "https://www.runninghub.ai"
@@ -18,21 +18,32 @@ download_timeout = 120
 enable = false
 recall_seconds = 90
 
-# 工作流列表：可自由增加数量。
-# 每个工作流可配置多个输入节点（node_id / field_name / default_value / use_command_text）。
-# TOML 中的数组嵌套写法示例（数组内的表）：
+# ────────────────────────────────────────────────────────────
+# 工作流配置说明（可自由增加数量）
+#
+# 推荐方式：聊天中发送 /识别工作流 <工作流ID> <名称>，自动写入配置。
+#
+# 手动配置示例（数组内的表，[[...]] 表示追加一项）：
 #
 # [[workflows]]
 # name = "动漫生图"
 # workflow_id = "2087492768787685378"
 # instance_type = "Standard"
-# workflows 内节点的键按数组顺序使用表数组：
-#   [[workflows.input_nodes]]   ← 注意：对应 workflows 数组当前元素
-#   node_id = "353"
-#   field_name = "prompt"
-#   default_value = ""
-#   use_command_text = true
+# llm_enhance = false              # LLM 扩写开关
+# llm_template_path = ""           # 扩写模板路径（相对插件目录）
 #
-# 第二个工作流直接再写一个 [[workflows]] 段即可。
+# [[workflows.input_nodes]]
+# node_id = "353"
+# field_name = "prompt"
+# field_value = ""                 # 留空：由用户提供；填写：固定默认值
+# value_type = "text"              # default=默认值 / text=文字 / image=图片 / audio=语音 / 空=自动推断
+# label = "提示词"
 #
-# 默认不带任何工作流，请按上面的注释自行添加。
+# 节点规则：
+# - field_value 填写了 → 作为固定默认值直接使用，不接受修改
+# - 留空且类型为文字 → 接收命令文本（仅第一个生效）
+# - 留空且类型为图片/语音 → 按节点顺序等待用户上传
+# - 类型为默认值且未填写 → 跳过该节点
+# - 总共最多 8 个节点
+#
+# 默认不带任何工作流，请按上面的注释自行添加或使用 /识别工作流 命令。

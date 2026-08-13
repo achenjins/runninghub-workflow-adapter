@@ -5,40 +5,48 @@
 ## 功能特性
 
 - 可配置多个工作流（工作流 ID、设备类型）
-- 每个工作流可自由增加多个输入节点（节点 ID、字段名、默认值、是否接收命令文本）
+- 每个工作流可自由增加输入节点（节点 ID、字段名、输入内容、节点类型下拉选择）
+- 节点类型：默认值 / 文字 / 图片 / 语音 / 自动推断
+- 文字节点支持 LLM 扩写（可配置扩写模板）
+- 图片/语音节点支持交互式上传（按节点顺序等待，仅接受命令触发者）
+- `/识别工作流` 自动识别工作流输入并写入配置
 - 命令、工具、公开 API 三种触发方式
-- 任务完成后自动下载结果并发送图片
 - 支持发送后自动撤回（仅 NapCat 适配器生效）
 
 ## 安装
 
 ```bash
 cd <MaiBot目录>/plugins
-git clone https://github.com/achenjins/runninghub-workflow-adapter.git runninghub-generic
-pip install -r runninghub-generic/requirements.txt
+git clone https://github.com/achenjins/runninghub-workflow-adapter.git runninghub-workflow-adapter
+pip install -r runninghub-workflow-adapter/requirements.txt
 ```
 
 重启 MaiBot（或 WebUI 热重载）即自动加载。
 
 ## 配置
 
-在 MaiBot WebUI 插件配置页填写，或编辑 `plugins/runninghub-generic/config.toml`。
+在 MaiBot WebUI 插件配置页填写，或编辑 `config.toml`。
 
 **必填**：`server.api_key`
 
-**工作流配置**（核心，可自由增加数量）：
+**最快上手**：聊天中发送 `/识别工作流 <工作流ID> <名称>`，自动识别输入节点并写入配置，热重载后即可用。
+
+**工作流配置示例**：
 
 ```toml
 [[workflows]]
 name = "动漫生图"
 workflow_id = "2087492768787685378"
 instance_type = "Standard"
+llm_enhance = false
+llm_template_path = ""
 
 [[workflows.input_nodes]]
 node_id = "353"
 field_name = "prompt"
-default_value = ""
-use_command_text = true
+field_value = ""
+value_type = "text"
+label = "提示词"
 ```
 
 每个节点字段说明：
@@ -46,21 +54,26 @@ use_command_text = true
 | 字段 | 说明 |
 |------|------|
 | `node_id` | RunningHub 工作流中的节点 ID |
-| `field_name` | 节点字段名（如 prompt / text / image） |
-| `default_value` | 该字段的默认值；接收命令文本时被覆盖 |
-| `use_command_text` | 开启后命令/工具传入的描述文本填入该字段 |
+| `field_name` | 节点字段名，可自定义（如 prompt / text / image / audio） |
+| `field_value` | 输入内容；填写后作为固定默认值，不接受修改 |
+| `value_type` | 节点类型下拉：`default` 默认值 / `text` 文字 / `image` 图片 / `audio` 语音 / 空 自动推断 |
+| `label` | 等待上传时的中文提示说明 |
 
-节点值规则：
+节点规则：
 
-- 文字节点使用 `default_value`；开启 `use_command_text` 的文字节点使用命令文本（可配 LLM 扩写）
-- 图片/语音节点有 `default_value`（已上传文件名）时直接使用，否则等待用户上传
-- 等待上传时按节点配置顺序逐个提示
+- 填写了 `field_value` → 固定默认值直接使用，不接受修改
+- 留空 + 类型为文字 → 接收命令文本（仅第一个生效，可配 LLM 扩写）
+- 留空 + 类型为图片/语音 → 按节点顺序等待用户上传
+- 类型为默认值且未填写 → 跳过该节点
+- 最多 8 个节点
+
+LLM 扩写模板路径使用**相对路径**（相对插件目录），如 `templates/my_template.txt`。
 
 ## 使用
 
 - **命令**：`/跑图 <工作流名> <描述文本>`
 - **列出工作流**：`/工作流`
-- **自动识别并写入配置**：`/识别工作流 <工作流ID> [工作流名称]`——自动识别输入节点（文字/图片/语音）并追加写入 config.toml，Runner 热重载后即可用
+- **自动识别并写入配置**：`/识别工作流 <工作流ID> [工作流名称]`
 - **工具**：模型自动调用 `run_workflow(workflow_name, prompt, stream_id)`
 - **其他插件**：`ctx.api.call("rh-workflow-adapter.run_workflow", workflow_name=..., prompt=..., stream_id=...)`
 
