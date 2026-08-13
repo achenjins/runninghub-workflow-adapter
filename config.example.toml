@@ -1,0 +1,38 @@
+# 复制本文件为 config.toml 后填写你的配置
+# 注意：config.toml 已被 .gitignore 排除，不会提交到仓库
+
+[plugin]
+config_version = "1.0.0"
+
+[server]
+base_url = "https://www.runninghub.ai"
+api_key = ""
+
+[generation]
+poll_interval = 15
+max_wait = 1800
+max_concurrent = 2
+download_timeout = 120
+
+[cleanup]
+enable = false
+recall_seconds = 90
+
+# 工作流列表：可自由增加数量。
+# 每个工作流可配置多个输入节点（node_id / field_name / default_value / use_command_text）。
+# TOML 中的数组嵌套写法示例（数组内的表）：
+#
+# [[workflows]]
+# name = "动漫生图"
+# workflow_id = "2087492768787685378"
+# instance_type = "Standard"
+# workflows 内节点的键按数组顺序使用表数组：
+#   [[workflows.input_nodes]]   ← 注意：对应 workflows 数组当前元素
+#   node_id = "353"
+#   field_name = "prompt"
+#   default_value = ""
+#   use_command_text = true
+#
+# 第二个工作流直接再写一个 [[workflows]] 段即可。
+#
+# 默认不带任何工作流，请按上面的注释自行添加。

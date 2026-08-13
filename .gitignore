@@ -1,0 +1,23 @@
+# 用户本地配置（含 API Key，禁止提交；由 WebUI / 运行时维护）
+/config.toml
+
+# 本地密钥（运行时自动生成/本地专用，禁止提交）
+config.toml.local
+secrets.toml
+*.key
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# 本地测试
+tests/
+
+# 运行产物
+data/
+temp/
+*.log
