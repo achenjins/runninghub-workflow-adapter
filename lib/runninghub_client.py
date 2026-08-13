@@ -140,47 +140,48 @@ class RunningHubClient:
         return await asyncio.to_thread(_do)
 
     async def upload_file(self, file_data: bytes, filename: str) -> str:
-        """上传文件到 RunningHub，返回 fileName（形如 api/xxx.png）。
+        """上传文件到 RunningHub，返回文件名（新接口，形如 openapi/xxx.png）。
 
-        官方文档接口：POST /task/openapi/upload，multipart/form-data，
-        form 字段 apiKey/fileType，文件字段 file。返回 data.fileName
-        可直接作为节点 fieldValue（图片/语音/视频节点）。
+        官方新接口：POST /openapi/v2/media/upload/binary，
+        header Authorization（Bearer），multipart 仅 file 字段。
+        响应：{code:200, message, data:{type, download_url, filename, size}}。
+        兼容旧接口响应（code:0 / data.fileName）。
 
         Args:
             file_data: 文件字节内容。
             filename: 文件名（含扩展名）。
 
         Returns:
-            str: RunningHub 文件名。
+            str: RunningHub 文件名（可直接作为节点 fieldValue）。
 
         Raises:
             RunningHubError: 上传失败时抛出。
         """
-        from urllib.parse import urlparse
 
         def _do() -> dict[str, Any]:
             response = requests.post(
-                f"{self.base_url}/task/openapi/upload",
-                data={"apiKey": self.api_key, "fileType": "input"},
+                f"{self.base_url}/openapi/v2/media/upload/binary",
+                headers={"Authorization": f"Bearer {self.api_key}"},
                 files={"file": (filename, file_data)},
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Host": urlparse(self.base_url).netloc,
-                },
                 timeout=self.timeout,
             )
             response.raise_for_status()
             return response.json()
 
         result = await asyncio.to_thread(_do)
-        if result.get("code") not in (0, None):
-            raise RunningHubError(f"上传文件失败: {result.get('msg') or result}")
+        code = result.get("code")
+        # 新接口成功码为 200，旧接口为 0
+        if code not in (0, 200, None):
+            raise RunningHubError(
+                f"上传文件失败: {result.get('message') or result.get('msg') or result}"
+            )
         data = result.get("data")
         file_name = ""
         if isinstance(data, dict):
-            file_name = str(data.get("fileName") or "")
+            # 新接口字段 filename，旧接口 fileName
+            file_name = str(data.get("filename") or data.get("fileName") or "")
         if not file_name:
-            raise RunningHubError("上传文件失败: 响应缺少 fileName")
+            raise RunningHubError("上传文件失败: 响应缺少 filename")
         return file_name
 
     async def get_workflow_json(self, workflow_id: str) -> dict[str, Any]:
