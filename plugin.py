@@ -628,6 +628,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         if scope != CONFIG_RELOAD_SCOPE_SELF:
             return
+        # 关键：先用最新配置数据更新强类型配置实例。否则 self.config 仍是旧值，
+        # 下面 _refresh_workflows 读到的设备类型（instance_type）等字段不会热更新。
+        self.set_plugin_config(config_data)
         self._rebuild_client()
         self._semaphore = asyncio.Semaphore(max(1, self.config.generation.max_concurrent))
         self._refresh_workflows()
