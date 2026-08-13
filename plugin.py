@@ -54,6 +54,16 @@ __all__ = ["RunningHubGenericPlugin", "create_plugin"]
 # 交互式收集的等待超时（秒）
 _INPUT_WAIT_TIMEOUT = 600
 
+# 单个工作流的输入/配置节点总数上限（含参考图、配置节点，原 8 个对多参考图工作流不够）
+_MAX_NODES = 32
+
+# 交互收集会话中，用于"跳过剩余文件、直接开始运行"的触发词
+_FINISH_KEYWORDS = {
+    "完成", "开始", "开始运行", "运行", "提交", "结束",
+    "跳过", "跳过剩余", "直接开始", "直接运行", "好了",
+    "ok", "go", "done", "finish", "start",
+}
+
 
 class PluginMetaSection(PluginConfigBase):
     """插件配置版本信息（SDK 要求，请勿删除）。"""
@@ -139,7 +149,7 @@ class DetectSection(PluginConfigBase):
 
 
 class InputNodeSection(PluginConfigBase):
-    """单个工作流输入节点配置（可自由增加数量，最多 8 个）。
+    """单个工作流输入节点配置（可自由增加数量，最多 32 个）。
 
     只需三个核心字段：节点 ID、字段名、输入内容。
     类型下拉框选择该节点的用途：
@@ -312,19 +322,23 @@ _LLM_DETECT_PROMPT = """你是 ComfyUI/RunningHub 工作流配置分析器。下
 请判断哪些字段是【用户输入节点】、哪些是【推荐预设的配置节点】，只输出一个 JSON 对象，不要输出任何解释、代码块围栏或多余文本。
 
 输出格式（严格遵守）：
-{{"nodes":[{{"node_id":"6","field_name":"text","value_type":"text","field_value":"","label":"提示词"}},{{"node_id":"5","field_name":"width","value_type":"default","field_value":"512","label":"宽度"}}]}}
+{{"nodes":[{{"node_id":"6","field_name":"text","value_type":"text","field_value":"","label":"提示词"}},{{"node_id":"3","field_name":"steps","value_type":"default","field_value":"20","label":"步数"}}]}}
 
 判定规则：
-1. node_id 与 field_name 必须真实存在于上面清单中，禁止编造、禁止使用连线字段。
+1. node_id 与 field_name 必须真实存在于上面清单中，禁止编造；<连线> 字段不可编辑，一律不得输出。
 2. 输入节点（终端用户需要提供）：
    - 文字类（提示词/描述文本）→ value_type="text"
    - 图片类（参考图/LoadImage 等）→ value_type="image"
    - 音频类（参考音频/配音）→ value_type="audio"
    输入节点的 field_value 一律留空 ""。
-3. 配置节点（值得预设的常见参数：分辨率/宽高、画面比例、步数、采样器、CFG、种子、批次、lora 强度等）→ value_type="default"，field_value 填当前值（字符串形式），label 用简短中文。
-4. 内部连接节点（KSampler 的 model/clip/positive 等连线、CheckpointLoader、VAE、SaveImage 等）不要输出。
-5. 只输出最有价值的节点，总数不超过 8 个；label 一律用简短中文。
-6. 若没有可识别的输入/配置节点，输出 {{"nodes":[]}}。
+3. 配置节点（值得预设的常见参数）→ value_type="default"，field_value 填当前值（字符串形式），label 用简短中文。
+   重要：即使节点带有连线输入，它的【标量参数】也必须作为配置节点列出，例如：
+   - KSampler：steps / cfg / sampler_name / seed / denoise
+   - EmptyLatentImage：width / height / batch_size
+   - 分辨率、画面比例（aspect ratio）、lora 强度、controlnet 强度等任何对出图效果有意义的标量参数
+4. 不要输出：CheckpointLoader、VAE、SaveImage、Upscale 等纯内部/保存类节点，也不要输出任何 <连线> 字段。
+5. 输入节点最多 8 个，配置节点最多 8 个，二者独立计数、互不影响；没有的类别可以少列或不列。
+6. label 一律用简短中文。
 
 工作流节点清单：
 {workflow}
@@ -547,11 +561,14 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     # ── 配置校验 ──────────────────────────────────────────────────
 
     def _validate_workflows(self) -> None:
-        """校验配置约束：总节点最多 8 个、无默认值的文字节点仅一个生效。"""
+        """校验配置约束：总节点最多 32 个、无默认值的文字节点仅一个生效。"""
         for workflow in self._workflows:
             nodes = [n for n in workflow.input_nodes if str(n.node_id or "").strip()]
-            if len(nodes) > 8:
-                self.ctx.logger.warning("工作流 %s 输入节点 %d 个，超过 8 个上限，多余节点将被忽略", workflow.name, len(nodes))
+            if len(nodes) > _MAX_NODES:
+                self.ctx.logger.warning(
+                    "工作流 %s 输入节点 %d 个，超过 %d 个上限，多余节点将被忽略",
+                    workflow.name, len(nodes), _MAX_NODES,
+                )
             empty_text_nodes = [
                 n for n in nodes
                 if not str(n.field_value or "").strip()
@@ -588,8 +605,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         return None
 
     def _ordered_nodes(self, workflow: WorkflowItemSection) -> list[InputNodeSection]:
-        """按配置顺序返回有效节点（最多 8 个）。"""
-        return [n for n in workflow.input_nodes if str(n.node_id or "").strip()][:8]
+        """按配置顺序返回有效节点（最多 _MAX_NODES 个）。"""
+        return [n for n in workflow.input_nodes if str(n.node_id or "").strip()][:_MAX_NODES]
 
     def _load_llm_template(self, workflow: WorkflowItemSection) -> str:
         """读取工作流配置的 LLM 扩写模板。"""
@@ -761,7 +778,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 "success": True,
                 "waiting": True,
                 "required_files": required_files,
-                "message": f"请依次发送以下输入（可一条消息发多个）：\n{tips}",
+                "message": (
+                    f"请依次发送以下输入（可一条消息发多个，也可只上传部分）：\n{tips}\n"
+                    "发送「跳过剩余」可直接开始运行，未上传的文件节点将使用工作流默认值"
+                ),
             }
 
         return await self._submit_and_poll(client, workflow, node_info_list, stream_id, kwargs)
@@ -866,7 +886,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         files = self._extract_files_from_message(message)
         if not files:
             await self.ctx.send.text(
-                "未识别到图片或语音文件，请直接发送文件（不要带文字）", stream_id
+                "未识别到图片或语音文件，请直接发送文件（不要带文字）；"
+                "或发送「跳过剩余」直接开始运行",
+                stream_id,
             )
             return True
 
@@ -911,16 +933,30 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
         if session.waiting_nodes:
             await self.ctx.send.text(
-                f"已收到，还需发送：\n{self._build_waiting_tips_from_dicts(session.waiting_nodes)}",
+                f"已收到，还需发送：\n{self._build_waiting_tips_from_dicts(session.waiting_nodes)}\n"
+                "（或发送「跳过剩余」直接开始运行）",
                 stream_id,
             )
             return True
 
         # 收集完成，提交任务
-        self._input_sessions.pop(user_id, None)
+        await self._submit_collected_session(user_id, stream_id, client, "全部输入已收到，开始运行任务")
+        return True
+
+    async def _submit_collected_session(
+        self,
+        user_id: str,
+        stream_id: str,
+        client: RunningHubClient,
+        notice: str,
+    ) -> None:
+        """提交已收集的输入（会话已从 _input_sessions 移除）。"""
+        session = self._input_sessions.pop(user_id, None)
+        if session is None:
+            return
         if session.expire_task is not None:
             session.expire_task.cancel()
-        await self.ctx.send.text("全部输入已收到，开始运行任务", stream_id)
+        await self.ctx.send.text(notice, stream_id)
         result = await self._submit_and_poll(
             client, session.workflow, session.collected, stream_id, {}
         )
@@ -928,6 +964,34 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             await self.ctx.send.text(result["message"], stream_id)
         else:
             await self.ctx.send.text(result["message"], stream_id)
+
+    async def _finish_input_session(
+        self,
+        user_id: str,
+        stream_id: str,
+        *,
+        skip_remaining: bool = True,
+    ) -> bool:
+        """跳过剩余文件节点，用已收集的输入直接提交；返回是否已消费该消息。"""
+        session = self._input_sessions.get(user_id)
+        if session is None:
+            return False
+        client = self._client
+        if client is None:
+            self._rebuild_client()
+            client = self._client
+        if client is None:
+            self._cancel_input_session(user_id)
+            await self.ctx.send.text("插件客户端未初始化，已取消本次任务", stream_id)
+            return True
+        skipped = len(session.waiting_nodes)
+        if skipped:
+            notice = (
+                f"已跳过剩余 {skipped} 个文件输入，开始运行任务（未上传的节点将使用工作流默认值）"
+            )
+        else:
+            notice = "全部输入已收到，开始运行任务"
+        await self._submit_collected_session(user_id, stream_id, client, notice)
         return True
 
     def _cancel_input_session(self, user_id: str) -> None:
@@ -966,6 +1030,33 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 if source:
                     files.append(("audio", source))
         return files
+
+    @staticmethod
+    def _extract_text_from_message(message: dict) -> str:
+        """从消息中提取纯文本内容（用于识别跳过/完成等控制词）。"""
+        raw = message.get("raw_message") or []
+        if not isinstance(raw, list):
+            return ""
+        parts: list[str] = []
+        for seg in raw:
+            if not isinstance(seg, dict):
+                continue
+            if str(seg.get("type") or "") != "text":
+                continue
+            data = seg.get("data") or {}
+            if isinstance(data, dict):
+                parts.append(str(data.get("text") or ""))
+        return "".join(parts).strip()
+
+    @staticmethod
+    def _is_finish_signal(text: str) -> bool:
+        """判断文本是否为"跳过剩余文件、直接开始运行"的触发词。"""
+        normalized = str(text or "").strip().strip("/").strip().lower()
+        if not normalized:
+            return False
+        if normalized in _FINISH_KEYWORDS:
+            return True
+        return normalized.startswith("跳过") or normalized.startswith("开始运行")
 
     async def _fetch_file_bytes(self, source: str) -> bytes:
         """从 URL 或本地路径获取文件字节。"""
@@ -1230,7 +1321,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     @EventHandler("generic_input_collector", event_type=EventType.ON_MESSAGE)
     async def handle_input_collector(self, **kwargs: Any) -> None:
-        """收集交互式输入会话中的文件消息（仅命令触发者有效）。"""
+        """收集交互式输入会话中的文件消息，并响应跳过/开始等控制词（仅命令触发者有效）。"""
         user_id = str(kwargs.get("user_id") or "")
         if not user_id or user_id not in self._input_sessions:
             return
@@ -1238,6 +1329,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         if not isinstance(message, dict):
             message = {}
         stream_id = str(kwargs.get("stream_id") or self._input_sessions[user_id].stream_id or "")
+        if self._is_finish_signal(self._extract_text_from_message(message)):
+            await self._finish_input_session(user_id, stream_id, skip_remaining=True)
+            return
         await self._handle_incoming_files(user_id, stream_id, message)
 
     @Command("工作流", description="列出已配置的工作流", pattern=r"^/工作流")
@@ -1763,7 +1857,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         if not isinstance(result, dict) or not result.get("success"):
             self.ctx.logger.warning("[识别] LLM 识别未成功，回退启发式: %s", str(result)[:300])
             return None
-        raw_response = str(result.get("response") or "")
+        raw_response = str(result.get("response") or result.get("content") or "")
         nodes = self._parse_llm_nodes(raw_response, workflow_json)
         if not nodes:
             self.ctx.logger.warning(
@@ -1804,8 +1898,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         description=(
             "运行配置好的 RunningHub 工作流，提交描述文本并生成结果。工作流名称为配置文件中的工作流名称。"
             "调用后立即返回：若该工作流还需要用户上传参考图/参考音频，返回中会带 waiting=true 和 required_files，"
-            "你必须把这些文件要求如实转告用户（如“请上传参考图/参考音频”），由用户直接发送文件到会话，"
-            "插件会自动接收文件并继续任务。"
+            "你必须把这些文件要求如实转告用户（如“请上传参考图/参考音频，可只传部分”），由用户直接发送文件到会话，"
+            "插件会自动接收文件并继续任务；用户也可发送「跳过剩余」直接开始运行。"
         ),
         parameters=[
             ToolParameterInfo(
