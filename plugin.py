@@ -1512,6 +1512,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                     files.append(("audio", source))
             elif seg_type == "file":
                 # QQ「文件」消息（type=file）不区分图片/音频/视频，按文件名/URL 扩展名推断真实类型。
+                import logging
+                logging.getLogger("RunningHubGenericPlugin").info(
+                    "[文件识别] file 段完整结构=%r", seg
+                )
                 # NapCat 的 data 字段名不统一：先试常见字段，再遍历 data 值找含扩展名的文件名，
                 # 最后从 URL 的 ?fname= 参数兜底。
                 filename = ""
@@ -1928,6 +1932,12 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             stream_id = str(message.get("session_id") or message.get("stream_id") or "")
         session = self._find_input_session(user_id, stream_id)
         if session is None:
+            import logging
+            logging.getLogger("RunningHubGenericPlugin").info(
+                "[输入收集] 无进行中的上传会话，忽略: user_id=%s stream_id=%s raw_types=%s",
+                user_id, stream_id,
+                [str(s.get("type") or "") for s in (message.get("raw_message") or []) if isinstance(s, dict)],
+            )
             return None
         stream_id = stream_id or session.stream_id
         if session.phase == "config":
