@@ -1534,9 +1534,16 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         否则以文件形式发的图片 / 音频会被当成视频而匹配不到对应节点。
         """
         path = str(name or "").split("?", 1)[0].strip().lower()
-        if path.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".jfif")):
+        if path.endswith((
+            ".png", ".jpg", ".jpeg", ".jpe", ".jfif", ".webp", ".gif", ".bmp",
+            ".tif", ".tiff", ".ico", ".heic", ".heif", ".avif", ".jxl", ".svg", ".raw", ".dib",
+        )):
             return "image"
-        if path.endswith((".mp3", ".wav", ".amr", ".ogg", ".m4a", ".aac", ".flac", ".silk", ".opus", ".m4r")):
+        if path.endswith((
+            ".mp3", ".wav", ".flac", ".aac", ".m4a", ".m4r", ".ogg", ".oga", ".opus",
+            ".wma", ".amr", ".silk", ".aiff", ".aif", ".ape", ".alac", ".wv",
+            ".mp2", ".mpga", ".ac3", ".mka", ".mid", ".midi",
+        )):
             return "audio"
         return "video"
 
