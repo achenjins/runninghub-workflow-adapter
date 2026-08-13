@@ -1627,7 +1627,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             client = self._client
             if client is None:
                 raise RunningHubError("客户端未初始化")
-            return await client.download_bytes(source)
+            data = await client.download_bytes(source)
+            self.ctx.logger.info("[下载诊断] url=%s size=%d head=%r", source, len(data), data[:64])
+            return data
         path = Path(source)
         if path.is_file():
             if path.stat().st_size > _MAX_FILE_BYTES:
