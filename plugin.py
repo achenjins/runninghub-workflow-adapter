@@ -11,8 +11,8 @@
 
 - 命令：``/跑图 <工作流名> <文字内容>``
 - 命令：``/工作流`` 列出已配置工作流
-- 命令：``/识别国内工作流 <工作流ID>`` / ``/识别国外工作流 <工作流ID>`` 简化识别关键节点（分别配置区域）
-- 命令：``/详细识别工作流 <工作流ID>`` LLM 详细识别全部节点（自动判断区域）
+- 命令：``/识别国内工作流 <工作流ID>`` / ``/识别国外工作流 <工作流ID>`` 识别关键节点（分别配置区域）
+- 命令：``/详细识别国内工作流 <工作流ID>`` / ``/详细识别国外工作流 <工作流ID>`` LLM 详细识别全部节点
 - 工具：``run_workflow``（供 LLM 调用）
 - API：``run_workflow``（public，供其他插件调用）
 """
@@ -371,6 +371,31 @@ _LLM_DETECT_PROMPT = """你是 ComfyUI/RunningHub 工作流配置分析器。下
 4. 不要输出：CheckpointLoader、VAE、SaveImage、Upscale 等纯内部/保存类节点，也不要输出任何 <连线> 字段。
 5. 输入节点最多 8 个，配置节点最多 8 个，二者独立计数、互不影响；没有的类别可以少列或不列。
 6. label 一律用简短中文。
+
+工作流节点清单：
+{workflow}
+"""
+
+_LLM_DETECT_KEY_PROMPT = """你是 ComfyUI/RunningHub 工作流配置分析器。下面是一个工作流的节点清单（"节点 ID（class_type）标题" + 各字段：字段名: 值/连线，<连线> 表示该字段来自其他节点输出，不可编辑）。
+
+请只识别下面这几类【关键节点】，其余节点（步数、采样器、CFG、种子、lora 强度等）一律不要输出。只输出一个 JSON 对象，不要输出任何解释、代码块围栏或多余文本。
+
+输出格式（严格遵守）：
+{{"nodes":[{{"node_id":"6","field_name":"text","value_type":"prompt","field_value":"","label":"提示词"}},{{"node_id":"5","field_name":"width","value_type":"default","field_value":"512","label":"宽度"}}]}}
+
+判定规则：
+1. node_id 与 field_name 必须真实存在于上面清单中，禁止编造；<连线> 字段不可编辑，一律不得输出。
+2. 输入节点（终端用户需要提供）：
+   - 文字类（提示词/描述文本，主提示词）→ value_type="prompt"（整个工作流最多 1 个）
+   - 图片类（参考图/LoadImage 等）→ value_type="image"
+   - 音频类（参考音频/配音）→ value_type="audio"
+   - 视频类（参考视频/LoadVideo 等）→ value_type="video"
+   输入节点的 field_value 一律留空 ""。
+3. 预设配置节点（仅这两类）：
+   - 分辨率（width / height / resolution）→ value_type="default"，field_value 填当前值
+   - 长宽比例（aspect ratio / ratio / 比例 / 画幅 / 宽高比）→ value_type="default"，field_value 填当前值
+4. 除上述 6 类（prompt / image / audio / video / 分辨率 / 长宽比例）外，其余节点一律不要输出。
+5. label 一律用简短中文。
 
 工作流节点清单：
 {workflow}
@@ -1815,20 +1840,31 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         workflow_name = parts[1].strip() if len(parts) > 1 else workflow_id
         return await self._detect_and_write(workflow_id, workflow_name, stream_id, detailed=False, region="overseas")
 
-    @Command("详细识别工作流", description="详细识别：用 LLM 识别全部输入节点与配置节点（步数/采样器/CFG/种子等），例如：/详细识别工作流 2087492768787685378 动漫生图", pattern=r"^/详细识别工作流")
-    async def handle_detail_detect_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
+    @Command("详细识别国内工作流", description="详细识别国内工作流（runninghub.cn）：用 LLM 识别全部输入节点与配置节点（步数/采样器/CFG/种子等），例如：/详细识别国内工作流 2087492768787685378 动漫生图", pattern=r"^/详细识别国内工作流")
+    async def handle_detail_detect_domestic_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
         stream_id = str(kwargs.get("stream_id") or "")
         plain_text = str(kwargs.get("text") or kwargs.get("plain_text") or "")
-        rest = re.sub(r"^/详细识别工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
+        rest = re.sub(r"^/详细识别国内工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
         if not rest:
-            await self.ctx.send.text(
-                "用法：/详细识别工作流 <工作流ID> [工作流名称]（LLM 识别全部节点）", stream_id
-            )
+            await self.ctx.send.text("用法：/详细识别国内工作流 <工作流ID> [工作流名称]", stream_id)
             return True, "", 1
         parts = rest.split(maxsplit=1)
         workflow_id = parts[0].strip()
         workflow_name = parts[1].strip() if len(parts) > 1 else workflow_id
-        return await self._detect_and_write(workflow_id, workflow_name, stream_id, detailed=True)
+        return await self._detect_and_write(workflow_id, workflow_name, stream_id, detailed=True, region="domestic")
+
+    @Command("详细识别国外工作流", description="详细识别国外工作流（runninghub.ai）：用 LLM 识别全部输入节点与配置节点（步数/采样器/CFG/种子等），例如：/详细识别国外工作流 2087492768787685378 动漫生图", pattern=r"^/详细识别国外工作流")
+    async def handle_detail_detect_overseas_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
+        stream_id = str(kwargs.get("stream_id") or "")
+        plain_text = str(kwargs.get("text") or kwargs.get("plain_text") or "")
+        rest = re.sub(r"^/详细识别国外工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
+        if not rest:
+            await self.ctx.send.text("用法：/详细识别国外工作流 <工作流ID> [工作流名称]", stream_id)
+            return True, "", 1
+        parts = rest.split(maxsplit=1)
+        workflow_id = parts[0].strip()
+        workflow_name = parts[1].strip() if len(parts) > 1 else workflow_id
+        return await self._detect_and_write(workflow_id, workflow_name, stream_id, detailed=True, region="overseas")
 
     async def _detect_and_write(
         self,
@@ -1837,43 +1873,24 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         stream_id: str,
         *,
         detailed: bool,
-        region: str | None = None,
+        region: str,
     ) -> tuple[bool, str, int]:
-        """识别工作流节点并写入配置。
-
-        detailed=True 走 LLM 全量识别；region 指定时只用该区域 key 拉取，
-        region=None 时按已填写的 key 自动判断区域。
-        """
+        """识别工作流节点并写入配置（detailed=True 走 LLM 全量识别，region 指定区域）。"""
         self.ctx.logger.info(
             "[识别] 开始: workflow_id=%s name=%s detailed=%s region=%s",
             workflow_id, workflow_name, detailed, region,
         )
 
-        # 候选区域
-        candidates: list[tuple[str, RunningHubClient]] = []
-        if region is not None:
-            key_attr = "api_key_cn" if region == "domestic" else "api_key"
-            if not getattr(self.config.server, key_attr):
-                label = "国内" if region == "domestic" else "国外"
-                await self.ctx.send.text(f"{label} API Key 未填写，请先在插件配置中配置", stream_id)
-                return True, "", 1
+        key_attr = "api_key_cn" if region == "domestic" else "api_key"
+        if not getattr(self.config.server, key_attr):
+            label = "国内" if region == "domestic" else "国外"
+            await self.ctx.send.text(f"{label} API Key 未填写，请先在插件配置中配置", stream_id)
+            return True, "", 1
+        client = self._get_client(region)
+        if client is None:
+            self._rebuild_client()
             client = self._get_client(region)
-            if client is None:
-                self._rebuild_client()
-                client = self._get_client(region)
-            if client is not None:
-                candidates.append((region, client))
-        else:
-            for key_attr, region_name in (("api_key", "overseas"), ("api_key_cn", "domestic")):
-                if not getattr(self.config.server, key_attr):
-                    continue
-                client = self._get_client(region_name)
-                if client is None:
-                    self._rebuild_client()
-                    client = self._get_client(region_name)
-                if client is not None:
-                    candidates.append((region_name, client))
-        if not candidates:
+        if client is None:
             self.ctx.logger.warning("[识别] 未配置任何 api_key")
             await self.ctx.send.text("请先填写 RunningHub API Key（国外或国内至少一个）", stream_id)
             return True, "", 1
@@ -1886,32 +1903,20 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 )
                 return True, "", 1
 
-        # 依次用候选 key 拉取工作流，哪个通就是哪个区域
-        workflow_json: dict[str, Any] | None = None
-        region = "overseas"
-        last_error = ""
-        for cand_region, cand_client in candidates:
-            if cand_client is None:
-                continue
-            self.ctx.logger.info("[识别] 尝试 %s 拉取: workflow_id=%s", cand_region, workflow_id)
-            try:
-                workflow_json = await cand_client.get_workflow_json(workflow_id)
-                region = cand_region
-                break
-            except Exception as exc:
-                last_error = str(exc)
-                self.ctx.logger.info("[识别] %s 拉取失败: %s", cand_region, exc)
-        if workflow_json is None:
-            self.ctx.logger.error("[识别] 获取工作流失败（国外/国内均失败）: %s", last_error)
-            await self.ctx.send.text(f"获取工作流失败，请检查 API Key：{last_error}", stream_id)
+        # 用指定区域的 key 拉取工作流
+        self.ctx.logger.info("[识别] 尝试 %s 拉取: workflow_id=%s", region, workflow_id)
+        try:
+            workflow_json = await client.get_workflow_json(workflow_id)
+        except Exception as exc:
+            self.ctx.logger.error("[识别] 获取工作流失败（%s）: %s", region, exc)
+            await self.ctx.send.text(f"获取工作流失败，请检查 API Key：{exc}", stream_id)
             return True, "", 1
         self.ctx.logger.info("[识别] 工作流 JSON 已获取（区域=%s），节点总数=%d", region, len(workflow_json))
 
         if detailed:
             detected, detect_method = await self._detect_full(workflow_json)
         else:
-            detected = self._detect_key_nodes(workflow_json)
-            detect_method = "简化"
+            detected, detect_method = await self._detect_key_full(workflow_json)
 
         if not detected:
             self.ctx.logger.warning("[识别] 未识别出输入节点")
@@ -1944,12 +1949,22 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         return True, "", 1
 
     async def _detect_full(self, workflow_json: dict[str, Any]) -> tuple[list[dict[str, str]], str]:
-        """详细识别：LLM 优先，失败回退启发式。"""
+        """详细识别：LLM 优先（全量提示词），失败回退启发式。"""
         if self.config.detect.use_llm:
             llm_nodes = await self._detect_input_nodes_with_llm(workflow_json)
             if llm_nodes is not None:
                 return llm_nodes, "LLM"
         return self._detect_input_nodes(workflow_json), "启发式"
+
+    async def _detect_key_full(self, workflow_json: dict[str, Any]) -> tuple[list[dict[str, str]], str]:
+        """简化识别：LLM 优先（关键节点专用提示词），失败回退启发式。"""
+        if self.config.detect.use_llm:
+            llm_nodes = await self._detect_input_nodes_with_llm(
+                workflow_json, prompt_template=_LLM_DETECT_KEY_PROMPT
+            )
+            if llm_nodes is not None:
+                return llm_nodes, "LLM"
+        return self._detect_key_nodes(workflow_json), "简化"
 
     @staticmethod
     def _detect_key_nodes(workflow_json: dict[str, Any]) -> list[dict[str, str]]:
@@ -2393,10 +2408,19 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             )
         return result or None
 
-    async def _detect_input_nodes_with_llm(self, workflow_json: dict[str, Any]) -> list[dict[str, str]] | None:
-        """用内置 LLM 识别输入节点与配置节点（失败返回 None，由调用方回退启发式）。"""
+    async def _detect_input_nodes_with_llm(
+        self,
+        workflow_json: dict[str, Any],
+        *,
+        prompt_template: str | None = None,
+    ) -> list[dict[str, str]] | None:
+        """用内置 LLM 识别节点（失败返回 None，由调用方回退启发式）。
+
+        prompt_template 传入时使用该提示词模板（如关键节点专用模板）。
+        """
         workflow_desc = self._describe_workflow_for_llm(workflow_json)
-        prompt = _LLM_DETECT_PROMPT.format(workflow=workflow_desc)
+        template = prompt_template or _LLM_DETECT_PROMPT
+        prompt = template.format(workflow=workflow_desc)
         try:
             result = await self.ctx.llm.generate(
                 prompt=prompt,
