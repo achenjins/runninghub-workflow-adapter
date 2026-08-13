@@ -863,13 +863,26 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     # ── 交互式输入收集 ────────────────────────────────────────────
 
-    def _build_waiting_tips(self, waiting: list[dict[str, Any]]) -> str:
-        """构建等待上传的提示文本（含节点顺序）。"""
-        lines = []
-        type_names = {"image": "图片", "audio": "语音"}
-        for index, item in enumerate(waiting, 1):
+    @staticmethod
+    def _build_waiting_tips(waiting: list[dict[str, Any]]) -> str:
+        """构建等待上传的提示文本（按类型汇总剩余数量与说明）。"""
+        return RunningHubGenericPlugin._format_waiting_summary(waiting)
+
+    @staticmethod
+    def _format_waiting_summary(waiting: list[dict[str, Any]]) -> str:
+        type_names = {"image": "图片", "audio": "语音", "video": "视频"}
+        groups: dict[str, list[str]] = {}
+        order: list[str] = []
+        for item in waiting:
             type_name = type_names.get(item["value_type"], item["value_type"])
-            lines.append(f"{index}. {type_name}（{item['label']}）")
+            if type_name not in groups:
+                groups[type_name] = []
+                order.append(type_name)
+            groups[type_name].append(str(item.get("label") or item.get("field_name") or ""))
+        lines = []
+        for type_name in order:
+            labels = groups[type_name]
+            lines.append(f"{type_name} ×{len(labels)}：{'、'.join(labels) if labels[0] else '—'}")
         return "\n".join(lines)
 
     def _create_input_session(
@@ -952,18 +965,18 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             return True
 
         for file_type, source in files:
-            if not session.waiting_nodes:
-                break
-            node = session.waiting_nodes.pop(0)
-            if file_type != node["value_type"]:
-                # 类型不匹配：放回队首，提示用户重发
-                session.waiting_nodes.insert(0, node)
-                type_name = {"image": "图片", "audio": "语音"}.get(node["value_type"], node["value_type"])
+            # 按类型自动分配：找到下一个同类型的等待节点（顺序无关，图对图、音对音）
+            index = next(
+                (i for i, n in enumerate(session.waiting_nodes) if n["value_type"] == file_type),
+                None,
+            )
+            if index is None:
                 await self.ctx.send.text(
-                    f"当前需要{type_name}（{node['label']}），你发的是{type_name_of(file_type)}，请重新发送",
+                    f"当前已不需要{type_name_of(file_type)}文件，已忽略",
                     stream_id,
                 )
                 continue
+            node = session.waiting_nodes.pop(index)
             try:
                 file_data = await self._fetch_file_bytes(source)
                 filename = self._guess_filename(source, file_type, file_data)
@@ -971,7 +984,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             except Exception as exc:
                 self.ctx.logger.error("上传文件到 RunningHub 失败: %s", exc)
                 await self.ctx.send.text(f"文件上传失败：{exc}", stream_id)
-                session.waiting_nodes.insert(0, node)
+                session.waiting_nodes.insert(index, node)
                 continue
             session.collected.append(
                 {
@@ -1051,12 +1064,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             session.expire_task.cancel()
 
     def _build_waiting_tips_from_dicts(self, waiting: list[dict[str, str]]) -> str:
-        lines = []
-        type_names = {"image": "图片", "audio": "语音"}
-        for index, node in enumerate(waiting, 1):
-            type_name = type_names.get(node["value_type"], node["value_type"])
-            lines.append(f"{index}. {type_name}（{node['label']}）")
-        return "\n".join(lines)
+        return self._format_waiting_summary(waiting)
 
     @staticmethod
     def _extract_files_from_message(message: dict) -> list[tuple[str, str]]:
@@ -2082,7 +2090,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
 
 def type_name_of(file_type: str) -> str:
-    return {"image": "图片", "audio": "语音"}.get(file_type, "文件")
+    return {"image": "图片", "audio": "语音", "video": "视频"}.get(file_type, "文件")
 
 
 def _safe_int(value: Any) -> int:
