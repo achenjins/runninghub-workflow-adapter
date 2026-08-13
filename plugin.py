@@ -778,6 +778,13 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
         return True, ""
 
+    def _check_access_from_kwargs(self, kwargs: dict[str, Any]) -> tuple[bool, str]:
+        """从命令 kwargs 提取 user_id/group_id 并做访问控制检查。"""
+        user_id = str(kwargs.get("user_id") or "")
+        chat_info = self._extract_chat_info(kwargs)
+        group_id = str(chat_info.get("group_id") or "")
+        return self._check_access(user_id, group_id)
+
     def _ordered_nodes(self, workflow: WorkflowItemSection) -> list[InputNodeSection]:
         """按配置顺序返回有效节点（最多 _MAX_NODES 个）。"""
         return [n for n in workflow.input_nodes if str(n.node_id or "").strip()][:_MAX_NODES]
@@ -1887,6 +1894,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     @Command("工作流", description="列出已配置的工作流", pattern=r"^/工作流")
     async def handle_list_workflows(self, **kwargs: Any) -> tuple[bool, str, int]:
         stream_id = str(kwargs.get("stream_id") or "")
+        allowed, deny_msg = self._check_access_from_kwargs(kwargs)
+        if not allowed:
+            await self.ctx.send.text(deny_msg, stream_id)
+            return True, "", 1
         workflows = self._workflows
         if not workflows:
             await self.ctx.send.text("尚未配置任何工作流，请先在插件配置中添加", stream_id)
@@ -1901,6 +1912,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     @Command("识别国内工作流", description="识别国内工作流（runninghub.cn），仅提取文字/图片/音频/视频/分辨率/长宽比例等关键节点，例如：/识别国内工作流 2087492768787685378 动漫生图", pattern=r"^/识别国内工作流")
     async def handle_detect_domestic_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
         stream_id = str(kwargs.get("stream_id") or "")
+        allowed, deny_msg = self._check_access_from_kwargs(kwargs)
+        if not allowed:
+            await self.ctx.send.text(deny_msg, stream_id)
+            return True, "", 1
         plain_text = str(kwargs.get("text") or kwargs.get("plain_text") or "")
         rest = re.sub(r"^/识别国内工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
         if not rest:
@@ -1914,6 +1929,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     @Command("识别国外工作流", description="识别国外工作流（runninghub.ai），仅提取文字/图片/音频/视频/分辨率/长宽比例等关键节点，例如：/识别国外工作流 2087492768787685378 动漫生图", pattern=r"^/识别国外工作流")
     async def handle_detect_overseas_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
         stream_id = str(kwargs.get("stream_id") or "")
+        allowed, deny_msg = self._check_access_from_kwargs(kwargs)
+        if not allowed:
+            await self.ctx.send.text(deny_msg, stream_id)
+            return True, "", 1
         plain_text = str(kwargs.get("text") or kwargs.get("plain_text") or "")
         rest = re.sub(r"^/识别国外工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
         if not rest:
@@ -1927,6 +1946,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     @Command("详细识别国内工作流", description="详细识别国内工作流（runninghub.cn）：用 LLM 识别全部输入节点与配置节点（步数/采样器/CFG/种子等），例如：/详细识别国内工作流 2087492768787685378 动漫生图", pattern=r"^/详细识别国内工作流")
     async def handle_detail_detect_domestic_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
         stream_id = str(kwargs.get("stream_id") or "")
+        allowed, deny_msg = self._check_access_from_kwargs(kwargs)
+        if not allowed:
+            await self.ctx.send.text(deny_msg, stream_id)
+            return True, "", 1
         plain_text = str(kwargs.get("text") or kwargs.get("plain_text") or "")
         rest = re.sub(r"^/详细识别国内工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
         if not rest:
@@ -1940,6 +1963,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     @Command("详细识别国外工作流", description="详细识别国外工作流（runninghub.ai）：用 LLM 识别全部输入节点与配置节点（步数/采样器/CFG/种子等），例如：/详细识别国外工作流 2087492768787685378 动漫生图", pattern=r"^/详细识别国外工作流")
     async def handle_detail_detect_overseas_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
         stream_id = str(kwargs.get("stream_id") or "")
+        allowed, deny_msg = self._check_access_from_kwargs(kwargs)
+        if not allowed:
+            await self.ctx.send.text(deny_msg, stream_id)
+            return True, "", 1
         plain_text = str(kwargs.get("text") or kwargs.get("plain_text") or "")
         rest = re.sub(r"^/详细识别国外工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
         if not rest:
