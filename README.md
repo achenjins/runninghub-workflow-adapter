@@ -9,7 +9,7 @@
 - 节点类型：默认值 / 文字 / 图片 / 语音 / 自动推断
 - 文字节点支持 LLM 扩写（可配置扩写模板）
 - 图片/语音节点支持交互式上传（按节点顺序等待，仅接受命令触发者）
-- `/识别工作流` 自动识别工作流输入并写入配置
+- `/识别工作流` 自动识别工作流输入并写入配置（内置 LLM 识别输入节点与配置节点，失败自动回退启发式）
 - 命令、工具、公开 API 三种触发方式
 - 支持发送后自动撤回（仅 NapCat 适配器生效）
 
@@ -28,6 +28,8 @@ pip install -r runninghub-workflow-adapter/requirements.txt
 在 MaiBot WebUI 插件配置页填写，或编辑 `config.toml`。
 
 **必填**：`server.api_key`
+
+**节点识别**：`detect.use_llm` 开启后，`/识别工作流` 会用内置 LLM 识别输入节点（文字/图片/语音）与配置节点（分辨率、画幅、步数、采样器等，自动带当前默认值），LLM 失败时回退启发式规则。`detect.model` 选模型槽位（`utils` 快 / `replyer` 强 / `planner`）。
 
 **最快上手**：聊天中发送 `/识别工作流 <工作流ID> <名称>`，自动识别输入节点并写入配置，热重载后即可用。
 
@@ -74,7 +76,7 @@ LLM 扩写模板路径使用**相对路径**（相对插件目录），如 `temp
 - **命令**：`/跑图 <工作流名> <描述文本>`
 - **列出工作流**：`/工作流`
 - **自动识别并写入配置**：`/识别工作流 <工作流ID> [工作流名称]`
-- **工具**：模型自动调用 `run_workflow(workflow_name, prompt, stream_id)`
+- **工具**：模型自动调用 `run_workflow(workflow_name, prompt, stream_id)`；若工作流需要参考图/参考音频，工具返回 `waiting=true` 与 `required_files`，模型会把文件要求转告用户，插件自动接收文件并继续
 - **其他插件**：`ctx.api.call("rh-workflow-adapter.run_workflow", workflow_name=..., prompt=..., stream_id=...)`
 
 ## 自动清理

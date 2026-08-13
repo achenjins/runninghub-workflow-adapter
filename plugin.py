@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import sys
 import time
@@ -117,6 +118,23 @@ class CleanupSection(PluginConfigBase):
         ge=10,
         description="图片发送后自动撤回的秒数（0 表示不撤回）",
         json_schema_extra={"label": "撤回延迟（秒）", "hint": "0 表示不撤回"},
+    )
+
+
+class DetectSection(PluginConfigBase):
+    """工作流节点识别配置。"""
+
+    __ui_label__ = "节点识别"
+
+    use_llm: bool = Field(
+        default=True,
+        description="用内置 LLM 识别输入节点与配置节点（覆盖任意节点类型，比白名单更准）；失败时自动回退启发式规则",
+        json_schema_extra={"label": "LLM 识别"},
+    )
+    model: Literal["utils", "replyer", "planner"] = Field(
+        default="utils",
+        description="识别使用的模型槽位（utils=通用快模型；replyer=主回复模型；planner=规划快模型）",
+        json_schema_extra={"label": "模型槽位", "hint": "要快选 utils，要效果选 replyer"},
     )
 
 
@@ -238,6 +256,7 @@ class GenericConfig(PluginConfigBase):
     server: ServerSection = Field(default_factory=ServerSection)
     generation: GenerationSection = Field(default_factory=GenerationSection)
     cleanup: CleanupSection = Field(default_factory=CleanupSection)
+    detect: DetectSection = Field(default_factory=DetectSection)
     workflows: WorkflowsSection = Field(default_factory=WorkflowsSection)
 
     @field_validator("workflows", mode="before")
@@ -286,6 +305,30 @@ def _resolve_action_api(action: str, cached: dict[str, str]) -> tuple[str, ...]:
         candidates.remove(cached_name)
         candidates.insert(0, cached_name)
     return tuple(candidates)
+
+
+_LLM_DETECT_PROMPT = """你是 ComfyUI/RunningHub 工作流配置分析器。下面是一个工作流的节点清单（"节点 ID（class_type）标题" + 各字段：字段名: 值/连线，<连线> 表示该字段来自其他节点输出，不可编辑）。
+
+请判断哪些字段是【用户输入节点】、哪些是【推荐预设的配置节点】，只输出一个 JSON 对象，不要输出任何解释、代码块围栏或多余文本。
+
+输出格式（严格遵守）：
+{{"nodes":[{{"node_id":"6","field_name":"text","value_type":"text","field_value":"","label":"提示词"}},{{"node_id":"5","field_name":"width","value_type":"default","field_value":"512","label":"宽度"}}]}}
+
+判定规则：
+1. node_id 与 field_name 必须真实存在于上面清单中，禁止编造、禁止使用连线字段。
+2. 输入节点（终端用户需要提供）：
+   - 文字类（提示词/描述文本）→ value_type="text"
+   - 图片类（参考图/LoadImage 等）→ value_type="image"
+   - 音频类（参考音频/配音）→ value_type="audio"
+   输入节点的 field_value 一律留空 ""。
+3. 配置节点（值得预设的常见参数：分辨率/宽高、画面比例、步数、采样器、CFG、种子、批次、lora 强度等）→ value_type="default"，field_value 填当前值（字符串形式），label 用简短中文。
+4. 内部连接节点（KSampler 的 model/clip/positive 等连线、CheckpointLoader、VAE、SaveImage 等）不要输出。
+5. 只输出最有价值的节点，总数不超过 8 个；label 一律用简短中文。
+6. 若没有可识别的输入/配置节点，输出 {{"nodes":[]}}。
+
+工作流节点清单：
+{workflow}
+"""
 
 
 @dataclass
@@ -710,9 +753,14 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 collected=node_info_list,
             )
             tips = self._build_waiting_tips(waiting)
+            required_files = [
+                {"type": item["value_type"], "label": item["label"]}
+                for item in waiting
+            ]
             return {
                 "success": True,
                 "waiting": True,
+                "required_files": required_files,
                 "message": f"请依次发送以下输入（可一条消息发多个）：\n{tips}",
             }
 
@@ -1253,7 +1301,17 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             return True, "", 1
         self.ctx.logger.info("[识别] 工作流 JSON 已获取，节点总数=%d", len(workflow_json))
 
-        detected = self._detect_input_nodes(workflow_json)
+        detected: list[dict[str, str]] = []
+        detect_method = "启发式"
+        if self.config.detect.use_llm:
+            llm_nodes = await self._detect_input_nodes_with_llm(workflow_json)
+            if llm_nodes is not None:
+                detected = llm_nodes
+                detect_method = "LLM"
+        if not detected:
+            detected = self._detect_input_nodes(workflow_json)
+            detect_method = "启发式"
+
         if not detected:
             class_types = sorted(
                 {
@@ -1272,7 +1330,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             )
             return True, "", 1
         self.ctx.logger.info(
-            "[识别] 识别到 %d 个输入节点: %s",
+            "[识别] %s 识别到 %d 个节点: %s",
+            detect_method,
             len(detected),
             ", ".join(f"{n['node_id']}/{n['field_name']}/{n['value_type']}" for n in detected),
         )
@@ -1288,13 +1347,22 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             await self.ctx.send.text(f"写入配置失败：{exc}", stream_id)
             return True, "", 1
 
-        summary = "、".join(
-            f"{n['node_id']}({n['value_type']})" for n in detected
-        )
+        inputs = [n for n in detected if n["value_type"] in ("text", "image", "audio")]
+        configs = [n for n in detected if n["value_type"] == "default"]
+        parts_summary: list[str] = []
+        if inputs:
+            parts_summary.append(
+                "输入节点：" + "、".join(f"{n['node_id']}({n['value_type']})" for n in inputs)
+            )
+        if configs:
+            parts_summary.append(
+                "配置节点：" + "、".join(f"{n['node_id']}({n['label']}={n['field_value']})" for n in configs)
+            )
+        summary = "\n".join(parts_summary) or "（无）"
         await self.ctx.send.text(
-            f"已自动写入配置并热重载：\n"
-            f"工作流「{workflow_name}」（{workflow_id}），识别到 {len(detected)} 个输入节点：{summary}\n"
-            f"可发送 /工作流 查看，文字节点若需接收命令文本请在 WebUI 开启",
+            f"已自动写入配置并热重载（{detect_method} 识别）：\n"
+            f"工作流「{workflow_name}」（{workflow_id}），共 {len(detected)} 个节点：\n{summary}\n"
+            f"可发送 /工作流 查看；文字节点若需接收命令文本请在 WebUI 开启",
             stream_id,
         )
         return True, "", 1
@@ -1488,9 +1556,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 {
                     "node_id": str(node.get("node_id") or ""),
                     "field_name": str(node.get("field_name") or ""),
-                    "field_value": "",
+                    "field_value": str(node.get("field_value") or ""),
                     "value_type": str(node.get("value_type") or ""),
-                    "label": str(node.get("hint") or node.get("label") or ""),
+                    "label": str(node.get("label") or node.get("hint") or ""),
                 }
                 for node in nodes
             ],
@@ -1515,11 +1583,12 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     @staticmethod
     def _detect_input_nodes(workflow_json: dict[str, Any]) -> list[dict[str, str]]:
-        """从工作流 JSON 自动识别可能的输入节点。
+        """从工作流 JSON 自动识别可能的输入节点（启发式，作为 LLM 识别的兜底）。
 
         规则：class_type 命中白名单。普通节点要求所有 inputs 均为标量值
         （非节点连线）；CLIPTextEncode 例外——它通常带有 clip 等连线输入，
         但只要 text 字段是标量，就是典型文字输入节点。
+        返回节点 dict：node_id / field_name / value_type / field_value / label。
         """
         detected: list[dict[str, str]] = []
         for node_id, node in sorted(workflow_json.items(), key=lambda item: _safe_int(item[0])):
@@ -1541,7 +1610,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                             "node_id": node_id,
                             "field_name": "text",
                             "value_type": "text",
-                            "hint": f"文本输入（{class_type}）",
+                            "field_value": "",
+                            "label": f"文本输入（{class_type}）",
                         }
                     )
                 continue
@@ -1559,7 +1629,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                         "node_id": node_id,
                         "field_name": field_name,
                         "value_type": "text",
-                        "hint": f"文本输入（{class_type}）",
+                        "field_value": "",
+                        "label": f"文本输入（{class_type}）",
                     }
                 )
             elif "loadimage" in cls_compact or "load image" in cls_lower:
@@ -1568,7 +1639,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                         "node_id": node_id,
                         "field_name": "image",
                         "value_type": "image",
-                        "hint": f"图片输入（{class_type}）",
+                        "field_value": "",
+                        "label": f"图片输入（{class_type}）",
                     }
                 )
             elif "loadaudio" in cls_compact or "audio upload" in cls_lower or "audioupload" in cls_compact:
@@ -1577,10 +1649,120 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                         "node_id": node_id,
                         "field_name": "audio",
                         "value_type": "audio",
-                        "hint": f"语音输入（{class_type}）",
+                        "field_value": "",
+                        "label": f"语音输入（{class_type}）",
                     }
                 )
         return detected
+
+    @staticmethod
+    def _describe_workflow_for_llm(workflow_json: dict[str, Any]) -> str:
+        """将工作流节点压缩为供 LLM 判断的清单（含字段名、是否连线、当前值）。"""
+        lines: list[str] = []
+        for node_id, node in sorted(workflow_json.items(), key=lambda item: _safe_int(item[0])):
+            if not isinstance(node, dict):
+                continue
+            class_type = str(node.get("class_type") or "")
+            meta = node.get("_meta")
+            title = str(meta.get("title") or "") if isinstance(meta, dict) else ""
+            header = f"节点 {node_id}（{class_type}）"
+            if title and title != class_type:
+                header += f" 标题={title}"
+            lines.append(header)
+            inputs = node.get("inputs")
+            if isinstance(inputs, dict):
+                for field_name, value in inputs.items():
+                    if isinstance(value, (list, tuple)):
+                        lines.append(f"    {field_name}: <连线>")
+                    elif isinstance(value, dict):
+                        lines.append(f"    {field_name}: <对象: {','.join(str(k) for k in value)}>")
+                    else:
+                        sample = str(value)
+                        if len(sample) > 80:
+                            sample = sample[:80] + "…"
+                        lines.append(f"    {field_name}: {sample!r}")
+            lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_llm_nodes(response_text: str, workflow_json: dict[str, Any]) -> list[dict[str, str]] | None:
+        """解析并校验 LLM 输出为节点列表（node_id/field_name 必须真实存在）。
+
+        Returns:
+            list | None: 校验通过的节点列表；解析失败或无有效节点返回 None。
+        """
+        text = str(response_text or "").strip()
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE)
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end <= start:
+            return None
+        try:
+            data = json.loads(text[start : end + 1])
+        except Exception:
+            return None
+        raw_nodes = data.get("nodes")
+        if not isinstance(raw_nodes, list):
+            return None
+
+        result: list[dict[str, str]] = []
+        for item in raw_nodes:
+            if not isinstance(item, dict):
+                continue
+            node_id = str(item.get("node_id") or "").strip()
+            field_name = str(item.get("field_name") or "").strip()
+            value_type = str(item.get("value_type") or "").strip().lower()
+            label = str(item.get("label") or "").strip()
+            if value_type not in ("text", "image", "audio", "default"):
+                continue
+            node = workflow_json.get(node_id)
+            if not isinstance(node, dict):
+                continue
+            inputs = node.get("inputs")
+            if not isinstance(inputs, dict) or field_name not in inputs:
+                continue
+            # 连线字段（来自其他节点输出）不可编辑，一律排除
+            if isinstance(inputs.get(field_name), (list, tuple)):
+                continue
+            field_value = ""
+            if value_type == "default":
+                field_value = str(item.get("field_value") or "").strip()
+                current = inputs.get(field_name)
+                if not field_value and not isinstance(current, (list, tuple, dict)):
+                    field_value = str(current)
+            result.append(
+                {
+                    "node_id": node_id,
+                    "field_name": field_name,
+                    "value_type": value_type,
+                    "field_value": field_value,
+                    "label": label or field_name,
+                }
+            )
+        return result or None
+
+    async def _detect_input_nodes_with_llm(self, workflow_json: dict[str, Any]) -> list[dict[str, str]] | None:
+        """用内置 LLM 识别输入节点与配置节点（失败返回 None，由调用方回退启发式）。"""
+        workflow_desc = self._describe_workflow_for_llm(workflow_json)
+        prompt = _LLM_DETECT_PROMPT.format(workflow=workflow_desc)
+        try:
+            result = await self.ctx.llm.generate(
+                prompt=prompt,
+                model=self.config.detect.model,
+                temperature=0.0,
+            )
+        except Exception as exc:
+            self.ctx.logger.warning("[识别] LLM 识别调用失败，将回退启发式: %s", exc)
+            return None
+        if not isinstance(result, dict) or not result.get("success"):
+            self.ctx.logger.warning("[识别] LLM 识别未成功，将回退启发式: %s", str(result)[:200])
+            return None
+        nodes = self._parse_llm_nodes(result.get("response") or "", workflow_json)
+        if not nodes:
+            self.ctx.logger.warning("[识别] LLM 输出校验失败，将回退启发式")
+            return None
+        self.ctx.logger.info("[识别] LLM 识别出 %d 个节点", len(nodes))
+        return nodes
 
     @Command("跑图", description="运行配置好的工作流，例如：/跑图 动漫生图 一只猫", pattern=r"^/跑图")
     async def handle_pao_tu(self, **kwargs: Any) -> tuple[bool, str, int]:
@@ -1606,7 +1788,12 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     @Tool(
         "run_workflow",
-        description="运行配置好的 RunningHub 工作流，提交描述文本并生成结果。工作流名称为配置文件中的工作流名称。",
+        description=(
+            "运行配置好的 RunningHub 工作流，提交描述文本并生成结果。工作流名称为配置文件中的工作流名称。"
+            "调用后立即返回：若该工作流还需要用户上传参考图/参考音频，返回中会带 waiting=true 和 required_files，"
+            "你必须把这些文件要求如实转告用户（如“请上传参考图/参考音频”），由用户直接发送文件到会话，"
+            "插件会自动接收文件并继续任务。"
+        ),
         parameters=[
             ToolParameterInfo(
                 name="workflow_name",
@@ -1639,7 +1826,13 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         kwargs["stream_id"] = stream_id
         result = await self._start_workflow(workflow_name, prompt, **kwargs)
         if result["success"]:
-            return {"success": True, "message": result["message"], "task_id": result.get("task_id")}
+            return {
+                "success": True,
+                "message": result["message"],
+                "task_id": result.get("task_id"),
+                "waiting": bool(result.get("waiting")),
+                "required_files": result.get("required_files") or [],
+            }
         return {"success": False, "message": result["message"]}
 
     @API("run_workflow", description="运行配置好的 RunningHub 工作流", version="1", public=True)

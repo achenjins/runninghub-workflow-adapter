@@ -18,6 +18,10 @@ download_timeout = 120
 enable = false
 recall_seconds = 90
 
+[detect]
+use_llm = true
+model = "utils"
+
 # ────────────────────────────────────────────────────────────
 # 工作流列表（结构化配置，可在 WebUI「工作流列表」中增删）
 #
