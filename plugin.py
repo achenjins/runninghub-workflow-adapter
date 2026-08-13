@@ -1967,6 +1967,29 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             return {"action": "abort"}
         return None
 
+    @HookHandler(
+        "chat.receive.after_process",
+        name="generic_notice_collector",
+        description="收集 QQ 文件消息（notice 通知消息，不经过 before_process）",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.EARLY,
+        timeout_ms=60000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def handle_notice_collector(self, message: dict | None = None, **kwargs: Any) -> dict | None:
+        """处理 notice 通知消息中的文件（QQ「文件」消息是 notice 类型，只走 after_process）。
+
+        先打诊断日志确认结构，再实现文件提取与上传。
+        """
+        if not isinstance(message, dict):
+            return None
+        import logging
+        logging.getLogger("RunningHubGenericPlugin").info(
+            "[notice收集] after_process 收到消息: message=%r kwargs_keys=%s",
+            message, list((kwargs or {}).keys()),
+        )
+        return None
+
     @Command("工作流", description="列出已配置的工作流", pattern=r"^/工作流")
     async def handle_list_workflows(self, **kwargs: Any) -> tuple[bool, str, int]:
         stream_id = str(kwargs.get("stream_id") or "")
