@@ -408,8 +408,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 "运行配置好的 RunningHub 工作流生成图片或视频。"
                 f"当前已配置的工作流名称：{name_list}。"
                 "workflow_name 必须从上述名称中精确选择一个；prompt 填生成内容描述（可留空）。"
-                "调用后若返回 waiting=true，说明该工作流还需要用户上传参考图/参考音频，"
-                "必须把 required_files 里的要求如实转告用户，让用户直接发送文件到会话。"
+                "调用后立即返回，无需调用 wait 轮询："
+                "若返回 waiting=true，说明该工作流还需要用户上传参考图/参考音频，"
+                "必须把 required_files 里的要求如实转告用户，让用户直接发送文件到会话，然后结束本轮；"
+                "文件由系统自动接收并继续，生成结果会异步自动发送到会话。"
             )
             metadata["description"] = description
             metadata["brief_description"] = description
@@ -2028,22 +2030,44 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 ),
             }
         result = await self._start_workflow(workflow_name, prompt, **kwargs)
-        if result["success"]:
+        if not result["success"]:
+            # 未找到工作流时，_start_workflow 的消息里已带上可用列表；这里补充用法提示
+            message = result["message"]
+            if "未找到工作流" in message:
+                message += (
+                    "\n用法：workflow_name 从已配置的工作流名称中精确选一个；"
+                    "prompt 填生成内容描述；若返回 waiting=true 就把 required_files 转告用户上传文件。"
+                )
+            return {"success": False, "message": message}
+
+        if result.get("waiting"):
+            files = result.get("required_files") or []
+            desc = "；".join(
+                f"{i + 1}.{f['label']}（{'图片' if f['type'] == 'image' else '语音'}）"
+                for i, f in enumerate(files)
+            )
             return {
                 "success": True,
-                "message": result["message"],
-                "task_id": result.get("task_id"),
-                "waiting": bool(result.get("waiting")),
-                "required_files": result.get("required_files") or [],
+                "waiting": True,
+                "required_files": files,
+                "message": (
+                    "任务已进入等待上传阶段，需要用户提供：" + desc + "。"
+                    "请用一句话告知用户需要上传这些文件（可只传部分，或发送「跳过剩余」直接开始）。"
+                    "告知后请立即结束本轮思考，不要再调用 wait，也不要重复调用本工具；"
+                    "用户上传后系统会自动接收并开始生成，结果会异步自动发送到会话，你无需等待。"
+                ),
             }
-        # 未找到工作流时，_start_workflow 的消息里已带上可用列表；这里补充用法提示
-        message = result["message"]
-        if "未找到工作流" in message:
-            message += (
-                "\n用法：workflow_name 从已配置的工作流名称中精确选一个；"
-                "prompt 填生成内容描述；若返回 waiting=true 就把 required_files 转告用户上传文件。"
-            )
-        return {"success": False, "message": message}
+
+        return {
+            "success": True,
+            "waiting": False,
+            "required_files": [],
+            "task_id": result.get("task_id"),
+            "message": (
+                "任务已提交并开始运行。生成结果会异步自动发送到会话，"
+                "你无需等待或轮询，请直接结束本轮思考，不要调用 wait。"
+            ),
+        }
 
     @API("run_workflow", description="运行配置好的 RunningHub 工作流", version="1", public=True)
     async def handle_run_workflow_api(
