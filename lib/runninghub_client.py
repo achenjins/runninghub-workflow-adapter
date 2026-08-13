@@ -177,7 +177,10 @@ class RunningHubClient:
         return file_name
 
     async def get_workflow_json(self, workflow_id: str) -> dict[str, Any]:
-        """获取工作流完整 JSON（getJsonApiFormat 接口）。
+        """获取工作流完整 JSON（getJsonApiFormat 接口，官方文档规范）。
+
+        按官方文档要求：body 带 apiKey/workflowId，header 带
+        Authorization（Bearer）与 Host。
 
         Args:
             workflow_id: 工作流 ID。
@@ -188,8 +191,26 @@ class RunningHubClient:
         Raises:
             RunningHubError: 获取失败时抛出。
         """
+        from urllib.parse import urlparse
+
         payload = {"apiKey": self.api_key, "workflowId": str(workflow_id)}
-        result = await self._post("/api/openapi/getJsonApiFormat", payload, use_api_key_header=False)
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+            "Host": urlparse(self.base_url).netloc,
+        }
+
+        def _do() -> dict[str, Any]:
+            response = requests.post(
+                f"{self.base_url}/api/openapi/getJsonApiFormat",
+                json=payload,
+                headers=headers,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            return response.json()
+
+        result = await asyncio.to_thread(_do)
         if result.get("code") not in (0, None):
             raise RunningHubError(f"获取工作流失败: {result.get('msg') or result}")
         data = result.get("data") or {}
