@@ -434,7 +434,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         self.ctx.logger.info(
             "通用工作流插件已加载：base_url=%s 工作流数量=%d",
             cfg.server.base_url,
-            len(cfg.workflows),
+            len(self._workflows),
         )
         for line in self._describe_workflows():
             self.ctx.logger.info("[配置] %s", line)
