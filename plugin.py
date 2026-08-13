@@ -156,7 +156,6 @@ class InputNodeSection(PluginConfigBase):
             "label": "节点类型",
             "x-widget": "select",
             "options": [
-                {"value": "", "label": "自动推断"},
                 {"value": "default", "label": "默认值（固定使用输入内容）"},
                 {"value": "text", "label": "文字（接收命令文本）"},
                 {"value": "image", "label": "图片（等待上传）"},
@@ -169,6 +168,14 @@ class InputNodeSection(PluginConfigBase):
         description="该输入的中文说明（等待上传时提示用户），留空使用节点 ID",
         json_schema_extra={"label": "输入说明", "placeholder": "角色参考图"},
     )
+
+    @field_validator("value_type", mode="before")
+    @classmethod
+    def _normalize_value_type(cls, value: Any) -> Any:
+        """WebUI 下拉的 SelectItem 不允许空字符串选项，用 "auto" 表示自动推断。"""
+        if value == "auto":
+            return ""
+        return value
 
 
 class WorkflowItemSection(PluginConfigBase):
@@ -359,7 +366,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 "default": default_values.get(field_name),
             }
             if field_name == "value_type":
-                item_field["choices"] = ["", "default", "text", "image", "audio"]
+                # SelectItem 不允许空字符串 value，用 "auto" 表示自动推断（模型层归一化为 ""）
+                item_field["choices"] = ["auto", "default", "text", "image", "audio"]
+                item_field["placeholder"] = "auto=自动推断"
             item_fields[field_name] = item_field
         return item_fields
 
