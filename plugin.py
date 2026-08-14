@@ -1694,11 +1694,6 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         """
         client = client or self._client
         chat_info = self._extract_chat_info(kwargs or {})
-        if not chat_info.get("group_id") and not chat_info.get("user_id"):
-            self.ctx.logger.warning(
-                "[结果发送] chat_info 为空, kwargs_keys=%s kwargs=%r",
-                list((kwargs or {}).keys()), kwargs,
-            )
         try:
             try:
                 result = await client.wait_for_result(task_id)
@@ -1878,11 +1873,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         # 优先用 send.custom：只需 stream_id，MaiBot 自动路由到平台/会话
         try:
             ok = await self.ctx.send.custom("videourl", video_url, stream_id)
-            self.ctx.logger.info("[视频发送] send.custom('videourl') 返回=%r", ok)
             if ok:
                 return ""
         except Exception as exc:
-            self.ctx.logger.warning("[视频发送] send.custom 异常: %s", exc)
+            self.ctx.logger.warning("send.custom 发视频异常，回退直发: %s", exc)
 
         group_id = str(chat_info.get("group_id") or "")
         user_id = str(chat_info.get("user_id") or "")
@@ -2958,11 +2952,6 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     async def handle_pao_tu(self, **kwargs: Any) -> tuple[bool, str, int]:
         stream_id = str(kwargs.get("stream_id") or "")
         plain_text = str(kwargs.get("text") or kwargs.get("plain_text") or "")
-        self.ctx.logger.info(
-            "[命令触发] kwargs_keys=%s user_id=%r group_id=%r message_type=%s message=%r",
-            list(kwargs.keys()), kwargs.get("user_id"), kwargs.get("group_id"),
-            type(kwargs.get("message")).__name__, kwargs.get("message"),
-        )
         # 解析：/rh运行 <工作流名> [描述文本]
         rest = re.sub(r"^/rh运行[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
 
