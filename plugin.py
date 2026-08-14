@@ -1737,6 +1737,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                         )
                         if should_cleanup and message_id:
                             self._schedule_recall(message_id, recall_seconds)
+                elif self._is_video_url(url) and stream_id:
+                    await self._send_video_with_id(url, stream_id, chat_info=chat_info)
                 elif stream_id:
                     await self.ctx.send.text(f"任务结果 {index + 1}：{url}", stream_id)
         except asyncio.CancelledError:
@@ -1756,6 +1758,12 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         """判断结果 URL 是否指向图片（按扩展名粗判）。"""
         path = str(url or "").split("?", 1)[0].lower()
         return path.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"))
+
+    @staticmethod
+    def _is_video_url(url: str) -> bool:
+        """判断结果 URL 是否指向视频（按扩展名粗判）。"""
+        path = str(url or "").split("?", 1)[0].lower()
+        return path.endswith((".mp4", ".mov", ".webm", ".avi", ".mkv", ".flv", ".m4v", ".mpg", ".mpeg", ".3gp", ".wmv"))
 
     @staticmethod
     def _extract_chat_info(kwargs: dict) -> dict:
@@ -1858,6 +1866,48 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             self.ctx.logger.warning("无法解析群号/用户号，回退 ctx.send.image")
 
         await self.ctx.send.image(image_base64, stream_id)
+        return ""
+
+    async def _send_video_with_id(self, video_url: str, stream_id: str, *, chat_info: dict) -> str:
+        """通过 NapCat 适配器直发视频（file 填 URL，NapCat 自行下载）；失败回退发链接。"""
+        group_id = str(chat_info.get("group_id") or "")
+        user_id = str(chat_info.get("user_id") or "")
+
+        if group_id or user_id:
+            try:
+                if group_id:
+                    action = "send_group_msg"
+                    params = {
+                        "group_id": int(group_id),
+                        "message": [{"type": "video", "data": {"file": video_url}}],
+                    }
+                else:
+                    action = "send_private_msg"
+                    params = {
+                        "user_id": int(user_id),
+                        "message": [{"type": "video", "data": {"file": video_url}}],
+                    }
+            except (TypeError, ValueError):
+                self.ctx.logger.warning("群号/用户号不是数字，回退发视频链接")
+                await self.ctx.send.text(video_url, stream_id)
+                return ""
+            try:
+                response = await self._call_napcat_action(action, params)
+            except Exception as exc:
+                response = None
+                self.ctx.logger.warning("NapCat 直发视频异常，回退发链接: %s", exc)
+            if response is not None:
+                if self._is_napcat_failed(response):
+                    self.ctx.logger.warning("NapCat 直发视频业务失败，回退发链接: %s", str(response)[:200])
+                else:
+                    message_id = self._extract_message_id(response)
+                    if message_id:
+                        return message_id
+                    return ""
+        else:
+            self.ctx.logger.warning("无法解析群号/用户号，回退发视频链接")
+
+        await self.ctx.send.text(video_url, stream_id)
         return ""
 
     @staticmethod
