@@ -1877,8 +1877,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         """优先用 send.custom 发视频（只需 stream_id）；失败回退 NapCat 直发或发链接。"""
         # 优先用 send.custom：只需 stream_id，MaiBot 自动路由到平台/会话
         try:
-            ok = await self.ctx.send.custom("video", video_url, stream_id)
-            self.ctx.logger.info("[视频发送] send.custom('video') 返回=%r", ok)
+            ok = await self.ctx.send.custom("videourl", video_url, stream_id)
+            self.ctx.logger.info("[视频发送] send.custom('videourl') 返回=%r", ok)
             if ok:
                 return ""
         except Exception as exc:
