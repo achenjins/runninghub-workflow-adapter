@@ -820,7 +820,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             bucket[:] = [t for t in bucket if now - t < 3600]
             if len(bucket) >= cfg.max_per_user_per_hour:
                 return False, "你本小时的生成次数已达上限，请稍后再试"
-            bucket.append(now)
+            # 计数移到提交成功后（_submit_and_poll），失败 / 识别等非生成请求不占额度
+            # 桶数超阈值时清理空桶，避免一次性用户导致字典无限增长
+            if len(self._user_requests) > 128:
+                self._user_requests = {k: v for k, v in self._user_requests.items() if v}
 
         return True, ""
 
@@ -1207,6 +1210,15 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             self.ctx.logger.error("提交任务异常: %s", exc, exc_info=True)
             return {"success": False, "message": f"提交任务异常：{exc}"}
 
+        # 提交成功才计入每用户每小时频率（失败 / 识别等非生成请求不占额度）
+        if self.config.access.max_per_user_per_hour > 0:
+            uid = str(kwargs.get("user_id") or "").strip()
+            if uid:
+                now = time.time()
+                bucket = self._user_requests.setdefault(uid, [])
+                bucket[:] = [t for t in bucket if now - t < 3600]
+                bucket.append(now)
+
         self.ctx.logger.info(
             "任务已提交: task_id=%s workflow=%s nodes=%d",
             task_id,
@@ -1454,10 +1466,13 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     async def _handle_config_edit(self, session: InputSession, stream_id: str, message: dict) -> None:
         """处理可编辑配置的确认/修改回复。"""
         text = self._extract_text_from_message(message)
-        values = self._parse_config_edit(text, len(session.editable_nodes))
-        if values is None:
-            await self.ctx.send.text("没看懂，请回复新值（如「512 16:9」），或「不变」使用默认值", stream_id)
+        # 配置阶段只接受文字：误发文件（无文字）时提示，不要当成「不变」直接提交
+        if not text.strip() and self._extract_files_from_message(message):
+            await self.ctx.send.text(
+                "现在是配置确认阶段，请回复数值（如「512 16:9」）或「不变」；图片等参考文件请留到下次任务再传", stream_id
+            )
             return
+        values = self._parse_config_edit(text, len(session.editable_nodes))
         for index, node in enumerate(session.editable_nodes):
             if index < len(values) and values[index] is not None:
                 self._patch_text_value(
@@ -1577,7 +1592,11 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 continue
             seg_type = str(seg.get("type") or "")
             data = seg.get("data")
-            data_text = str(data).strip() if isinstance(data, str) else ""
+            if isinstance(data, dict):
+                # 兼容 dict 形态（{"url"/"file"/"path": ...}）
+                data_text = str(data.get("url") or data.get("file") or data.get("path") or "").strip()
+            else:
+                data_text = str(data).strip() if isinstance(data, str) else ""
             b64 = str(seg.get("binary_data_base64") or "").strip()
             if seg_type == "image":
                 source = ("base64://" + b64) if b64 else data_text
