@@ -819,9 +819,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     def _check_access_from_kwargs(self, kwargs: dict[str, Any]) -> tuple[bool, str]:
         """从命令 kwargs 提取 user_id/group_id 并做访问控制检查。"""
-        user_id = str(kwargs.get("user_id") or "")
         chat_info = self._extract_chat_info(kwargs)
         group_id = str(chat_info.get("group_id") or "")
+        user_id = str(kwargs.get("user_id") or chat_info.get("user_id") or "")
         return self._check_access(user_id, group_id)
 
     def _is_admin(self, user_id: str) -> bool:
@@ -1080,9 +1080,14 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     ) -> dict[str, Any]:
         """查找工作流，构建节点参数，提交任务或进入交互式收集。"""
         stream_id = str(kwargs.pop("stream_id", "") or "")
-        user_id = str(kwargs.get("user_id") or "")
         chat_info = self._extract_chat_info(kwargs)
         group_id = str(chat_info.get("group_id") or "")
+        # 命令路径会注入 user_id；LLM 工具路径只有 stream_id + message，
+        # 这里回退到从 message 里提取的用户，避免空 user_id 被 allow_users 白名单误拒。
+        user_id = str(kwargs.get("user_id") or chat_info.get("user_id") or "")
+        # 回填 kwargs，保证下游（任务元信息 / 撤回 / 中断权限）在工具路径也能拿到正确用户
+        kwargs["user_id"] = user_id
+        kwargs["group_id"] = group_id
         allowed, deny_msg = self._check_access(user_id, group_id)
         if not allowed:
             return {"success": False, "message": deny_msg}
