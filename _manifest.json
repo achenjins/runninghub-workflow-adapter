@@ -33,6 +33,7 @@
   "capabilities": [
     "send.text",
     "send.image",
+    "send.custom",
     "api.call",
     "llm.generate"
   ],
