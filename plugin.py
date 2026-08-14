@@ -1080,6 +1080,29 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     ) -> dict[str, Any]:
         """查找工作流，构建节点参数，提交任务或进入交互式收集。"""
         stream_id = str(kwargs.pop("stream_id", "") or "")
+        # ── 临时诊断：完整 dump 调用来源与 message，确认 user_id 到底在哪个字段 ──
+        try:
+            import traceback as _tb
+            _caller = ""
+            for _frame in reversed(_tb.extract_stack()):
+                _fname = _frame.name
+                if "handle_" in _fname or "run_workflow" in _fname or "pao_tu" in _fname:
+                    _caller = _fname
+                    break
+            self.ctx.logger.info(
+                "[入口诊断] caller=%s stream_id=%r kwargs_keys=%s",
+                _caller, stream_id, sorted(kwargs.keys()),
+            )
+            _msg = kwargs.get("message")
+            if isinstance(_msg, dict):
+                self.ctx.logger.info(
+                    "[入口诊断] message=%s",
+                    json.dumps(_msg, ensure_ascii=False, default=str)[:3000],
+                )
+            else:
+                self.ctx.logger.info("[入口诊断] message=%r", _msg)
+        except Exception as _exc:
+            self.ctx.logger.info("[入口诊断] 打印失败: %r", _exc)
         chat_info = self._extract_chat_info(kwargs)
         group_id = str(chat_info.get("group_id") or "")
         # 命令路径会注入 user_id；LLM 工具路径只有 stream_id + message，
@@ -3041,23 +3064,6 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         prompt: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
-        # ── 临时诊断：确认工具调用时能否拿到用户身份 ──
-        self.ctx.logger.info(
-            "[工具诊断] stream_id=%r prompt_len=%d kwargs_keys=%s",
-            stream_id, len(str(prompt or "")), sorted(kwargs.keys()),
-        )
-        message = kwargs.get("message")
-        if isinstance(message, dict):
-            info = message.get("message_info") or {}
-            self.ctx.logger.info(
-                "[工具诊断] message_keys=%s message_info_keys=%s user_info=%r group_info=%r",
-                sorted(message.keys()),
-                sorted(info.keys()) if isinstance(info, dict) else info,
-                info.get("user_info") if isinstance(info, dict) else None,
-                info.get("group_info") if isinstance(info, dict) else None,
-            )
-        else:
-            self.ctx.logger.info("[工具诊断] message=%r", message)
         kwargs["stream_id"] = stream_id
         workflow_name = str(workflow_name or "").strip()
         names = self._llm_callable_workflow_names()
