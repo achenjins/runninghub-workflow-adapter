@@ -198,6 +198,11 @@ class AccessSection(PluginConfigBase):
         description="每个用户每小时最多触发的任务数（0 表示不限制）",
         json_schema_extra={"label": "每用户每小时上限", "hint": "0 表示不限制"},
     )
+    admin_users: list[str] = Field(
+        default_factory=list,
+        description="管理员用户 ID 列表；管理员可用 /rh中断 中断所有人的任务",
+        json_schema_extra={"label": "管理员 ID", "placeholder": "用户ID，每行一个"},
+    )
 
 
 class InputNodeSection(PluginConfigBase):
@@ -793,6 +798,14 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         chat_info = self._extract_chat_info(kwargs)
         group_id = str(chat_info.get("group_id") or "")
         return self._check_access(user_id, group_id)
+
+    def _is_admin(self, user_id: str) -> bool:
+        """判断用户是否为管理员（可中断所有人的任务）。"""
+        uid = str(user_id or "").strip()
+        if not uid:
+            return False
+        admins = {str(a).strip() for a in self.config.access.admin_users if str(a).strip()}
+        return uid in admins
 
     def _ordered_nodes(self, workflow: WorkflowItemSection) -> list[InputNodeSection]:
         """按配置顺序返回有效节点（最多 _MAX_NODES 个）。"""
@@ -1979,6 +1992,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             await self.ctx.send.text(deny_msg, stream_id)
             return True, "", 1
         user_id = str(kwargs.get("user_id") or "")
+        is_admin = self._is_admin(user_id)
         # 1. 还在输入收集阶段：直接结束会话
         session = self._find_input_session(user_id, stream_id)
         if session is not None:
@@ -1986,10 +2000,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             self._cancel_input_session(key)
             await self.ctx.send.text("已中断", stream_id)
             return True, "", 1
-        # 2. 已提交的任务：列出编号让用户选择
+        # 2. 已提交的任务：列出编号让用户选择（管理员可中断所有人）
         tasks = [
             (tid, meta) for tid, meta in self._task_meta.items()
-            if not user_id or meta.get("user_id") == user_id
+            if is_admin or not user_id or meta.get("user_id") == user_id
         ]
         if not tasks:
             await self.ctx.send.text("当前没有进行中的任务", stream_id)
@@ -2483,6 +2497,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         lines.append(f"allow_users = {json.dumps([str(u) for u in cfg.access.allow_users], ensure_ascii=False)}")
         lines.append(f"allow_groups = {json.dumps([str(g) for g in cfg.access.allow_groups], ensure_ascii=False)}")
         lines.append(f"max_per_user_per_hour = {cfg.access.max_per_user_per_hour}")
+        lines.append(f"admin_users = {json.dumps([str(u) for u in cfg.access.admin_users], ensure_ascii=False)}")
         lines.append("")
         return "\n".join(lines)
 

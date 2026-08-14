@@ -32,6 +32,8 @@ enhance_model = "utils"
 allow_users = []
 allow_groups = []
 max_per_user_per_hour = 0
+# 管理员用户 ID（可用 /rh中断 中断所有人的任务）
+admin_users = []
 
 # ────────────────────────────────────────────────────────────
 # 工作流列表（结构化配置，可在 WebUI「工作流列表」中增删）
