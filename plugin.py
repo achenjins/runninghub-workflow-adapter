@@ -80,7 +80,7 @@ class PluginMetaSection(PluginConfigBase):
     config_version: str = Field(
         default="1.1.0",
         description="插件配置版本号（一般无需修改）",
-        json_schema_extra={"label": "配置版本"},
+        json_schema_extra={"label": "配置版本", "hidden": True},
     )
 
 
