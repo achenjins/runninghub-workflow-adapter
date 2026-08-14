@@ -1,5 +1,6 @@
 {
   "manifest_version": 2,
+  "plugin_type": "media",
   "id": "github.achenjins.runninghub-workflow-adapter",
   "version": "1.0.0",
   "name": "RunningHub 通用工作流插件",
