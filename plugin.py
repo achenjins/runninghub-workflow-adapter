@@ -496,6 +496,33 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         except Exception:
             return [str(w.name or "").strip() for w in self._workflows if str(w.name or "").strip()]
 
+    def _is_llm_callable_workflow(self, workflow: WorkflowItemSection) -> bool:
+        """判断工作流是否支持 LLM 工具调用。
+
+        仅支持「只有主提示词 + 可选固定默认值」的工作流：无文件节点（图片/音频/视频），
+        无可编辑配置节点（text）。
+        """
+        prompt_count = 0
+        for node in self._ordered_nodes(workflow):
+            vtype = self._resolve_value_type(node)
+            if vtype == "prompt":
+                prompt_count += 1
+            elif vtype in ("image", "audio", "video", "text"):
+                return False
+        return prompt_count == 1
+
+    def _llm_callable_workflow_names(self) -> list[str]:
+        """返回支持 LLM 工具调用的工作流名称列表。"""
+        try:
+            workflows = list(self.config.workflows.items)
+        except Exception:
+            workflows = list(self._workflows)
+        return [
+            str(w.name or "").strip()
+            for w in workflows
+            if str(w.name or "").strip() and self._is_llm_callable_workflow(w)
+        ]
+
     def get_components(self) -> list[dict[str, Any]]:
         """收集组件，并把当前已配置的工作流名称注入 run_workflow 工具描述。
 
@@ -503,20 +530,18 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         workflow_name 甚至干脆不调用（幻觉已完成），因此在这里动态注入名称列表。
         """
         components = super().get_components()
-        names = self._workflow_names()
-        name_list = "、".join(names) if names else "（尚未配置任何工作流，请先让用户发送 /识别工作流 添加）"
+        names = self._llm_callable_workflow_names()
+        name_list = "、".join(names) if names else "（当前没有支持自然语言调用的工作流，需是仅有提示词输入的工作流）"
         for comp in components:
             if comp.get("type") != "TOOL" or comp.get("name") != "run_workflow":
                 continue
             metadata = dict(comp.get("metadata") or {})
             description = (
-                "运行配置好的 RunningHub 工作流生成图片或视频。"
-                f"当前已配置的工作流名称：{name_list}。"
-                "workflow_name 必须从上述名称中精确选择一个；prompt 填生成内容描述（可留空）。"
-                "调用后立即返回，无需调用 wait 轮询："
-                "若返回 waiting=true，说明该工作流还需要用户上传参考图/参考音频，"
-                "必须把 required_files 里的要求如实转告用户，让用户直接发送文件到会话，然后结束本轮；"
-                "文件由系统自动接收并继续，生成结果会异步自动发送到会话。"
+                "运行仅支持自然语言调用的 RunningHub 工作流（文生图/文生视频等只有提示词输入的工作流）。"
+                f"当前支持的工作流名称：{name_list}。"
+                "workflow_name 必须从上述名称中精确选一个；prompt 填用户描述的内容（从用户原话提取，不要脑补）。"
+                "只在用户明确要求生成图片/视频时才调用。"
+                "调用后立即返回任务已提交，生成结果会异步自动发送到会话，你无需等待或轮询。"
             )
             metadata["description"] = description
             metadata["brief_description"] = description
@@ -2973,16 +2998,16 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     @Tool(
         "run_workflow",
         description=(
-            "运行配置好的 RunningHub 工作流，提交描述文本并生成结果。工作流名称为配置文件中的工作流名称。"
-            "调用后立即返回：若该工作流还需要用户上传参考图/参考音频，返回中会带 waiting=true 和 required_files，"
-            "你必须把这些文件要求如实转告用户（如“请上传参考图/参考音频，可只传部分”），由用户直接发送文件到会话，"
-            "插件会自动接收文件并继续任务；用户也可发送「跳过剩余」直接开始运行。"
+            "运行配置好的 RunningHub 工作流，提交提示词并生成结果（文生图/文生视频等）。"
+            "仅支持「只有提示词输入、无图片/音频/视频/配置输入」的工作流；可用工作流名称会动态注入到本工具描述中。"
+            "workflow_name 必须从描述中列出的名称里精确选一个；prompt 填用户想要生成的内容（从用户原话提取，不要脑补）。"
+            "调用后立即返回任务已提交，生成结果会异步自动发送到会话，你无需等待或轮询。"
         ),
         parameters=[
             ToolParameterInfo(
                 name="workflow_name",
                 param_type=ToolParamType.STRING,
-                description="要运行的工作流名称（对应插件配置中的工作流名称）",
+                description="要运行的工作流名称（必须从工具描述中列出的支持名称里精确选一个）",
                 required=True,
             ),
             ToolParameterInfo(
@@ -3009,52 +3034,40 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     ) -> dict[str, Any]:
         kwargs["stream_id"] = stream_id
         workflow_name = str(workflow_name or "").strip()
-        names = self._workflow_names()
+        names = self._llm_callable_workflow_names()
         if not workflow_name:
-            # 自述用法：让 LLM 知道有哪些工作流、怎么传参
+            # 未指定名称：返回可用列表，让 LLM 选一个后再次调用本工具（多轮工具调用）
             return {
                 "success": False,
                 "message": (
-                    "未指定 workflow_name。用法：workflow_name 从已配置的工作流名称中精确选一个，"
-                    "prompt 填生成内容描述（可留空），stream_id 填当前聊天流 ID。"
-                    "当前已配置的工作流："
-                    + ("、".join(names) if names else "（无，请先让用户发送 /识别工作流 添加）")
+                    "请从以下支持自然语言调用的工作流名称中精确选一个填入 workflow_name，"
+                    "并把用户想要生成的内容填入 prompt（从用户原话提取，不要脑补），然后再次调用本工具。"
+                    "可选工作流：" + ("、".join(names) if names else "（无）")
                 ),
             }
+        if workflow_name not in names:
+            all_names = self._workflow_names()
+            if workflow_name in all_names:
+                reason = (
+                    f"工作流「{workflow_name}」包含图片/音频/视频/配置等输入节点，"
+                    "不支持自然语言调用，请让用户改用命令 /rh运行 手动运行"
+                )
+            else:
+                reason = f"工作流「{workflow_name}」未配置"
+            return {
+                "success": False,
+                "message": (
+                    reason + "。可选的自然语言调用工作流："
+                    + ("、".join(names) if names else "（无）")
+                    + "。请直接结束本轮思考，不要重复调用本工具。"
+                ),
+            }
+        # 支持自然语言调用的工作流仅有提示词输入，_start_workflow 必然直接提交，不会进入等待上传
         result = await self._start_workflow(workflow_name, prompt, **kwargs)
         if not result["success"]:
-            # 未找到工作流时，_start_workflow 的消息里已带上可用列表；这里补充用法提示
-            message = result["message"]
-            if "未找到工作流" in message:
-                message += (
-                    "\n用法：workflow_name 从已配置的工作流名称中精确选一个；"
-                    "prompt 填生成内容描述；若返回 waiting=true 就把 required_files 转告用户上传文件。"
-                )
-            return {"success": False, "message": message}
-
-        if result.get("waiting"):
-            files = result.get("required_files") or []
-            _type_name = {"image": "图片", "audio": "语音", "video": "视频"}
-            desc = "；".join(
-                f"{i + 1}.{f['label']}（{_type_name.get(f['type'], '文件')}）"
-                for i, f in enumerate(files)
-            )
-            return {
-                "success": True,
-                "waiting": True,
-                "required_files": files,
-                "message": (
-                    "任务已进入等待上传阶段，需要用户提供：" + desc + "。"
-                    "请用一句话告知用户需要上传这些文件（可只传部分，或发送「跳过剩余」直接开始）。"
-                    "告知后请立即结束本轮思考，不要再调用 wait，也不要重复调用本工具；"
-                    "用户上传后系统会自动接收并开始生成，结果会异步自动发送到会话，你无需等待。"
-                ),
-            }
-
+            return {"success": False, "message": result["message"]}
         return {
             "success": True,
-            "waiting": False,
-            "required_files": [],
             "task_id": result.get("task_id"),
             "message": (
                 "任务已提交并开始运行。生成结果会异步自动发送到会话，"
