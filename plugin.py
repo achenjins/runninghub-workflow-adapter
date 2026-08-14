@@ -2487,10 +2487,19 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         return "\n".join(lines)
 
     def _write_config_file(self, items: list[dict[str, Any]]) -> None:
-        """按结构化工作流列表重建 config.toml（同步写盘）。"""
+        """按结构化工作流列表重建 config.toml（同步写盘，原子替换）。
+
+        先写临时文件，写成功后再原子替换到 config.toml；写盘中途失败不会破坏原配置。
+        """
         config_path = _PLUGIN_DIR / "config.toml"
+        tmp_path = config_path.with_suffix(".toml.tmp")
         content = self._serialize_config_file(items)
-        config_path.write_text(content, encoding="utf-8")
+        tmp_path.write_text(content, encoding="utf-8")
+        try:
+            tmp_path.replace(config_path)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
     def _workflow_dicts_from_toml_text(self, text: str) -> list[dict[str, Any]]:
         """解析旧版 workflows_toml 文本为工作流 dict 列表（供迁移使用）。"""
