@@ -1860,31 +1860,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         return None
 
     async def _send_image_with_id(self, image_base64: str, stream_id: str, *, chat_info: dict) -> str:
-        """发送图片并尽量返回平台 message_id（用于撤回）。
+        """通过 NapCat 直发图片并返回平台 message_id（用于撤回）。
 
-        优先走 send.image(return_details=True)；失败回退 NapCat 直发，再失败回退通用发送。
+        注：MaiBot 的 send.image(return_details=True) 当前不回填 message_id，撤回只能靠 NapCat 直发。
         """
-        # 1. 优先 send.image 拿 message_id（走 MaiBot 抽象层，更跨平台）
-        try:
-            result = await self.ctx.send.image(image_base64, stream_id, return_details=True)
-        except Exception as exc:
-            result = None
-            self.ctx.logger.warning("send.image 异常，回退 NapCat 直发: %s", exc)
-        if isinstance(result, dict):
-            if result.get("sent") is False:
-                self.ctx.logger.warning("send.image 发送失败，回退 NapCat 直发")
-            else:
-                message_id = str(result.get("message_id") or "").strip()
-                if message_id:
-                    return message_id
-                self.ctx.logger.warning("send.image 未返回 message_id，无法撤回")
-                return ""
-        elif result is False:
-            self.ctx.logger.warning("send.image 返回 False，回退 NapCat 直发")
-        elif result is True:
-            return ""
-
-        # 2. 回退 NapCat 直发
         group_id = str(chat_info.get("group_id") or "")
         user_id = str(chat_info.get("user_id") or "")
 
@@ -1937,30 +1916,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         return ""
 
     async def _send_video_with_id(self, video_url: str, stream_id: str, *, chat_info: dict) -> str:
-        """发送视频并尽量返回平台 message_id（用于撤回）。
+        """通过 NapCat 直发视频并返回平台 message_id（用于撤回）；失败回退 send.custom 或发链接。
 
-        优先 send.custom 发视频；失败回退 NapCat 直发，再失败发链接。
+        注：MaiBot 的 send.custom(return_details=True) 当前不回填 message_id，撤回只能靠 NapCat 直发。
         """
-        # 1. 优先 send.custom 拿 message_id
-        try:
-            result = await self.ctx.send.custom("videourl", video_url, stream_id, return_details=True)
-        except Exception as exc:
-            result = None
-            self.ctx.logger.warning("send.custom 发视频异常，回退直发: %s", exc)
-        if isinstance(result, dict):
-            if result.get("sent") is False:
-                self.ctx.logger.warning("send.custom 发视频失败，回退 NapCat 直发")
-            else:
-                message_id = str(result.get("message_id") or "").strip()
-                if message_id:
-                    return message_id
-                return ""
-        elif result is False:
-            self.ctx.logger.warning("send.custom 发视频返回 False，回退 NapCat 直发")
-        elif result is True:
-            return ""
-
-        # 2. 回退 NapCat 直发
         group_id = str(chat_info.get("group_id") or "")
         user_id = str(chat_info.get("user_id") or "")
 
@@ -1979,24 +1938,34 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                         "message": [{"type": "video", "data": {"file": video_url}}],
                     }
             except (TypeError, ValueError):
-                self.ctx.logger.warning("群号/用户号不是数字，回退发视频链接")
-                await self.ctx.send.text(video_url, stream_id)
-                return ""
-            try:
-                response = await self._call_napcat_action(action, params)
-            except Exception as exc:
-                response = None
-                self.ctx.logger.warning("NapCat 直发视频异常，回退发链接: %s", exc)
-            if response is not None:
-                if self._is_napcat_failed(response):
-                    self.ctx.logger.warning("NapCat 直发视频业务失败，回退发链接: %s", str(response)[:200])
-                else:
-                    message_id = self._extract_message_id(response)
-                    if message_id:
-                        return message_id
-                    return ""
+                self.ctx.logger.warning("群号/用户号不是数字，回退 send.custom 发视频")
+            else:
+                self.ctx.logger.debug(
+                    "尝试 NapCat 直发视频: action=%s group_id=%s user_id=%s", action, group_id, user_id
+                )
+                try:
+                    response = await self._call_napcat_action(action, params)
+                except Exception as exc:
+                    response = None
+                    self.ctx.logger.warning("NapCat 直发视频异常，回退 send.custom: %s", exc)
+                if response is not None:
+                    if self._is_napcat_failed(response):
+                        self.ctx.logger.warning("NapCat 直发视频业务失败，回退 send.custom: %s", str(response)[:200])
+                    else:
+                        message_id = self._extract_message_id(response)
+                        if message_id:
+                            return message_id
+                        return ""
         else:
-            self.ctx.logger.warning("无法解析群号/用户号，回退发视频链接")
+            self.ctx.logger.warning("无法解析群号/用户号，回退 send.custom 发视频")
+
+        # 回退 send.custom 发视频（拿不到 message_id，不撤回）
+        try:
+            ok = await self.ctx.send.custom("videourl", video_url, stream_id)
+            if ok:
+                return ""
+        except Exception as exc:
+            self.ctx.logger.warning("send.custom 发视频异常，回退发链接: %s", exc)
 
         await self.ctx.send.text(video_url, stream_id)
         return ""
