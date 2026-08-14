@@ -3,7 +3,7 @@
   "id": "github.achenjins.runninghub-workflow-adapter",
   "version": "1.0.0",
   "name": "RunningHub 通用工作流插件",
-  "description": "仅适配 NapCat 的 QQ（其余平台未测试，可能用不了）。通过配置适配 RunningHub 的大部分工作流：可配置多个工作流，每个工作流可自由增加输入节点（节点 ID / 字段名 / 默认值），命令、工具与公开 API 三种触发方式，任务完成后自动发送结果，支持自动撤回。",
+  "description": "让 MaiBot 操作你的账号跑 RunningHub 工作流：文生图、图生图、图生视频等等，结果自动发回。支持配置多工作流、工作流自动识别、LLM 提示词扩写与访问控制，仓库内含一个文生图工作流配置教程。仅适配 NapCat 的 QQ 消息平台。",
   "author": {
     "name": "achenjins",
     "url": "https://github.com/achenjins"
