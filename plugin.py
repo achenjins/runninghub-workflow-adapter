@@ -457,6 +457,8 @@ class InputSession:
     # 收集阶段：files=等待文件上传；config=等待用户确认/修改可编辑配置
     phase: str = "files"
     editable_nodes: list[dict[str, str]] = field(default_factory=list)
+    # 触发时的会话上下文（group_id/user_id），提交后用于 NapCat 直发与自动撤回
+    chat_info: dict[str, str] = field(default_factory=dict)
 
 
 class RunningHubGenericPlugin(MaiBotPlugin):
@@ -1147,6 +1149,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 text_node_id=text_node.node_id.strip() if text_node else "",
                 text_field_name=text_node.field_name.strip() if text_node else "",
                 editable_nodes=editable_nodes,
+                chat_info=chat_info,
             )
             key = self._session_key(user_id, stream_id)
             if waiting:
@@ -1260,6 +1263,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         text_node_id: str = "",
         text_field_name: str = "",
         editable_nodes: list[dict[str, str]] | None = None,
+        chat_info: dict[str, str] | None = None,
     ) -> InputSession:
         """创建交互式收集会话（优先按用户、工具路径回退按会话），带超时清理。"""
         key = self._session_key(user_id, stream_id)
@@ -1281,6 +1285,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             text_node_id=text_node_id,
             text_field_name=text_field_name,
             editable_nodes=editable_nodes or [],
+            chat_info=chat_info or {},
         )
         self._input_sessions[key] = session
 
@@ -1502,8 +1507,13 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             )
 
         await self.ctx.send.text(notice, stream_id)
+        # 用触发时的 chat_info 构造扁平 kwargs，_extract_chat_info 能识别，恢复 NapCat 直发与自动撤回
+        kwargs = {
+            "group_id": str(session.chat_info.get("group_id") or ""),
+            "user_id": str(session.chat_info.get("user_id") or ""),
+        }
         result = await self._submit_and_poll(
-            client, session.workflow, session.collected, stream_id, {}
+            client, session.workflow, session.collected, stream_id, kwargs
         )
         if not result["success"]:
             await self.ctx.send.text(result["message"], stream_id)
