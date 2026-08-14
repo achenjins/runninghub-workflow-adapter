@@ -16,15 +16,14 @@ max_wait = 1800
 max_concurrent = 2
 download_timeout = 120
 
-[cleanup]
+[feature]
+# 自动撤回（仅 NapCat / QQ 适配器生效）
 enable = false
 recall_seconds = 90
-
-[detect]
+# 节点识别
 use_llm = true
 model = "utils"
-
-[llm]
+# 提示词扩写
 enhance_model = "utils"
 
 [access]

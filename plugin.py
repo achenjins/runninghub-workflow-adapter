@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 
 from maibot_sdk import (
     API,
@@ -130,10 +130,10 @@ class GenerationSection(PluginConfigBase):
     )
 
 
-class CleanupSection(PluginConfigBase):
-    """发送后自动撤回配置。"""
+class FeatureSection(PluginConfigBase):
+    """可选功能设置（自动撤回 / 节点识别 / 提示词扩写）。"""
 
-    __ui_label__ = "自动撤回"
+    __ui_label__ = "功能设置"
 
     enable: bool = Field(
         default=False,
@@ -146,13 +146,6 @@ class CleanupSection(PluginConfigBase):
         description="图片发送后自动撤回的秒数（0 表示不撤回）",
         json_schema_extra={"label": "撤回延迟（秒）", "hint": "0 表示不撤回"},
     )
-
-
-class DetectSection(PluginConfigBase):
-    """工作流节点识别配置。"""
-
-    __ui_label__ = "节点识别"
-
     use_llm: bool = Field(
         default=True,
         description="用内置 LLM 识别输入节点与配置节点（覆盖任意节点类型，比白名单更准）；失败时自动回退启发式规则",
@@ -161,19 +154,12 @@ class DetectSection(PluginConfigBase):
     model: Literal["utils", "replyer", "planner"] = Field(
         default="utils",
         description="识别使用的模型槽位（utils=通用快模型；replyer=主回复模型；planner=规划快模型）",
-        json_schema_extra={"label": "模型槽位", "hint": "要快选 utils，要效果选 replyer"},
+        json_schema_extra={"label": "识别模型槽位", "hint": "要快选 utils，要效果选 replyer"},
     )
-
-
-class LLMSection(PluginConfigBase):
-    """提示词扩写 LLM 配置。"""
-
-    __ui_label__ = "提示词扩写"
-
     enhance_model: Literal["utils", "replyer", "planner"] = Field(
         default="utils",
         description="扩写使用的模型任务槽位（utils=通用快模型；replyer=主回复模型；planner=规划快模型）",
-        json_schema_extra={"label": "模型槽位", "hint": "要快选 utils，要效果选 replyer"},
+        json_schema_extra={"label": "扩写模型槽位", "hint": "要快选 utils，要效果选 replyer"},
     )
 
 
@@ -328,11 +314,26 @@ class GenericConfig(PluginConfigBase):
     plugin: PluginMetaSection = Field(default_factory=PluginMetaSection)
     server: ServerSection = Field(default_factory=ServerSection)
     generation: GenerationSection = Field(default_factory=GenerationSection)
-    cleanup: CleanupSection = Field(default_factory=CleanupSection)
-    detect: DetectSection = Field(default_factory=DetectSection)
-    llm: LLMSection = Field(default_factory=LLMSection)
+    feature: FeatureSection = Field(default_factory=FeatureSection)
     access: AccessSection = Field(default_factory=AccessSection)
     workflows: WorkflowsSection = Field(default_factory=WorkflowsSection)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _merge_legacy_feature_sections(cls, data: Any) -> Any:
+        """兼容旧配置：把 cleanup / detect / llm 三节合并为 feature 一节。"""
+        if not isinstance(data, dict):
+            return data
+        feature = dict(data.get("feature") or {})
+        for old_key in ("cleanup", "detect", "llm"):
+            old = data.get(old_key)
+            if isinstance(old, dict):
+                for key, value in old.items():
+                    feature.setdefault(key, value)
+        if feature:
+            data = {key: value for key, value in data.items() if key not in ("cleanup", "detect", "llm")}
+            data["feature"] = feature
+        return data
 
     @field_validator("workflows", mode="before")
     @classmethod
@@ -961,7 +962,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         try:
             result = await self.ctx.llm.generate(
                 prompt=prompt_text,
-                model=self.config.llm.enhance_model,
+                model=self.config.feature.enhance_model,
             )
         except Exception as exc:
             self.ctx.logger.warning("LLM 扩写失败，回退原文: %s", exc)
@@ -1773,7 +1774,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                     await self.ctx.send.text("哦不好意思，任务没有返回结果", stream_id)
                 return
 
-            cleanup_cfg = self.config.cleanup
+            cleanup_cfg = self.config.feature
             recall_seconds = cleanup_cfg.recall_seconds
             should_cleanup = bool(cleanup_cfg.enable and recall_seconds and recall_seconds > 0)
 
@@ -2481,7 +2482,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     async def _detect_full(self, workflow_json: dict[str, Any]) -> tuple[list[dict[str, str]], str]:
         """详细识别：LLM 优先（全量提示词），失败回退启发式。"""
-        if self.config.detect.use_llm:
+        if self.config.feature.use_llm:
             llm_nodes = await self._detect_input_nodes_with_llm(workflow_json)
             if llm_nodes is not None:
                 return llm_nodes, "LLM"
@@ -2489,7 +2490,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     async def _detect_key_full(self, workflow_json: dict[str, Any]) -> tuple[list[dict[str, str]], str]:
         """简化识别：LLM 优先（关键节点专用提示词），失败回退启发式。"""
-        if self.config.detect.use_llm:
+        if self.config.feature.use_llm:
             llm_nodes = await self._detect_input_nodes_with_llm(
                 workflow_json, prompt_template=_LLM_DETECT_KEY_PROMPT
             )
@@ -2611,16 +2612,12 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         lines.append(f"max_concurrent = {cfg.generation.max_concurrent}")
         lines.append(f"download_timeout = {cfg.generation.download_timeout}")
         lines.append("")
-        lines.append("[cleanup]")
-        lines.append(f"enable = {'true' if cfg.cleanup.enable else 'false'}")
-        lines.append(f"recall_seconds = {cfg.cleanup.recall_seconds}")
-        lines.append("")
-        lines.append("[detect]")
-        lines.append(f"use_llm = {'true' if cfg.detect.use_llm else 'false'}")
-        lines.append(f"model = {self._toml_string(cfg.detect.model)}")
-        lines.append("")
-        lines.append("[llm]")
-        lines.append(f"enhance_model = {self._toml_string(cfg.llm.enhance_model)}")
+        lines.append("[feature]")
+        lines.append(f"enable = {'true' if cfg.feature.enable else 'false'}")
+        lines.append(f"recall_seconds = {cfg.feature.recall_seconds}")
+        lines.append(f"use_llm = {'true' if cfg.feature.use_llm else 'false'}")
+        lines.append(f"model = {self._toml_string(cfg.feature.model)}")
+        lines.append(f"enhance_model = {self._toml_string(cfg.feature.enhance_model)}")
         lines.append("")
         lines.append("[access]")
         lines.append(f"allow_users = {json.dumps([str(u) for u in cfg.access.allow_users], ensure_ascii=False)}")
@@ -2995,7 +2992,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         try:
             result = await self.ctx.llm.generate(
                 prompt=prompt,
-                model=self.config.detect.model,
+                model=self.config.feature.model,
                 temperature=0.2,
                 max_tokens=1500,
             )
