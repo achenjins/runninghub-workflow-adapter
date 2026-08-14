@@ -474,6 +474,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         self._cache_dir: Path | None = None
         self._workflows: list[WorkflowItemSection] = []
         self._user_requests: dict[str, list[float]] = {}
+        self._task_meta: dict[str, dict[str, str]] = {}
+        self._cancel_choices: dict[str, list[str]] = {}
 
     # ── 工作流配置访问 ────────────────────────────────────────────
 
@@ -623,6 +625,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         self._pending.clear()
         self._recall_tasks.clear()
         self._input_sessions.clear()
+        self._task_meta.clear()
+        self._cancel_choices.clear()
         self._client = None
         self._client_cn = None
         self.ctx.logger.info("通用工作流插件已卸载")
@@ -1162,6 +1166,12 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             self._poll_and_send(task_id, stream_id, client=client, kwargs=kwargs)
         )
         self._pending[task_id] = poll_task
+        self._task_meta[task_id] = {
+            "name": str(workflow.name or workflow.workflow_id),
+            "stream_id": stream_id,
+            "region": str(workflow.region or "overseas").strip(),
+            "user_id": str(kwargs.get("user_id") or ""),
+        }
         return {
             "success": True,
             "task_id": task_id,
@@ -1725,6 +1735,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 await self.ctx.send.text("哦不好意思，处理结果时出了点问题", stream_id)
         finally:
             self._pending.pop(task_id, None)
+            self._task_meta.pop(task_id, None)
             self._semaphore.release()
 
     @staticmethod
@@ -1936,6 +1947,17 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             stream_id = str(message.get("session_id") or message.get("stream_id") or "")
         session = self._find_input_session(user_id, stream_id)
         if session is None:
+            # 检查是否有等待选择的取消任务（/rh中断 后的编号回复）
+            choice_key = user_id or stream_id
+            cancel_tasks = self._cancel_choices.get(choice_key)
+            if cancel_tasks:
+                text = self._extract_text_from_message(message)
+                indices = self._parse_cancel_indices(text, len(cancel_tasks))
+                if indices:
+                    for idx in indices:
+                        await self._cancel_task(cancel_tasks[idx], stream_id)
+                    self._cancel_choices.pop(choice_key, None)
+                    return {"action": "abort"}
             return None
         stream_id = stream_id or session.stream_id
         if session.phase == "config":
@@ -1948,6 +1970,73 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             await self._handle_incoming_files(user_id, stream_id, message)
             return {"action": "abort"}
         return None
+
+    @Command("rh中断", description="中断任务：还在传文件阶段则直接结束；已提交则回复编号取消运行中的任务", pattern=r"^/rh中断")
+    async def handle_rh_cancel(self, **kwargs: Any) -> tuple[bool, str, int]:
+        stream_id = str(kwargs.get("stream_id") or "")
+        allowed, deny_msg = self._check_access_from_kwargs(kwargs)
+        if not allowed:
+            await self.ctx.send.text(deny_msg, stream_id)
+            return True, "", 1
+        user_id = str(kwargs.get("user_id") or "")
+        # 1. 还在输入收集阶段：直接结束会话
+        session = self._find_input_session(user_id, stream_id)
+        if session is not None:
+            key = self._session_key(session.user_id, session.stream_id)
+            self._cancel_input_session(key)
+            await self.ctx.send.text("已中断", stream_id)
+            return True, "", 1
+        # 2. 已提交的任务：列出编号让用户选择
+        tasks = [
+            (tid, meta) for tid, meta in self._task_meta.items()
+            if not user_id or meta.get("user_id") == user_id
+        ]
+        if not tasks:
+            await self.ctx.send.text("当前没有进行中的任务", stream_id)
+            return True, "", 1
+        lines = ["正在运行的任务："]
+        for index, (tid, meta) in enumerate(tasks, 1):
+            lines.append(f"{index}. {meta.get('name') or tid}")
+        lines.append("回复编号取消（如 1；可多个：1 2）")
+        await self.ctx.send.text("\n".join(lines), stream_id)
+        self._cancel_choices[user_id or stream_id] = [tid for tid, _ in tasks]
+        return True, "", 1
+
+    @staticmethod
+    def _parse_cancel_indices(text: str, count: int) -> list[int]:
+        """解析用户回复的编号（如 1、2、1 2、1,2），返回 0-based 有效编号列表。"""
+        tokens = re.split(r"[\s,，、]+", str(text or "").strip())
+        indices: list[int] = []
+        for token in tokens:
+            if not token.isdigit():
+                continue
+            idx = int(token)
+            if 1 <= idx <= count and idx - 1 not in indices:
+                indices.append(idx - 1)
+        return indices
+
+    async def _cancel_task(self, task_id: str, stream_id: str) -> None:
+        """取消 RunningHub 任务并停止本地轮询。"""
+        meta = self._task_meta.get(task_id) or {}
+        name = meta.get("name") or task_id
+        region = str(meta.get("region") or "overseas").strip()
+        client = self._get_client(region)
+        if client is None:
+            self._rebuild_client()
+            client = self._get_client(region)
+        if client is not None:
+            try:
+                result = await client.cancel(task_id)
+                code = result.get("code")
+                if code not in (0, 200, None):
+                    raise RunningHubError(str(result.get("msg") or result.get("message") or result))
+            except Exception as exc:
+                self.ctx.logger.error("取消任务 %s 失败: %s", task_id, exc)
+        poll_task = self._pending.pop(task_id, None)
+        if poll_task is not None:
+            poll_task.cancel()
+        self._task_meta.pop(task_id, None)
+        await self.ctx.send.text(f"已取消任务：{name}", stream_id)
 
     @HookHandler(
         "chat.receive.after_process",

@@ -129,6 +129,21 @@ class RunningHubClient:
         """
         return await self._post("/openapi/v2/query", {"taskId": str(task_id)})
 
+    async def cancel(self, task_id: str) -> dict[str, Any]:
+        """取消任务（POST /task/openapi/cancel）。
+
+        Args:
+            task_id: 要取消的任务 ID。
+
+        Returns:
+            dict: 原始响应，code 为 0/200 表示取消成功。
+        """
+        payload = {
+            "apiKey": self.api_key,
+            "taskId": str(task_id),
+        }
+        return await self._post("/task/openapi/cancel", payload)
+
     async def download_base64(self, url: str) -> str:
         """下载图片并以 base64 字符串返回（供 send.image 使用）。"""
         content = await self.download_bytes(url)
