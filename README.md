@@ -1,6 +1,6 @@
 # RunningHub 通用工作流插件
 
-![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![running](https://count.kjchmc.cn/get/@rhaajinse?theme=gelbooru) ![Version](https://img.shields.io/badge/version-1.0.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-NapCat%20%2F%20QQ-orange)
 
