@@ -543,6 +543,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 "user_id 填当前消息发送者的 QQ 号：先调用 find_user_qq_id 工具（msg_id 填当前消息的 ID）查出发送者 QQ 号，把返回的纯数字 QQ 号填入本参数，不要填显示名或脑补数字。"
                 "只在用户明确要求生成图片/视频时才调用。"
                 "调用后立即返回任务已提交，生成结果会异步自动发送到会话，你无需等待或轮询。"
+                "若返回 success=false（例如无权限、工作流不存在、提交失败），把返回的 message 原文如实回复给用户"
+                "（无权限时就说「你没有权限生成哦」），不要假装任务已提交或编造成功。"
             )
             metadata["description"] = description
             metadata["brief_description"] = description
@@ -1081,41 +1083,14 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     ) -> dict[str, Any]:
         """查找工作流，构建节点参数，提交任务或进入交互式收集。"""
         stream_id = str(kwargs.pop("stream_id", "") or "")
-        # ── 临时诊断：完整 dump 调用来源与 message，确认 user_id 到底在哪个字段 ──
-        try:
-            import traceback as _tb
-            _caller = ""
-            for _frame in reversed(_tb.extract_stack()):
-                _fname = _frame.name
-                if "handle_" in _fname or "run_workflow" in _fname or "pao_tu" in _fname:
-                    _caller = _fname
-                    break
-            self.ctx.logger.info(
-                "[入口诊断] caller=%s stream_id=%r kwargs=%s",
-                _caller, stream_id, json.dumps(kwargs, ensure_ascii=False, default=str)[:2000],
-            )
-            _msg = kwargs.get("message")
-            if isinstance(_msg, dict):
-                self.ctx.logger.info(
-                    "[入口诊断] message=%s",
-                    json.dumps(_msg, ensure_ascii=False, default=str)[:3000],
-                )
-            else:
-                self.ctx.logger.info("[入口诊断] message=%r", _msg)
-        except Exception as _exc:
-            self.ctx.logger.info("[入口诊断] 打印失败: %r", _exc)
         chat_info = self._extract_chat_info(kwargs)
         group_id = str(chat_info.get("group_id") or "")
-        # 命令路径会注入 user_id；LLM 工具路径只有 stream_id + message，
-        # 这里回退到从 message 里提取的用户，避免空 user_id 被 allow_users 白名单误拒。
+        # 命令路径由宿主注入 user_id；工具路径由 LLM 经 find_user_qq_id 查询后填入。
+        # 这里统一优先取 kwargs["user_id"]，再回退到 message 里提取的发送者，避免被白名单误拒。
         user_id = str(kwargs.get("user_id") or chat_info.get("user_id") or "")
-        # 回填 kwargs，保证下游（任务元信息 / 撤回 / 中断权限）在工具路径也能拿到正确用户
+        # 回填 kwargs，保证下游（任务元信息 / 撤回 / 中断权限）能拿到正确用户
         kwargs["user_id"] = user_id
         kwargs["group_id"] = group_id
-        self.ctx.logger.info(
-            "[权限诊断] stream_id=%r user_id=%r group_id=%r chat_info=%r allow_users=%r",
-            stream_id, user_id, group_id, chat_info, self.config.access.allow_users,
-        )
         allowed, deny_msg = self._check_access(user_id, group_id)
         if not allowed:
             return {"success": False, "message": deny_msg}
@@ -3036,6 +3011,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             "workflow_name 必须从描述中列出的名称里精确选一个；prompt 填用户想要生成的内容（从用户原话提取，不要脑补）。"
             "user_id 填当前消息发送者的 QQ 号：先调用 find_user_qq_id 工具（msg_id 填当前消息的 ID）查出发送者 QQ 号，把返回的纯数字 QQ 号填入本参数，不要填显示名或脑补数字。"
             "调用后立即返回任务已提交，生成结果会异步自动发送到会话，你无需等待或轮询。"
+            "若返回 success=false（例如无权限、工作流不存在、提交失败），把返回的 message 原文如实回复给用户"
+            "（无权限时就说「你没有权限生成哦」），不要假装任务已提交或编造成功。"
         ),
         parameters=[
             ToolParameterInfo(
