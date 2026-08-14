@@ -1874,7 +1874,16 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         return ""
 
     async def _send_video_with_id(self, video_url: str, stream_id: str, *, chat_info: dict) -> str:
-        """通过 NapCat 适配器直发视频（file 填 URL，NapCat 自行下载）；失败回退发链接。"""
+        """优先用 send.custom 发视频（只需 stream_id）；失败回退 NapCat 直发或发链接。"""
+        # 优先用 send.custom：只需 stream_id，MaiBot 自动路由到平台/会话
+        try:
+            ok = await self.ctx.send.custom("video", video_url, stream_id)
+            self.ctx.logger.info("[视频发送] send.custom('video') 返回=%r", ok)
+            if ok:
+                return ""
+        except Exception as exc:
+            self.ctx.logger.warning("[视频发送] send.custom 异常: %s", exc)
+
         group_id = str(chat_info.get("group_id") or "")
         user_id = str(chat_info.get("user_id") or "")
 
