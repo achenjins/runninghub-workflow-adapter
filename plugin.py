@@ -1090,8 +1090,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                     _caller = _fname
                     break
             self.ctx.logger.info(
-                "[入口诊断] caller=%s stream_id=%r kwargs_keys=%s",
-                _caller, stream_id, sorted(kwargs.keys()),
+                "[入口诊断] caller=%s stream_id=%r kwargs=%s",
+                _caller, stream_id, json.dumps(kwargs, ensure_ascii=False, default=str)[:2000],
             )
             _msg = kwargs.get("message")
             if isinstance(_msg, dict):
