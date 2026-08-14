@@ -16,7 +16,7 @@
 - 命令：``/识别国内工作流 <工作流ID>`` / ``/识别国外工作流 <工作流ID>`` 识别关键节点（分别配置区域）
 - 命令：``/详细识别国内工作流 <工作流ID>`` / ``/详细识别国外工作流 <工作流ID>`` LLM 详细识别全部节点
 - 工具：``run_workflow``（供 LLM 调用）
-- API：``run_workflow``（public，供其他插件调用）
+- API：``run_workflow_api``（public，供其他插件调用）
 """
 
 from __future__ import annotations
@@ -3107,7 +3107,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             ),
         }
 
-    @API("run_workflow", description="运行配置好的 RunningHub 工作流", version="1", public=True)
+    @API("run_workflow_api", description="运行配置好的 RunningHub 工作流", version="1", public=True)
     async def handle_run_workflow_api(
         self,
         workflow_name: str,
