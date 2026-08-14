@@ -540,6 +540,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 "运行仅支持自然语言调用的 RunningHub 工作流（文生图/文生视频等只有提示词输入的工作流）。"
                 f"当前支持的工作流名称：{name_list}。"
                 "workflow_name 必须从上述名称中精确选一个；prompt 填用户描述的内容（从用户原话提取，不要脑补）。"
+                "user_id 填当前消息发送者的 QQ 号（从对话上下文里找，找不到就留空，不要脑补）。"
                 "只在用户明确要求生成图片/视频时才调用。"
                 "调用后立即返回任务已提交，生成结果会异步自动发送到会话，你无需等待或轮询。"
             )
@@ -3033,6 +3034,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             "运行配置好的 RunningHub 工作流，提交提示词并生成结果（文生图/文生视频等）。"
             "仅支持「只有提示词输入、无图片/音频/视频/配置输入」的工作流；可用工作流名称会动态注入到本工具描述中。"
             "workflow_name 必须从描述中列出的名称里精确选一个；prompt 填用户想要生成的内容（从用户原话提取，不要脑补）。"
+            "user_id 填当前消息发送者的 QQ 号（从对话上下文里找，找不到就留空，不要脑补）。"
             "调用后立即返回任务已提交，生成结果会异步自动发送到会话，你无需等待或轮询。"
         ),
         parameters=[
@@ -3050,21 +3052,25 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 default="",
             ),
             ToolParameterInfo(
-                name="stream_id",
+                name="user_id",
                 param_type=ToolParamType.STRING,
-                description="当前聊天流 ID，结果会发送到该会话",
-                required=True,
+                description="当前消息发送者的 QQ 号（用于权限校验）",
+                required=False,
+                default="",
             ),
         ],
     )
     async def handle_run_workflow(
         self,
         workflow_name: str,
-        stream_id: str = "",
         prompt: str = "",
+        user_id: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
+        # 工具调用时宿主通过 kwargs 提供 chat_id（真实流 ID）；LLM 填的 stream_id 不可靠，故用 chat_id
+        stream_id = str(kwargs.get("chat_id") or kwargs.get("stream_id") or "")
         kwargs["stream_id"] = stream_id
+        kwargs["user_id"] = str(user_id or "").strip()
         workflow_name = str(workflow_name or "").strip()
         names = self._llm_callable_workflow_names()
         if not workflow_name:
