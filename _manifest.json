@@ -35,7 +35,9 @@
     "send.image",
     "send.custom",
     "api.call",
-    "llm.generate"
+    "llm.generate",
+    "maisaka.context.append",
+    "maisaka.proactive.trigger"
   ],
   "i18n": {
     "default_locale": "zh-CN",

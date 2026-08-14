@@ -1802,10 +1802,28 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                         )
                         if should_cleanup and message_id:
                             self._schedule_recall(message_id, recall_seconds)
+                        # 追加到 LLM 聊天上下文：让 LLM 能看到并记住自己生成的图片
+                        await self._append_result_to_llm_context(
+                            stream_id,
+                            [{"type": "image", "binary_data_base64": image_base64, "description": "RunningHub 生成结果"}],
+                            visible_text="[生成结果] 图片已生成",
+                            intent=(
+                                "你之前通过工具生成的图片已经完成并发送给用户。"
+                                "请结合上下文简短地向用户确认结果（例如「发好了，看看喜欢不喜欢」）；"
+                                "如果你正在角色扮演，请用角色口吻自然地提一句自己刚生成了这张图。"
+                            ),
+                        )
                 elif self._is_video_url(url) and stream_id:
                     video_message_id = await self._send_video_with_id(url, stream_id, chat_info=chat_info)
                     if should_cleanup and video_message_id:
                         self._schedule_recall(video_message_id, recall_seconds)
+                    # 视频无法直接给 LLM 看，追加链接文本，让 LLM 知道生成了什么
+                    await self._append_result_to_llm_context(
+                        stream_id,
+                        [{"type": "text", "data": url}],
+                        visible_text=f"[生成结果] 视频已生成：{url}",
+                        intent="你之前通过工具生成的视频已经完成并发送给用户，请结合上下文简短地向用户确认结果。",
+                    )
                 elif stream_id:
                     await self.ctx.send.text(f"任务结果 {index + 1}：{url}", stream_id)
         except asyncio.CancelledError:
@@ -1819,6 +1837,39 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             self._pending.pop(task_id, None)
             self._task_meta.pop(task_id, None)
             self._semaphore.release()
+
+    async def _append_result_to_llm_context(
+        self, stream_id: str, segments: list[dict[str, Any]], visible_text: str, intent: str = ""
+    ) -> None:
+        """把生成结果追加到 LLM 聊天上下文，并可选触发 LLM 主动处理一轮。
+
+        走 Maisaka 的 context.append（纯记忆，不会重复发送给用户）；
+        intent 非空时再走 proactive.trigger，让 LLM 主动向用户确认结果
+        （普通场景提醒「发好了」，角色扮演场景可用角色口吻提一句）。
+        失败时静默降级，不影响结果正常发送。
+        """
+        if not stream_id:
+            return
+        try:
+            maisaka = getattr(self.ctx, "maisaka", None)
+            if maisaka is None:
+                return
+            if hasattr(maisaka, "context"):
+                await maisaka.context.append(
+                    stream_id,
+                    segments,
+                    visible_text=visible_text,
+                    source_kind="runninghub_result",
+                )
+            if intent and hasattr(maisaka, "proactive"):
+                await maisaka.proactive.trigger(
+                    stream_id,
+                    intent=intent,
+                    reason="RunningHub 生成结果已发送",
+                    priority="low",
+                )
+        except Exception as exc:
+            self.ctx.logger.warning("追加生成结果到 LLM 上下文失败: %s", exc)
 
     @staticmethod
     def _is_image_url(url: str) -> bool:
