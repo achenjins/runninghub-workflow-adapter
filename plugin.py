@@ -1088,6 +1088,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         # 回填 kwargs，保证下游（任务元信息 / 撤回 / 中断权限）在工具路径也能拿到正确用户
         kwargs["user_id"] = user_id
         kwargs["group_id"] = group_id
+        self.ctx.logger.info(
+            "[权限诊断] stream_id=%r user_id=%r group_id=%r chat_info=%r allow_users=%r",
+            stream_id, user_id, group_id, chat_info, self.config.access.allow_users,
+        )
         allowed, deny_msg = self._check_access(user_id, group_id)
         if not allowed:
             return {"success": False, "message": deny_msg}
@@ -3037,6 +3041,23 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         prompt: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
+        # ── 临时诊断：确认工具调用时能否拿到用户身份 ──
+        self.ctx.logger.info(
+            "[工具诊断] stream_id=%r prompt_len=%d kwargs_keys=%s",
+            stream_id, len(str(prompt or "")), sorted(kwargs.keys()),
+        )
+        message = kwargs.get("message")
+        if isinstance(message, dict):
+            info = message.get("message_info") or {}
+            self.ctx.logger.info(
+                "[工具诊断] message_keys=%s message_info_keys=%s user_info=%r group_info=%r",
+                sorted(message.keys()),
+                sorted(info.keys()) if isinstance(info, dict) else info,
+                info.get("user_info") if isinstance(info, dict) else None,
+                info.get("group_info") if isinstance(info, dict) else None,
+            )
+        else:
+            self.ctx.logger.info("[工具诊断] message=%r", message)
         kwargs["stream_id"] = stream_id
         workflow_name = str(workflow_name or "").strip()
         names = self._llm_callable_workflow_names()
