@@ -1783,7 +1783,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                         if should_cleanup and message_id:
                             self._schedule_recall(message_id, recall_seconds)
                 elif self._is_video_url(url) and stream_id:
-                    await self._send_video_with_id(url, stream_id, chat_info=chat_info)
+                    video_message_id = await self._send_video_with_id(url, stream_id, chat_info=chat_info)
+                    if should_cleanup and video_message_id:
+                        self._schedule_recall(video_message_id, recall_seconds)
                 elif stream_id:
                     await self.ctx.send.text(f"任务结果 {index + 1}：{url}", stream_id)
         except asyncio.CancelledError:
@@ -1858,10 +1860,31 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         return None
 
     async def _send_image_with_id(self, image_base64: str, stream_id: str, *, chat_info: dict) -> str:
-        """通过 NapCat 适配器直发图片并返回平台 message_id（用于撤回）。
+        """发送图片并尽量返回平台 message_id（用于撤回）。
 
-        优先走 send_group_msg / send_private_msg；失败时回退 ctx.send.image。
+        优先走 send.image(return_details=True)；失败回退 NapCat 直发，再失败回退通用发送。
         """
+        # 1. 优先 send.image 拿 message_id（走 MaiBot 抽象层，更跨平台）
+        try:
+            result = await self.ctx.send.image(image_base64, stream_id, return_details=True)
+        except Exception as exc:
+            result = None
+            self.ctx.logger.warning("send.image 异常，回退 NapCat 直发: %s", exc)
+        if isinstance(result, dict):
+            if result.get("sent") is False:
+                self.ctx.logger.warning("send.image 发送失败，回退 NapCat 直发")
+            else:
+                message_id = str(result.get("message_id") or "").strip()
+                if message_id:
+                    return message_id
+                self.ctx.logger.warning("send.image 未返回 message_id，无法撤回")
+                return ""
+        elif result is False:
+            self.ctx.logger.warning("send.image 返回 False，回退 NapCat 直发")
+        elif result is True:
+            return ""
+
+        # 2. 回退 NapCat 直发
         group_id = str(chat_info.get("group_id") or "")
         user_id = str(chat_info.get("user_id") or "")
 
@@ -1914,15 +1937,30 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         return ""
 
     async def _send_video_with_id(self, video_url: str, stream_id: str, *, chat_info: dict) -> str:
-        """优先用 send.custom 发视频（只需 stream_id）；失败回退 NapCat 直发或发链接。"""
-        # 优先用 send.custom：只需 stream_id，MaiBot 自动路由到平台/会话
-        try:
-            ok = await self.ctx.send.custom("videourl", video_url, stream_id)
-            if ok:
-                return ""
-        except Exception as exc:
-            self.ctx.logger.warning("send.custom 发视频异常，回退直发: %s", exc)
+        """发送视频并尽量返回平台 message_id（用于撤回）。
 
+        优先 send.custom 发视频；失败回退 NapCat 直发，再失败发链接。
+        """
+        # 1. 优先 send.custom 拿 message_id
+        try:
+            result = await self.ctx.send.custom("videourl", video_url, stream_id, return_details=True)
+        except Exception as exc:
+            result = None
+            self.ctx.logger.warning("send.custom 发视频异常，回退直发: %s", exc)
+        if isinstance(result, dict):
+            if result.get("sent") is False:
+                self.ctx.logger.warning("send.custom 发视频失败，回退 NapCat 直发")
+            else:
+                message_id = str(result.get("message_id") or "").strip()
+                if message_id:
+                    return message_id
+                return ""
+        elif result is False:
+            self.ctx.logger.warning("send.custom 发视频返回 False，回退 NapCat 直发")
+        elif result is True:
+            return ""
+
+        # 2. 回退 NapCat 直发
         group_id = str(chat_info.get("group_id") or "")
         user_id = str(chat_info.get("user_id") or "")
 
