@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "plugin_type": "media",
   "id": "github.achenjins.runninghub-workflow-adapter",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "name": "麦麦画师 · RunningHub",
   "description": "让麦麦亲手给你画画：从一句话文生图，到多参考图 / 视频生成，统统自动完成并把成品发回聊天。支持自定义工作流、自己优化成本、AI 扩写提示词和限流防刷。仅适配 NapCat / QQ。",
   "author": {
