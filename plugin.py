@@ -486,6 +486,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         self._pending: dict[str, asyncio.Task] = {}
         self._recall_tasks: set[asyncio.Task] = set()
         self._input_sessions: dict[str, InputSession] = {}
+        self._input_session_keys_by_stream: dict[str, set[str]] = {}
+        self._input_session_keys_by_user: dict[str, set[str]] = {}
+        self._config_write_lock: asyncio.Lock = asyncio.Lock()
         self._cleanup_task: asyncio.Task | None = None
         self._cache_dir: Path | None = None
         self._workflows: list[WorkflowItemSection] = []
@@ -677,6 +680,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         self._pending.clear()
         self._recall_tasks.clear()
         self._input_sessions.clear()
+        self._input_session_keys_by_stream.clear()
+        self._input_session_keys_by_user.clear()
         self._task_meta.clear()
         self._cancel_choices.clear()
         self._client = None
@@ -686,20 +691,22 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         if scope != CONFIG_RELOAD_SCOPE_SELF:
             return
-        # 关键：先用最新配置数据更新强类型配置实例。否则 self.config 仍是旧值，
-        # 下面 _refresh_workflows 读到的设备类型（instance_type）等字段不会热更新。
-        self.set_plugin_config(config_data)
-        self._rebuild_client()
-        self._semaphore = asyncio.Semaphore(max(1, self.config.generation.max_concurrent))
-        self._refresh_workflows()
-        self._validate_workflows()
-        self.ctx.logger.info(
-            "插件配置已热更新: version=%s 工作流数量=%d",
-            version,
-            len(self._workflows),
-        )
-        for line in self._describe_workflows():
-            self.ctx.logger.info("[配置] %s", line)
+        # 识别命令写盘触发的文件监听回调会和这里的更新并发，统一用锁串行化
+        async with self._config_write_lock:
+            # 关键：先用最新配置数据更新强类型配置实例。否则 self.config 仍是旧值，
+            # 下面 _refresh_workflows 读到的设备类型（instance_type）等字段不会热更新。
+            self.set_plugin_config(config_data)
+            self._rebuild_client()
+            self._semaphore = asyncio.Semaphore(max(1, self.config.generation.max_concurrent))
+            self._refresh_workflows()
+            self._validate_workflows()
+            self.ctx.logger.info(
+                "插件配置已热更新: version=%s 工作流数量=%d",
+                version,
+                len(self._workflows),
+            )
+            for line in self._describe_workflows():
+                self.ctx.logger.info("[配置] %s", line)
 
     # ── 缓存清理 ──────────────────────────────────────────────────
 
@@ -920,6 +927,13 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         """返回所有主提示词节点（prompt 类型，最多允许一个）。"""
         return [n for n in self._ordered_nodes(workflow) if self._resolve_value_type(n) == "prompt"]
 
+    def _first_prompt_node(self, workflow: WorkflowItemSection) -> InputNodeSection | None:
+        """返回第一个 prompt 节点（用户文本/扩写结果的回填目标，不关心是否有默认值）。"""
+        for node in self._ordered_nodes(workflow):
+            if self._resolve_value_type(node) == "prompt":
+                return node
+        return None
+
     def _primary_prompt_node(self, workflow: WorkflowItemSection) -> InputNodeSection | None:
         """返回第一个无默认值的主提示词节点（接收命令/扩写文本的节点）。"""
         for node in self._ordered_nodes(workflow):
@@ -934,11 +948,14 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         field_name: str,
         text: str,
     ) -> list[dict[str, str]]:
-        """回填文字节点的 fieldValue。"""
+        """回填文字节点的 fieldValue；列表中不存在该节点时追加（如交互补充的描述）。"""
         for entry in node_info_list:
             if entry.get("nodeId") == node_id and entry.get("fieldName") == field_name:
                 entry["fieldValue"] = text
-                break
+                return node_info_list
+        node_info_list.append(
+            {"nodeId": node_id, "fieldName": field_name, "fieldValue": text}
+        )
         return node_info_list
 
     async def _enhance_text(
@@ -1010,7 +1027,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         """构建 nodeInfoList 并返回需要等待用户输入的节点列表。
 
         规则（新节点类型语义）：
-        - prompt：主提示词，接收命令/扩写文本（有默认值时用默认值），仅第一个生效
+        - prompt：主提示词，优先使用命令/扩写文本；没有输入时回退节点默认值；仅第一个接收文本
         - text：可编辑配置，先用默认值（可为空），上传文件后询问用户修改
         - default：固定默认值，不询问；无默认值时跳过
         - image / audio：有默认值直接使用；无默认值按顺序等待上传
@@ -1032,18 +1049,19 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             field_name = node.field_name.strip() or "prompt"
 
             if vtype == "prompt":
-                # 主提示词：有默认值用默认值，否则接收命令/扩写文本（仅第一个生效）
-                if field_value:
-                    node_info_list.append(
-                        {"nodeId": node_id, "fieldName": field_name, "fieldValue": field_value}
-                    )
-                elif not text_filled and text_to_fill:
+                # 主提示词：用户输入/扩写文本优先，没有输入时回退到节点默认值；
+                # 文本只填第一个 prompt 节点，后续 prompt 节点按默认值处理。
+                if not text_filled and text_to_fill:
                     node_info_list.append(
                         {"nodeId": node_id, "fieldName": field_name, "fieldValue": text_to_fill}
                     )
                     text_filled = True
+                elif field_value:
+                    node_info_list.append(
+                        {"nodeId": node_id, "fieldName": field_name, "fieldValue": field_value}
+                    )
                 else:
-                    self.ctx.logger.info("主提示词节点 %s 未接收文本，已跳过", node_id)
+                    self.ctx.logger.info("主提示词节点 %s 未接收文本且无默认值，已跳过", node_id)
                 continue
 
             if vtype == "text":
@@ -1105,6 +1123,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     ) -> dict[str, Any]:
         """查找工作流，构建节点参数，提交任务或进入交互式收集。"""
         stream_id = str(kwargs.pop("stream_id", "") or "")
+        command_text = str(command_text or "").strip()
         chat_info = self._extract_chat_info(kwargs)
         group_id = str(chat_info.get("group_id") or "")
         # 命令路径由宿主注入 user_id；工具路径由 LLM 经 find_user_qq_id 查询后填入。
@@ -1149,13 +1168,52 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             }
 
         text_node = self._primary_prompt_node(workflow)
+        text_target = self._first_prompt_node(workflow)
         editable_nodes = self._editable_config_nodes(workflow)
+        # 存在无默认值的 prompt 节点且用户没给描述：不能直接提交，先交互收集描述
+        missing_prompt_text = bool(text_node is not None and not command_text)
+        # 会话中需要回填文字的目标节点：给了文本或需要补文本时才记录
+        session_text_node = text_target if (command_text or missing_prompt_text) else None
 
         # 先用原始文本构建节点参数（文字节点暂填原文，扩写见下）
         node_info_list, waiting = self._build_node_info_list(workflow, command_text)
 
-        if not node_info_list and not waiting and not editable_nodes:
+        if not node_info_list and not waiting and not editable_nodes and not missing_prompt_text:
             return {"success": False, "message": f"工作流「{workflow.name}」未配置任何输入节点"}
+
+        if missing_prompt_text:
+            # 有文件先收文件（收完再问描述）；没有文件则直接进入描述输入阶段
+            session = self._create_input_session(
+                user_id=user_id,
+                stream_id=stream_id,
+                workflow=workflow,
+                waiting_nodes=waiting,
+                collected=node_info_list,
+                command_text=command_text,
+                text_node_id=session_text_node.node_id.strip() if session_text_node else "",
+                text_field_name=session_text_node.field_name.strip() if session_text_node else "",
+                editable_nodes=editable_nodes,
+                chat_info=chat_info,
+                phase="files" if waiting else "text",
+            )
+            if waiting:
+                tips = self._build_waiting_tips(waiting)
+                required_files = [
+                    {"type": item["value_type"], "label": item["label"]}
+                    for item in waiting
+                ]
+                return {
+                    "success": True,
+                    "waiting": True,
+                    "required_files": required_files,
+                    "message": f"请上传：{tips}（可只传部分，发「跳过剩余」直接开始；上传后还需补充描述文本）",
+                }
+            return {
+                "success": True,
+                "waiting": True,
+                "required_files": [],
+                "message": f"工作流「{workflow.name}」需要描述文本，请直接发送要生成的内容",
+            }
 
         if waiting or editable_nodes:
             # 固定流程：有文件先收文件，收完（或直接）进入可编辑配置确认
@@ -1166,8 +1224,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 waiting_nodes=waiting,
                 collected=node_info_list,
                 command_text=command_text,
-                text_node_id=text_node.node_id.strip() if text_node else "",
-                text_field_name=text_node.field_name.strip() if text_node else "",
+                text_node_id=session_text_node.node_id.strip() if session_text_node else "",
+                text_field_name=session_text_node.field_name.strip() if session_text_node else "",
                 editable_nodes=editable_nodes,
                 chat_info=chat_info,
             )
@@ -1188,13 +1246,13 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             await self._ask_config_edit(session, stream_id)
             return {"success": True, "waiting": True, "required_files": [], "message": "请确认配置"}
 
-        # 无文件、无可编辑配置：立即扩写并回填文字节点
-        if text_node and workflow.llm_enhance:
+        # 无文件、无可编辑配置：立即扩写并回填文字节点（用户输入优先，目标为第一个 prompt 节点）
+        if command_text and text_target and workflow.llm_enhance:
             enhanced_text = await self._enhance_text(workflow, command_text)
             self._patch_text_value(
                 node_info_list,
-                text_node.node_id.strip(),
-                text_node.field_name.strip(),
+                text_target.node_id.strip(),
+                text_target.field_name.strip(),
                 enhanced_text,
             )
 
@@ -1293,9 +1351,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         text_field_name: str = "",
         editable_nodes: list[dict[str, str]] | None = None,
         chat_info: dict[str, str] | None = None,
+        phase: str = "files",
     ) -> InputSession:
-        """创建交互式收集会话（优先按用户、工具路径回退按会话），带超时清理。"""
-        key = self._session_key(user_id, stream_id)
+        """创建交互式收集会话（同一用户可在不同会话各有一份，工具路径回退按 stream 定位）。"""
         session = InputSession(
             user_id=user_id,
             stream_id=stream_id,
@@ -1315,13 +1373,14 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             text_field_name=text_field_name,
             editable_nodes=editable_nodes or [],
             chat_info=chat_info or {},
+            phase=phase,
         )
-        self._input_sessions[key] = session
+        key = self._register_input_session(session)
 
         async def _expire() -> None:
             await asyncio.sleep(_INPUT_WAIT_TIMEOUT)
             if self._input_sessions.get(key) is session:
-                self._input_sessions.pop(key, None)
+                self._remove_input_session(key)
                 if stream_id:
                     try:
                         await self.ctx.send.text("输入等待已超时，本次任务已取消", stream_id)
@@ -1333,17 +1392,85 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     @staticmethod
     def _session_key(user_id: str, stream_id: str) -> str:
-        """会话键：优先用 user_id（保证群聊中仅触发者可上传），工具路径无 user_id 时退回 stream_id。"""
-        return str(user_id or "").strip() or str(stream_id or "").strip()
+        """会话键：user_id + stream_id 共同区分，避免同用户跨会话、同群多用户互相覆盖。"""
+        uid = str(user_id or "").strip()
+        sid = str(stream_id or "").strip()
+        if uid and sid:
+            return f"{uid}:{sid}"
+        if sid:
+            return f"stream:{sid}"
+        if uid:
+            return f"user:{uid}"
+        return "anonymous"
+
+    def _register_input_session(self, session: InputSession) -> str:
+        """把会话写入主表与 user/stream 索引，返回会话键。"""
+        key = self._session_key(session.user_id, session.stream_id)
+        old_session = self._input_sessions.get(key)
+        if old_session is not None and old_session is not session and old_session.expire_task is not None:
+            old_session.expire_task.cancel()
+        # 重新插入以更新注册顺序，保证“最近会话”回退按最新触发优先
+        self._input_sessions.pop(key, None)
+        self._input_sessions[key] = session
+        if session.stream_id:
+            self._input_session_keys_by_stream.setdefault(session.stream_id, set()).add(key)
+        if session.user_id:
+            self._input_session_keys_by_user.setdefault(session.user_id, set()).add(key)
+        return key
+
+    def _remove_input_session(self, key: str) -> InputSession | None:
+        """从主表与索引中删除会话，保持三张表一致。"""
+        session = self._input_sessions.pop(key, None)
+        if session is None:
+            return None
+        if session.stream_id:
+            stream_keys = self._input_session_keys_by_stream.get(session.stream_id)
+            if stream_keys is not None:
+                stream_keys.discard(key)
+                if not stream_keys:
+                    self._input_session_keys_by_stream.pop(session.stream_id, None)
+        if session.user_id:
+            user_keys = self._input_session_keys_by_user.get(session.user_id)
+            if user_keys is not None:
+                user_keys.discard(key)
+                if not user_keys:
+                    self._input_session_keys_by_user.pop(session.user_id, None)
+        return session
+
+    def _latest_session_for_keys(self, keys: set[str]) -> InputSession | None:
+        """从会话键集合中返回最近注册的会话（注册顺序，避免同秒时间戳不稳定）。"""
+        for key in reversed(self._input_sessions):
+            if key in keys:
+                return self._input_sessions[key]
+        return None
 
     def _find_input_session(self, user_id: str, stream_id: str) -> InputSession | None:
-        """按 user_id 或 stream_id 查找进行中的输入收集会话。"""
+        """按 user_id + stream_id 精确查找；降级时不得跨用户取同群其他人的会话。"""
         user_id = str(user_id or "").strip()
         stream_id = str(stream_id or "").strip()
-        if user_id and user_id in self._input_sessions:
-            return self._input_sessions[user_id]
-        if stream_id and stream_id in self._input_sessions:
-            return self._input_sessions[stream_id]
+
+        if user_id and stream_id:
+            session = self._input_sessions.get(self._session_key(user_id, stream_id))
+            if session is not None:
+                return session
+            # 该流里存在匿名会话（工具/API 路径创建）时允许按 stream 命中；
+            # 否则不跨会话/跨用户回退，避免把文件误投到其他会话
+            anonymous_key = f"stream:{stream_id}"
+            if anonymous_key in self._input_sessions:
+                return self._input_sessions[anonymous_key]
+            return None
+        if stream_id:
+            stream_keys = self._input_session_keys_by_stream.get(stream_id)
+            if stream_keys:
+                # 工具路径创建的匿名流会话优先精确命中
+                anonymous_key = f"stream:{stream_id}"
+                if anonymous_key in stream_keys:
+                    return self._input_sessions.get(anonymous_key)
+                return self._latest_session_for_keys(stream_keys)
+        if user_id:
+            user_keys = self._input_session_keys_by_user.get(user_id)
+            if user_keys:
+                return self._latest_session_for_keys(user_keys)
         return None
 
     async def _handle_incoming_files(self, user_id: str, stream_id: str, message: dict) -> bool:
@@ -1446,7 +1573,14 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         client: RunningHubClient,
         notice: str,
     ) -> None:
-        """文件收集结束后：有可编辑配置则进入确认阶段，否则直接提交。"""
+        """文件/描述收集结束后：需要描述先问描述，再有可编辑配置则进入确认，否则提交。"""
+        if not session.command_text and session.text_node_id:
+            session.phase = "text"
+            await self.ctx.send.text(
+                f"{notice}。请补充描述文本（将填入提示词节点，直接发送文字即可）：",
+                stream_id,
+            )
+            return
         if session.editable_nodes:
             await self._ask_config_edit(session, stream_id, notice)
             return
@@ -1477,6 +1611,42 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             else:
                 values.append(token)
         return values
+
+    async def _handle_text_input(self, session: InputSession, stream_id: str, message: dict) -> None:
+        """处理描述文本输入阶段：文本写入命令文本，然后继续配置确认或提交。"""
+        text = self._extract_text_from_message(message).strip()
+        if not text:
+            if self._extract_files_from_message(message):
+                await self.ctx.send.text(
+                    "现在是描述输入阶段，请先发送要生成的内容文字；参考文件等描述确认后再传",
+                    stream_id,
+                )
+            else:
+                await self.ctx.send.text(
+                    "请直接发送要生成的描述文本（例如：一只在窗边的猫）",
+                    stream_id,
+                )
+            return
+        if self._is_finish_signal(text):
+            await self.ctx.send.text(
+                "该工作流需要描述文本才能运行，不能跳过；请直接发送要生成的内容",
+                stream_id,
+            )
+            return
+
+        session.command_text = text
+        region = str(session.workflow.region or "overseas").strip()
+        client = self._get_client(region)
+        if client is None:
+            self._rebuild_client()
+            client = self._get_client(region)
+        if client is None:
+            key = self._session_key(session.user_id, session.stream_id)
+            self._cancel_input_session(key)
+            await self.ctx.send.text("插件客户端未初始化，已取消本次任务", stream_id)
+            return
+        key = self._session_key(session.user_id, session.stream_id)
+        await self._after_files_collected(session, key, stream_id, client, "描述已更新")
 
     async def _handle_config_edit(self, session: InputSession, stream_id: str, message: dict) -> None:
         """处理可编辑配置的确认/修改回复。"""
@@ -1515,22 +1685,21 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         notice: str,
     ) -> None:
         """提交已收集的输入（会话已从 _input_sessions 移除）。"""
-        self._input_sessions.pop(key, None)
+        self._remove_input_session(key)
         if session.expire_task is not None:
             session.expire_task.cancel()
 
-        # 文字扩写延后到此刻：用实际上传的文件数量重新扩写并回填文字节点
-        if (
-            session.command_text
-            and session.text_node_id
-            and session.workflow.llm_enhance
-        ):
-            actual_desc = self._format_file_counts(
-                session.uploaded_images, session.uploaded_audios, session.uploaded_videos
-            )
-            enhanced = await self._enhance_text(
-                session.workflow, session.command_text, actual_file_desc=actual_desc
-            )
+        # 文字扩写延后到此刻：用实际上传的文件数量重新扩写并回填文字节点；
+        # 交互补充的描述此时可能还没有对应条目，_patch_text_value 会自动追加。
+        if session.command_text and session.text_node_id:
+            enhanced = session.command_text
+            if session.workflow.llm_enhance:
+                actual_desc = self._format_file_counts(
+                    session.uploaded_images, session.uploaded_audios, session.uploaded_videos
+                )
+                enhanced = await self._enhance_text(
+                    session.workflow, session.command_text, actual_file_desc=actual_desc
+                )
             session.collected = self._patch_text_value(
                 session.collected,
                 session.text_node_id,
@@ -1582,7 +1751,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         return True
 
     def _cancel_input_session(self, key: str) -> None:
-        session = self._input_sessions.pop(key, None)
+        session = self._remove_input_session(key)
         if session is not None and session.expire_task is not None:
             session.expire_task.cancel()
 
@@ -1782,8 +1951,18 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                     await self.ctx.send.text("哦不好意思，任务运行失败了", stream_id)
                 return
 
-            urls = [item.get("url") for item in (result.get("results") or []) if isinstance(item, dict) and item.get("url")]
-            if not urls:
+            result_items: list[tuple[str, str]] = []
+            for item in result.get("results") or []:
+                if not isinstance(item, dict):
+                    continue
+                url = str(item.get("url") or item.get("outputUrl") or item.get("fileUrl") or "").strip()
+                if not url:
+                    continue
+                output_type = str(
+                    item.get("outputType") or item.get("fileType") or ""
+                ).strip().lower()
+                result_items.append((url, output_type))
+            if not result_items:
                 if stream_id:
                     await self.ctx.send.text("哦不好意思，任务没有返回结果", stream_id)
                 return
@@ -1793,8 +1972,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             should_cleanup = bool(cleanup_cfg.enable and recall_seconds and recall_seconds > 0)
 
             appended_result = False
-            for index, url in enumerate(urls):
-                if self._is_image_url(url):
+            for index, (url, output_type) in enumerate(result_items):
+                if self._is_image_url(url, output_type):
                     try:
                         image_base64 = await client.download_base64(url)
                     except Exception as exc:
@@ -1811,7 +1990,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                         self.ctx.logger.info(
                             "已发送结果 %d/%d (task_id=%s message_id=%s)",
                             index + 1,
-                            len(urls),
+                            len(result_items),
                             task_id,
                             message_id or "无",
                         )
@@ -1824,7 +2003,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                             visible_text="[生成结果] 图片已生成",
                         )
                         appended_result = True
-                elif self._is_video_url(url) and stream_id:
+                elif self._is_video_url(url, output_type) and stream_id:
                     video_message_id = await self._send_video_with_id(url, stream_id, chat_info=chat_info)
                     if should_cleanup and video_message_id:
                         self._schedule_recall(video_message_id, recall_seconds)
@@ -1902,14 +2081,24 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             self.ctx.logger.warning("触发生成结果确认回复失败: %s", exc)
 
     @staticmethod
-    def _is_image_url(url: str) -> bool:
-        """判断结果 URL 是否指向图片（按扩展名粗判）。"""
+    def _is_image_url(url: str, output_type: str = "") -> bool:
+        """判断结果是否指向图片：优先信 RunningHub 的 outputType，否则按扩展名粗判。"""
+        normalized = str(output_type or "").strip().lower()
+        if normalized in ("image", "png", "jpg", "jpeg", "webp", "gif", "bmp"):
+            return True
+        if normalized in ("video", "mp4", "mov", "webm", "avi", "mkv", "flv", "m4v", "mpg", "mpeg", "3gp", "wmv"):
+            return False
         path = str(url or "").split("?", 1)[0].lower()
         return path.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"))
 
     @staticmethod
-    def _is_video_url(url: str) -> bool:
-        """判断结果 URL 是否指向视频（按扩展名粗判）。"""
+    def _is_video_url(url: str, output_type: str = "") -> bool:
+        """判断结果是否指向视频：优先信 RunningHub 的 outputType，否则按扩展名粗判。"""
+        normalized = str(output_type or "").strip().lower()
+        if normalized in ("video", "mp4", "mov", "webm", "avi", "mkv", "flv", "m4v", "mpg", "mpeg", "3gp", "wmv"):
+            return True
+        if normalized in ("image", "png", "jpg", "jpeg", "webp", "gif", "bmp"):
+            return False
         path = str(url or "").split("?", 1)[0].lower()
         return path.endswith((".mp4", ".mov", ".webm", ".avi", ".mkv", ".flv", ".m4v", ".mpg", ".mpeg", ".3gp", ".wmv"))
 
@@ -2184,6 +2373,9 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                     return {"action": "abort"}
             return None
         stream_id = stream_id or session.stream_id
+        if session.phase == "text":
+            await self._handle_text_input(session, stream_id, message)
+            return {"action": "abort"}
         if session.phase == "config":
             await self._handle_config_edit(session, stream_id, message)
             return {"action": "abort"}
@@ -2892,42 +3084,44 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         """将识别出的工作流以结构化条目写入 workflows.items 并重建 config.toml。
 
         写盘后立即应用到当前实例（不必等待文件监听的热更新回环）。
+        加锁串行化“读配置-合并-写盘-应用”，避免两个识别命令并发时互相覆盖。
         """
-        workflow_dict: dict[str, Any] = {
-            "name": workflow_name,
-            "workflow_id": workflow_id,
-            "instance_type": "Standard",
-            "region": region,
-            "llm_enhance": False,
-            "llm_template_path": "",
-            "input_nodes": [
-                {
-                    "node_id": str(node.get("node_id") or ""),
-                    "field_name": str(node.get("field_name") or ""),
-                    "field_value": str(node.get("field_value") or ""),
-                    "value_type": str(node.get("value_type") or ""),
-                    "label": str(node.get("label") or node.get("hint") or ""),
-                }
-                for node in nodes
-            ],
-        }
-        # pydantic 校验，非法值在写入前暴露
-        WorkflowItemSection.model_validate(workflow_dict)
+        async with self._config_write_lock:
+            workflow_dict: dict[str, Any] = {
+                "name": workflow_name,
+                "workflow_id": workflow_id,
+                "instance_type": "Standard",
+                "region": region,
+                "llm_enhance": False,
+                "llm_template_path": "",
+                "input_nodes": [
+                    {
+                        "node_id": str(node.get("node_id") or ""),
+                        "field_name": str(node.get("field_name") or ""),
+                        "field_value": str(node.get("field_value") or ""),
+                        "value_type": str(node.get("value_type") or ""),
+                        "label": str(node.get("label") or node.get("hint") or ""),
+                    }
+                    for node in nodes
+                ],
+            }
+            # pydantic 校验，非法值在写入前暴露
+            WorkflowItemSection.model_validate(workflow_dict)
 
-        merged = [workflow.model_dump(mode="python") for workflow in self.config.workflows.items]
-        merged.append(workflow_dict)
+            merged = [workflow.model_dump(mode="python") for workflow in self.config.workflows.items]
+            merged.append(workflow_dict)
 
-        await asyncio.to_thread(self._write_config_file, merged)
+            await asyncio.to_thread(self._write_config_file, merged)
 
-        current = self.get_plugin_config_data()
-        current["workflows"] = {"items": merged}
-        self.set_plugin_config(current)
-        self._refresh_workflows()
-        self.ctx.logger.info(
-            "[识别] 已写入结构化配置: %s（%d 个节点），并热重载",
-            _PLUGIN_DIR / "config.toml",
-            len(nodes),
-        )
+            current = self.get_plugin_config_data()
+            current["workflows"] = {"items": merged}
+            self.set_plugin_config(current)
+            self._refresh_workflows()
+            self.ctx.logger.info(
+                "[识别] 已写入结构化配置: %s（%d 个节点），并热重载",
+                _PLUGIN_DIR / "config.toml",
+                len(nodes),
+            )
 
     @staticmethod
     def _detect_input_nodes(workflow_json: dict[str, Any]) -> list[dict[str, str]]:
@@ -3237,7 +3431,18 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                     + "。请直接结束本轮思考，不要重复调用本工具。"
                 ),
             }
-        # 支持自然语言调用的工作流仅有提示词输入，_start_workflow 必然直接提交，不会进入等待上传
+        # 支持自然语言调用的工作流仅有提示词输入；如果 prompt 节点没有默认值且 LLM 没给
+        # prompt，直接让 LLM 补参数，不要创建交互会话（工具路径没有后续消息承接会话）。
+        prompt = str(prompt or "").strip()
+        workflow = self._find_workflow(workflow_name)
+        if not prompt and workflow is not None and self._primary_prompt_node(workflow) is not None:
+            return {
+                "success": False,
+                "message": (
+                    f"工作流「{workflow_name}」的提示词节点没有默认值，"
+                    "请把用户想要生成的内容填入 prompt 参数后再次调用本工具，不要创建任务。"
+                ),
+            }
         result = await self._start_workflow(workflow_name, prompt, **kwargs)
         if not result["success"]:
             return {"success": False, "message": result["message"]}
