@@ -3,8 +3,8 @@
   "plugin_type": "media",
   "id": "github.achenjins.runninghub-workflow-adapter",
   "version": "1.0.0",
-  "name": "RunningHub 通用工作流插件",
-  "description": "让 MaiBot 操作你的账号跑 RunningHub 工作流：文生图、图生图、图生视频等等，结果自动发回。支持配置多工作流、工作流自动识别、LLM 提示词扩写与访问控制，仓库内含一个文生图工作流配置教程。仅适配 NapCat 的 QQ 消息平台。",
+  "name": "麦麦画师 · RunningHub",
+  "description": "让麦麦亲手给你画画：从一句话文生图，到多参考图 / 视频生成，统统自动完成并把成品发回聊天。支持自定义工作流、自己优化成本、AI 扩写提示词和限流防刷。仅适配 NapCat / QQ。",
   "author": {
     "name": "achenjins",
     "url": "https://github.com/achenjins"

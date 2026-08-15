@@ -1,4 +1,4 @@
-"""RunningHub 通用工作流插件。
+"""麦麦画师 · RunningHub（通用工作流适配插件）。
 
 ⚠️ 仅适配 NapCat 的 QQ，其余平台未测试，可能用不了。
 
@@ -471,7 +471,7 @@ class InputSession:
 
 
 class RunningHubGenericPlugin(MaiBotPlugin):
-    """RunningHub 通用工作流插件主体。"""
+    """麦麦画师 · RunningHub 插件主体。"""
 
     config_model: ClassVar[type[PluginConfigBase]] = GenericConfig
 
@@ -649,7 +649,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         self._cleanup_task = asyncio.create_task(self._cleanup_cache_loop())
 
         self.ctx.logger.info(
-            "通用工作流插件已加载：base_url=%s 工作流数量=%d",
+            "麦麦画师插件已加载：base_url=%s 工作流数量=%d",
             cfg.server.base_url,
             len(self._workflows),
         )
@@ -686,7 +686,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         self._cancel_choices.clear()
         self._client = None
         self._client_cn = None
-        self.ctx.logger.info("通用工作流插件已卸载")
+        self.ctx.logger.info("麦麦画师插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         if scope != CONFIG_RELOAD_SCOPE_SELF:
