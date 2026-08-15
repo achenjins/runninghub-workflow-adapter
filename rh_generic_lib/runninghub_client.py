@@ -124,8 +124,8 @@ class RunningHubClient:
 
         Returns:
             dict: 原始响应，``status`` 字段取值为
-                ``QUEUED`` / ``RUNNING`` / ``SUCCESS`` / ``FAILED`` / ``ERROR`` 等，
-                SUCCESS 时 ``results`` 列表包含 ``url`` 等结果字段。
+                ``QUEUED`` / ``RUNNING`` / ``SUCCESS`` / ``FAILED`` / ``ERROR`` /
+                ``CANCEL`` 等，SUCCESS 时 ``results`` 列表包含 ``url`` 等结果字段。
         """
         return await self._post("/openapi/v2/query", {"taskId": str(task_id)})
 
@@ -305,13 +305,15 @@ class RunningHubClient:
         waited = 0
         while waited < limit:
             result = await self.query(task_id)
-            status = result.get("status") or ""
+            status = str(result.get("status") or "").upper()
             if status == "SUCCESS":
                 return result
-            if status in ("FAILED", "ERROR"):
+            # CANCEL/CANCELED 也是终态，继续轮询只会空等到超时并占用并发额度
+            if status in ("FAILED", "ERROR", "CANCEL", "CANCELED", "CANCELLED"):
                 reason = (
                     result.get("errorMessage")
                     or str(result.get("failedReason") or "")
+                    or (f"任务状态为 {status}" if status.startswith("CANCEL") else "")
                     or json.dumps(result, ensure_ascii=False)[:500]
                 )
                 raise RunningHubError(f"任务执行失败: {reason}")

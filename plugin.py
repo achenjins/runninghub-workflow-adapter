@@ -654,20 +654,26 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             self.ctx.logger.info("[配置] %s", line)
 
     async def on_unload(self) -> None:
-        if self._cleanup_task is not None:
-            self._cleanup_task.cancel()
-            self._cleanup_task = None
-        for task_id, task in list(self._pending.items()):
+        cleanup_task = self._cleanup_task
+        self._cleanup_task = None
+
+        # 先收集全部待取消任务，再统一取消并等待结束；
+        # 之前的实现边 cancel 边从 _pending 弹出，导致 gather 时轮询任务已经被漏掉
+        poll_tasks = list(self._pending.values())
+        recall_tasks = list(self._recall_tasks)
+        expire_tasks = [
+            session.expire_task
+            for session in self._input_sessions.values()
+            if session.expire_task is not None
+        ]
+        tasks_to_stop = poll_tasks + recall_tasks + expire_tasks
+        if cleanup_task is not None:
+            tasks_to_stop.append(cleanup_task)
+        for task in tasks_to_stop:
             task.cancel()
-            self._pending.pop(task_id, None)
-        for recall_task in list(self._recall_tasks):
-            recall_task.cancel()
-        for session in list(self._input_sessions.values()):
-            if session.expire_task is not None:
-                session.expire_task.cancel()
-        pending_tasks = list(self._pending.values()) + list(self._recall_tasks)
-        if pending_tasks:
-            await asyncio.gather(*pending_tasks, return_exceptions=True)
+        if tasks_to_stop:
+            await asyncio.gather(*tasks_to_stop, return_exceptions=True)
+
         self._pending.clear()
         self._recall_tasks.clear()
         self._input_sessions.clear()
@@ -2206,9 +2212,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             await self.ctx.send.text("已中断", stream_id)
             return True, "", 1
         # 2. 已提交的任务：列出编号让用户选择（管理员可中断所有人）
+        # 身份缺失时不允许查看/取消任何任务，避免“谁都能用 /rh中断 取消所有人任务”的漏洞
         tasks = [
             (tid, meta) for tid, meta in self._task_meta.items()
-            if is_admin or not user_id or meta.get("user_id") == user_id
+            if is_admin or (user_id and meta.get("user_id") == user_id)
         ]
         if not tasks:
             await self.ctx.send.text("当前没有进行中的任务", stream_id)
@@ -2235,7 +2242,11 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         return indices
 
     async def _cancel_task(self, task_id: str, stream_id: str) -> None:
-        """取消 RunningHub 任务并停止本地轮询。"""
+        """取消 RunningHub 任务并停止本地轮询。
+
+        平台取消失败时仍然停止本地轮询（避免无限占用并发额度），但必须如实告知用户：
+        远端任务可能继续运行并计费，需要去 RunningHub 手动处理。
+        """
         meta = self._task_meta.get(task_id) or {}
         name = meta.get("name") or task_id
         region = str(meta.get("region") or "overseas").strip()
@@ -2243,19 +2254,32 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         if client is None:
             self._rebuild_client()
             client = self._get_client(region)
-        if client is not None:
+        remote_cancel_error = ""
+        if client is None:
+            remote_cancel_error = "插件客户端未初始化"
+        else:
             try:
                 result = await client.cancel(task_id)
                 code = result.get("code")
                 if code not in (0, 200, None):
                     raise RunningHubError(str(result.get("msg") or result.get("message") or result))
             except Exception as exc:
+                remote_cancel_error = str(exc)
                 self.ctx.logger.error("取消任务 %s 失败: %s", task_id, exc)
+
         poll_task = self._pending.pop(task_id, None)
         if poll_task is not None:
             poll_task.cancel()
         self._task_meta.pop(task_id, None)
-        await self.ctx.send.text(f"已取消任务：{name}", stream_id)
+
+        if remote_cancel_error:
+            await self.ctx.send.text(
+                f"已停止本地跟踪，但 RunningHub 平台取消失败：{remote_cancel_error}。"
+                f"任务「{name}」可能仍在运行并计费，请到 RunningHub 平台手动取消",
+                stream_id,
+            )
+        else:
+            await self.ctx.send.text(f"已取消任务：{name}", stream_id)
 
     @HookHandler(
         "chat.receive.after_process",
@@ -2341,14 +2365,27 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 return content
         raise RunningHubError(f"无法通过 NapCat API 获取文件 file_id={file_id}")
 
+    @staticmethod
+    def _decode_base64_bounded(encoded: str, max_bytes: int = _MAX_FILE_BYTES) -> bytes:
+        """解码 base64 并强制大小上限，防止 QQ 群文件结果撑爆内存。"""
+        import base64
+
+        encoded = str(encoded or "").strip()
+        if not encoded:
+            return b""
+        if len(encoded) > max_bytes * 4 // 3 + 4:
+            raise RunningHubError(f"base64 内容超过 {max_bytes} 字节上限，已拒绝")
+        data = base64.b64decode(encoded, validate=False)
+        if len(data) > max_bytes:
+            raise RunningHubError(f"base64 解码后超过 {max_bytes} 字节上限，已拒绝")
+        return data
+
     async def _extract_bytes_from_napcat_result(self, result: Any) -> bytes | None:
         """从 NapCat get_file / get_group_file_url 返回里解析出文件字节。"""
-        import base64 as _b64
-
         if isinstance(result, str):
             result = result.strip()
             if result.startswith("base64://"):
-                return _b64.b64decode(result[len("base64://"):])
+                return self._decode_base64_bounded(result[len("base64://"):])
             if result.startswith(("http://", "https://")):
                 client = self._client
                 if client is not None:
@@ -2365,8 +2402,11 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 b64 = b64[len("base64://"):]
             if b64:
                 try:
-                    return _b64.b64decode(b64)
+                    return self._decode_base64_bounded(b64)
+                except RunningHubError:
+                    raise
                 except Exception:
+                    # 非法 base64 保持原行为：跳过该候选，继续尝试其他字段/API
                     pass
             url = str(data.get("url") or data.get("file_url") or data.get("download_url") or "").strip()
             if url.startswith(("http://", "https://")):
@@ -2377,6 +2417,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             if path:
                 p = Path(path)
                 if p.is_file():
+                    if p.stat().st_size > _MAX_FILE_BYTES:
+                        raise RunningHubError(f"本地文件超过 {_MAX_FILE_BYTES} 字节上限，已拒绝: {path}")
                     return await asyncio.to_thread(p.read_bytes)
 
         url = result.get("url")
@@ -2784,10 +2826,14 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         workflows_raw = raw.get("workflows")
         legacy_items: list[dict[str, Any]] = []
         legacy_text = ""
+        # 顶层 [[workflows]] 数组会被配置模型的 validator 先解析进
+        # self.config.workflows.items；这里直接以文件里的旧数组为准，不能再叠加 existing，
+        # 否则每个工作流都会被写成两份。
+        legacy_from_top_level_array = isinstance(workflows_raw, list)
 
         if isinstance(workflows_raw, dict):
             legacy_text = str(workflows_raw.get("workflows_toml") or "").strip()
-        elif isinstance(workflows_raw, list):
+        elif legacy_from_top_level_array:
             # 形态 1：顶层数组，已是结构化 dict，直接搬运
             legacy_items = [
                 {
@@ -2817,7 +2863,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         existing = [workflow.model_dump(mode="python") for workflow in self.config.workflows.items]
         if existing and not legacy_items:
             return False  # 已是结构化配置，无旧内容可迁移
-        merged = existing + legacy_items
+        # 顶层数组形态只以文件内容为准；字符串旧形态才需要与现有结构化项合并
+        merged = legacy_items if legacy_from_top_level_array else existing + legacy_items
         if not merged:
             return False
 
