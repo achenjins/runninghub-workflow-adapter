@@ -5,7 +5,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-NapCat%20%2F%20QQ-orange)
 
-让 MaiBot 机器人帮你跑 [RunningHub](https://www.runninghub.ai)（国外）/ [RunningHub 国内](https://www.runninghub.cn) 上的工作流：文生图、图生图、图生视频、参考图 / 参考音频 / 参考视频等等，**一句命令触发，结果自动发回聊天窗口**。
+让 MaiBot 机器人帮你跑 [RunningHub](https://www.runninghub.ai?inviteCode=bvhsaqdr)（国外）/ [RunningHub 国内](https://www.runninghub.cn?inviteCode=8cq8uhl8) 上的工作流：文生图、图生图、图生视频、参考图 / 参考音频 / 参考视频等等，**一句命令触发，结果自动发回聊天窗口**。
 
 > [!WARNING]
 > 本插件目前**仅适配 NapCat 的 QQ**，其余平台 / 适配器未经测试，可能无法正常使用。
