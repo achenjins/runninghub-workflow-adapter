@@ -82,6 +82,14 @@ class PluginMetaSection(PluginConfigBase):
         description="插件配置版本号（一般无需修改）",
         json_schema_extra={"label": "配置版本", "hidden": True},
     )
+    # MaiBot 的「禁用/启用」会在 [plugin] 写 enabled；必须声明该字段，
+    # 否则 pydantic(extra=ignore) 会在配置归一化时把它丢弃，
+    # 导致禁用后 inspect 误判为已启用、点「启用」又被翻转回禁用。
+    enabled: bool = Field(
+        default=True,
+        description="插件启用状态（由 MaiBot 管理，请勿手动修改）",
+        json_schema_extra={"label": "启用状态", "hidden": True},
+    )
 
 
 class ServerSection(PluginConfigBase):
@@ -2666,6 +2674,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 lines.append("")
         lines.append("[plugin]")
         lines.append(f"config_version = {self._toml_string(cfg.plugin.config_version)}")
+        lines.append(f"enabled = {'true' if cfg.plugin.enabled else 'false'}")
         lines.append("")
         lines.append("[server]")
         lines.append(f"base_url = {self._toml_string(cfg.server.base_url)}")
