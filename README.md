@@ -75,15 +75,15 @@
 
 打开对应平台的注册链接（邀请码已内置在链接里）：
 
-- 国内站：[https://www.runninghub.cn?inviteCode=8cq8uhl8](https://www.runninghub.cn?inviteCode=8cq8uhl8)
-- 海外站：[https://www.runninghub.ai?inviteCode=bvhsaqdr](https://www.runninghub.ai?inviteCode=bvhsaqdr)
+- 国内站：[注册国内账号](https://www.runninghub.cn?inviteCode=8cq8uhl8)
+- 海外站：[注册海外账号](https://www.runninghub.ai?inviteCode=bvhsaqdr)
 
 **② 获取 API Key**
 
 注册并登录后，打开对应平台的 API 页面，复制页面里的 API Key：
 
-- 国内站：[https://www.runninghub.cn/enterprise-api/consumerApi?inviteCode=8cq8uhl8](https://www.runninghub.cn/enterprise-api/consumerApi?inviteCode=8cq8uhl8)
-- 海外站：[https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=bvhsaqdr](https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=bvhsaqdr)
+- 国内站：[打开国内 API 页面](https://www.runninghub.cn/enterprise-api/consumerApi?inviteCode=8cq8uhl8)
+- 海外站：[打开海外 API 页面](https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=bvhsaqdr)
 
 **③ 填进插件**
 
@@ -101,8 +101,8 @@
 
 先给大家一个我**删除了内部高成本豆包提示词优化**的**文生图体验工作流**（注意：打开不能直接使用，没有提示词优化节点，想体验原版可去下方 up 主的视频里找完整版工作流）：
 
-- 海外版：[https://www.runninghub.ai/zh-cn/workflow/2087492768787685378?inviteCode=bvhsaqdr](https://www.runninghub.ai/zh-cn/workflow/2087492768787685378?inviteCode=bvhsaqdr)
-- 国内版：[https://www.runninghub.cn/workflow/2087939838371786753?inviteCode=8cq8uhl8](https://www.runninghub.cn/workflow/2087939838371786753?inviteCode=8cq8uhl8)
+- 海外版：[海外体验工作流](https://www.runninghub.ai/zh-cn/workflow/2087492768787685378?inviteCode=bvhsaqdr)
+- 国内版：[国内体验工作流](https://www.runninghub.cn/workflow/2087939838371786753?inviteCode=8cq8uhl8)
 
 > [!NOTE]
 > 这个工作流魔改自 B 站视频教程 [BV1arGt6wExL](https://www.bilibili.com/video/BV1arGt6wExL)，感谢 up 主 [@每日提钢小助手5号](https://space.bilibili.com/3690999272442168) 分享的工作流，如侵权可联系删除。该up工作流自带提示词优化，会消耗rh上的余额
