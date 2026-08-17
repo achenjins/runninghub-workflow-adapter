@@ -113,7 +113,6 @@ class RunningHubClient:
         }
         result = await self._post(f"/openapi/v2/run/workflow/{target_workflow}", payload)
         task_id = result.get("taskId")
-        status = result.get("status")
         if not task_id:
             error_message = result.get("errorMessage") or ""
             raise RunningHubError(f"提交任务失败: {error_message or json.dumps(result, ensure_ascii=False)}")

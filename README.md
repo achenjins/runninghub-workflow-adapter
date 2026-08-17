@@ -1,7 +1,7 @@
 # 麦麦画师 · RunningHub
 
 ![running](https://count.kjchmc.cn/get/@rhaajinse?theme=gelbooru)
-![Version](https://img.shields.io/badge/version-1.0.1-blue)
+![Version](https://img.shields.io/badge/version-1.1.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-NapCat%20%2F%20QQ-orange)
 
@@ -49,8 +49,8 @@
 ## 安装
 
     cd <MaiBot目录>/plugins
-    git clone https://github.com/achenjins/runninghub-workflow-adapter.git runninghub-workflow-adapter
-    pip install -r runninghub-workflow-adapter/requirements.txt
+    git clone https://github.com/achenjins/runninghub-animaimage.git runninghub-animaimage
+    pip install -r runninghub-animaimage/requirements.txt
 
 克隆并装好依赖后，重启 MaiBot（或在 WebUI 里热重载插件），插件即自动加载。
 
@@ -395,6 +395,20 @@
 </details>
 
 ---
+
+---
+
+## 项目结构（v1.1.0 分层）
+
+插件入口只负责 MaiBot SDK 适配，业务逻辑已拆到 `rh_generic_lib/`，这些模块不 import MaiBot SDK，换宿主时不用重写：
+
+- `workflow_runner.py`：节点类型解析、nodeInfoList 构建、结果 URL 分类、消耗解析
+- `session_machine.py`：交互式收集会话数据结构与查找规则
+- `file_source.py`：消息文件提取、base64 / URL / 本地路径读取
+- `delivery.py`：NapCat 直发、回退发送、定时撤回
+- `task_journal.py`：任务日志持久化
+
+任务日志默认写入插件 `runtime_dir/task_journal.json`。任务提交时记 `pending`，成功时记状态和 RH 币消耗；插件重启后会自动恢复未完成任务的轮询。
 
 ## 常见问题 FAQ
 

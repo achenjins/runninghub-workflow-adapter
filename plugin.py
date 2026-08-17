@@ -26,7 +26,6 @@ import json
 import re
 import sys
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -51,7 +50,28 @@ if str(_PLUGIN_DIR) not in sys.path:
 # 包名必须全局唯一：多个 RunningHub 插件同进程加载时，通用名 lib 会互相抢占
 # sys.modules，导致拿到对方的旧版 client（缺少 get_workflow_json 等方法）。
 # 热重载交给 Runner 整体重载插件，不要在这里对子模块做部分 reload。
-from rh_generic_lib.runninghub_client import RunningHubClient, RunningHubError
+from rh_generic_lib import workflow_runner  # noqa: E402
+from rh_generic_lib.delivery import NapcatDelivery  # noqa: E402
+from rh_generic_lib.file_source import (  # noqa: E402
+    MAX_FILE_BYTES as _MAX_FILE_BYTES,
+    decode_base64_bounded,
+    detect_file_type_from_name,
+    extract_bytes_from_napcat_result,
+    extract_files_from_message,
+    extract_text_from_message,
+    fetch_file_bytes,
+    guess_filename,
+    is_finish_signal,
+)
+from rh_generic_lib.runninghub_client import RunningHubClient, RunningHubError  # noqa: E402
+from rh_generic_lib.session_machine import (  # noqa: E402
+    InputSession,
+    find_input_session,
+    latest_session_for_keys,
+    remove_session_from_indexes,
+    session_key,
+)
+from rh_generic_lib.task_journal import TaskJournal  # noqa: E402
 
 __all__ = ["RunningHubGenericPlugin", "create_plugin"]
 
@@ -60,16 +80,6 @@ _INPUT_WAIT_TIMEOUT = 600
 
 # 单个工作流的输入/配置节点总数上限（含参考图、配置节点，原 8 个对多参考图工作流不够）
 _MAX_NODES = 32
-
-# 上传/下载单个文件的最大字节数（512MB），防止异常或恶意超大内容撑爆内存
-_MAX_FILE_BYTES = 512 * 1024 * 1024
-
-# 交互收集会话中，用于"跳过剩余文件、直接开始运行"的触发词
-_FINISH_KEYWORDS = {
-    "完成", "开始", "开始运行", "运行", "提交", "结束",
-    "跳过", "跳过剩余", "直接开始", "直接运行", "好了",
-    "ok", "go", "done", "finish", "start",
-}
 
 
 class PluginMetaSection(PluginConfigBase):
@@ -361,36 +371,6 @@ class GenericConfig(PluginConfigBase):
         return value
 
 
-# NapCat 动作候选 API（兼容 napcat-adapter 与 SnowLuma 命名空间）
-_ACTION_API_CANDIDATES: dict[str, tuple[str, ...]] = {
-    "send_group_msg": (
-        "adapter.napcat.group.send_group_msg",    # napcat-adapter（官方）
-        "adapter.napcat.message.send_group_msg",  # SnowLuma
-    ),
-    "send_private_msg": (
-        "adapter.napcat.message.send_private_msg",  # napcat-adapter / SnowLuma
-    ),
-    "delete_msg": (
-        "adapter.napcat.message.delete_msg",  # napcat-adapter / SnowLuma
-    ),
-}
-
-# 两适配器参数签名差异：params=call(api, params=dict) / spread=call(api, **dict)
-_ACTION_CALL_STYLE: dict[str, str] = {
-    "delete_msg": "spread",
-}
-
-
-def _resolve_action_api(action: str, cached: dict[str, str]) -> tuple[str, ...]:
-    """返回动作的候选完整 API 名（命中过的排最前）。"""
-    candidates = list(_ACTION_API_CANDIDATES.get(action, (f"adapter.napcat.message.{action}",)))
-    cached_name = cached.get(action)
-    if cached_name and cached_name in candidates:
-        candidates.remove(cached_name)
-        candidates.insert(0, cached_name)
-    return tuple(candidates)
-
-
 _LLM_DETECT_PROMPT = """你是 ComfyUI/RunningHub 工作流配置分析器。下面是一个工作流的节点清单（"节点 ID（class_type）标题" + 各字段：字段名: 值/连线，<连线> 表示该字段来自其他节点输出，不可编辑）。
 
 请判断哪些字段是【用户输入节点】、哪些是【推荐预设的配置节点】，只输出一个 JSON 对象，不要输出任何解释、代码块围栏或多余文本。
@@ -445,31 +425,6 @@ _LLM_DETECT_KEY_PROMPT = """你是 ComfyUI/RunningHub 工作流配置分析器�
 """
 
 
-@dataclass
-class InputSession:
-    """一次命令触发的交互式输入收集会话。"""
-
-    user_id: str
-    stream_id: str
-    workflow: WorkflowItemSection
-    waiting_nodes: list[dict[str, str]] = field(default_factory=list)
-    collected: list[dict[str, str]] = field(default_factory=list)
-    created_at: float = field(default_factory=time.time)
-    expire_task: asyncio.Task | None = None
-    # 文字扩写延后到收集完成：记录原始文本、文字节点身份与实际上传的文件数量
-    command_text: str = ""
-    text_node_id: str = ""
-    text_field_name: str = ""
-    uploaded_images: int = 0
-    uploaded_audios: int = 0
-    uploaded_videos: int = 0
-    # 收集阶段：files=等待文件上传；config=等待用户确认/修改可编辑配置
-    phase: str = "files"
-    editable_nodes: list[dict[str, str]] = field(default_factory=list)
-    # 触发时的会话上下文（group_id/user_id），提交后用于 NapCat 直发与自动撤回
-    chat_info: dict[str, str] = field(default_factory=dict)
-
-
 class RunningHubGenericPlugin(MaiBotPlugin):
     """麦麦画师 · RunningHub 插件主体。"""
 
@@ -495,6 +450,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         self._user_requests: dict[str, list[float]] = {}
         self._task_meta: dict[str, dict[str, str]] = {}
         self._cancel_choices: dict[str, list[str]] = {}
+        self._delivery: NapcatDelivery | None = None
+        self._task_journal: TaskJournal | None = None
 
     # ── 工作流配置访问 ────────────────────────────────────────────
 
@@ -641,6 +598,10 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         self._migrate_legacy_workflows_toml()
         self._refresh_workflows()
 
+        # 任务日志：加载磁盘状态，并把上次进程退出前未跑完的任务重新拉起来轮询
+        await self._load_task_journal()
+        await self._resume_pending_tasks()
+
         if not cfg.server.api_key:
             self.ctx.logger.warning("未配置 RunningHub API Key，请编辑插件目录下 config.toml 的 server.api_key")
         self._validate_workflows()
@@ -655,6 +616,49 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         )
         for line in self._describe_workflows():
             self.ctx.logger.info("[配置] %s", line)
+
+    async def _resume_pending_tasks(self) -> None:
+        """重启后恢复 pending 任务的轮询（只有任务日志里的 pending 记录）。"""
+        journal = self._task_journal
+        if journal is None:
+            return
+        resumed = 0
+        for record in journal.pending_records():
+            task_id = str(record.get("task_id") or "").strip()
+            if not task_id or task_id in self._pending:
+                continue
+            region = str(record.get("region") or "overseas").strip()
+            client = self._get_client(region)
+            if client is None:
+                self._rebuild_client()
+                client = self._get_client(region)
+            if client is None:
+                self.ctx.logger.warning(
+                    "任务 %s 无法恢复轮询：%s 客户端不可用", task_id, region
+                )
+                continue
+            stream_id = str(record.get("stream_id") or "")
+            kwargs = {
+                "stream_id": stream_id,
+                "user_id": str(record.get("user_id") or ""),
+                "group_id": str(record.get("group_id") or ""),
+                "trigger": "resume",
+            }
+            self.ctx.logger.info("恢复轮询任务: task_id=%s stream=%s", task_id, stream_id)
+            await self._semaphore.acquire()
+            poll_task = asyncio.create_task(
+                self._poll_and_send(task_id, stream_id, client=client, kwargs=kwargs)
+            )
+            self._pending[task_id] = poll_task
+            self._task_meta[task_id] = {
+                "name": str(record.get("workflow") or task_id),
+                "stream_id": stream_id,
+                "region": region,
+                "user_id": str(record.get("user_id") or ""),
+            }
+            resumed += 1
+        if resumed:
+            self.ctx.logger.info("已恢复 %d 个 pending 任务", resumed)
 
     async def on_unload(self) -> None:
         cleanup_task = self._cleanup_task
@@ -804,6 +808,38 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             return self._client_cn
         return self._client
 
+    def _ensure_delivery(self) -> NapcatDelivery:
+        """懒加载平台发送层（FakeContext 注入 _ctx 之后才可用）。"""
+        if self._delivery is None:
+            self._delivery = NapcatDelivery(
+                self.ctx,
+                type(self)._resolved_action_api,
+                self._recall_tasks,
+            )
+        return self._delivery
+
+    def _task_journal_path(self) -> Path:
+        """任务日志路径：优先插件 runtime_dir，否则回退仓库 data 目录（测试/独立运行）。"""
+        try:
+            runtime_dir = Path(self.ctx.paths.runtime_dir)
+        except Exception:
+            runtime_dir = None
+        if runtime_dir is not None:
+            return runtime_dir / "task_journal.json"
+        return _PLUGIN_DIR / "data" / "task_journal.json"
+
+    def _ensure_task_journal(self) -> TaskJournal:
+        """懒加载任务日志（使用前请调用 _load_task_journal 读取磁盘状态）。"""
+        if self._task_journal is None:
+            self._task_journal = TaskJournal(self._task_journal_path())
+        return self._task_journal
+
+    async def _load_task_journal(self) -> TaskJournal:
+        """读取磁盘上的任务日志；文件损坏时降级为空日志。"""
+        journal = self._ensure_task_journal()
+        await journal.load()
+        return journal
+
     def _find_workflow(self, name: str) -> WorkflowItemSection | None:
         """按名称查找工作流配置。"""
         name = str(name or "").strip()
@@ -866,7 +902,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     def _ordered_nodes(self, workflow: WorkflowItemSection) -> list[InputNodeSection]:
         """按配置顺序返回有效节点（最多 _MAX_NODES 个）。"""
-        return [n for n in workflow.input_nodes if str(n.node_id or "").strip()][:_MAX_NODES]
+        return workflow_runner.ordered_nodes(workflow)
 
     def _load_llm_template(self, workflow: WorkflowItemSection) -> str:
         """读取工作流配置的 LLM 扩写模板。"""
@@ -883,63 +919,25 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             return ""
 
     def _describe_file_inputs(self, workflow: WorkflowItemSection) -> str:
-        """汇总该工作流需要用户上传的文件输入（图片/音频/视频的种类与数量）。
-
-        仅在未提供实际上传数量时作为兜底，告知工作流所需的文件节点。
-        """
-        images = [
-            n for n in workflow.input_nodes
-            if not str(n.field_value or "").strip() and self._resolve_value_type(n) == "image"
-        ]
-        audios = [
-            n for n in workflow.input_nodes
-            if not str(n.field_value or "").strip() and self._resolve_value_type(n) == "audio"
-        ]
-        videos = [
-            n for n in workflow.input_nodes
-            if not str(n.field_value or "").strip() and self._resolve_value_type(n) == "video"
-        ]
-        parts: list[str] = []
-        if images:
-            labels = "、".join(str(n.label or "").strip() or str(n.node_id) for n in images)
-            parts.append(f"参考图片 {len(images)} 张（{labels}）")
-        if audios:
-            labels = "、".join(str(n.label or "").strip() or str(n.node_id) for n in audios)
-            parts.append(f"参考音频 {len(audios)} 段（{labels}）")
-        if videos:
-            labels = "、".join(str(n.label or "").strip() or str(n.node_id) for n in videos)
-            parts.append(f"参考视频 {len(videos)} 段（{labels}）")
-        return "；".join(parts) if parts else ""
+        """汇总该工作流需要用户上传的文件输入（委托 workflow_runner）。"""
+        return workflow_runner.describe_file_inputs(workflow)
 
     @staticmethod
     def _format_file_counts(images: int, audios: int, videos: int = 0) -> str:
         """按实际上传数量生成简短描述（0 的类别省略）。"""
-        parts: list[str] = []
-        if images:
-            parts.append(f"参考图片 {images} 张")
-        if audios:
-            parts.append(f"参考音频 {audios} 段")
-        if videos:
-            parts.append(f"参考视频 {videos} 段")
-        return "；".join(parts)
+        return workflow_runner.format_file_counts(images, audios, videos)
 
     def _prompt_nodes(self, workflow: WorkflowItemSection) -> list[InputNodeSection]:
         """返回所有主提示词节点（prompt 类型，最多允许一个）。"""
-        return [n for n in self._ordered_nodes(workflow) if self._resolve_value_type(n) == "prompt"]
+        return workflow_runner.prompt_nodes(workflow)
 
     def _first_prompt_node(self, workflow: WorkflowItemSection) -> InputNodeSection | None:
         """返回第一个 prompt 节点（用户文本/扩写结果的回填目标，不关心是否有默认值）。"""
-        for node in self._ordered_nodes(workflow):
-            if self._resolve_value_type(node) == "prompt":
-                return node
-        return None
+        return workflow_runner.first_prompt_node(workflow)
 
     def _primary_prompt_node(self, workflow: WorkflowItemSection) -> InputNodeSection | None:
         """返回第一个无默认值的主提示词节点（接收命令/扩写文本的节点）。"""
-        for node in self._ordered_nodes(workflow):
-            if self._resolve_value_type(node) == "prompt" and not str(node.field_value or "").strip():
-                return node
-        return None
+        return workflow_runner.primary_prompt_node(workflow)
 
     @staticmethod
     def _patch_text_value(
@@ -948,15 +946,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         field_name: str,
         text: str,
     ) -> list[dict[str, str]]:
-        """回填文字节点的 fieldValue；列表中不存在该节点时追加（如交互补充的描述）。"""
-        for entry in node_info_list:
-            if entry.get("nodeId") == node_id and entry.get("fieldName") == field_name:
-                entry["fieldValue"] = text
-                return node_info_list
-        node_info_list.append(
-            {"nodeId": node_id, "fieldName": field_name, "fieldValue": text}
-        )
-        return node_info_list
+        """回填文字节点的 fieldValue；列表中不存在该节点时追加。"""
+        return workflow_runner.patch_text_value(node_info_list, node_id, field_name, text)
 
     async def _enhance_text(
         self,
@@ -1005,17 +996,7 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     @staticmethod
     def _resolve_value_type(node: InputNodeSection) -> str:
         """解析节点类型：显式选择优先，留空时按字段名自动推断。"""
-        explicit = str(node.value_type or "").strip().lower()
-        if explicit in ("default", "text", "image", "audio", "video", "prompt"):
-            return explicit
-        field_name = str(node.field_name or "").lower()
-        if any(k in field_name for k in ("image", "pic", "photo", "img")):
-            return "image"
-        if any(k in field_name for k in ("audio", "voice", "sound", "music", "speech")):
-            return "audio"
-        if any(k in field_name for k in ("video", "mp4", "mov", "webm", "clip")):
-            return "video"
-        return "text"
+        return workflow_runner.resolve_value_type(node)
 
     def _build_node_info_list(
         self,
@@ -1024,96 +1005,17 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         *,
         enhanced_text: str | None = None,
     ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
-        """构建 nodeInfoList 并返回需要等待用户输入的节点列表。
-
-        规则（新节点类型语义）：
-        - prompt：主提示词，优先使用命令/扩写文本；没有输入时回退节点默认值；仅第一个接收文本
-        - text：可编辑配置，先用默认值（可为空），上传文件后询问用户修改
-        - default：固定默认值，不询问；无默认值时跳过
-        - image / audio：有默认值直接使用；无默认值按顺序等待上传
-
-        Returns:
-            (node_info_list, waiting_nodes)：已确定的节点参数与待收集节点
-            （waiting 元素为 dict：node/field_name/value_type/label）。
-        """
-        nodes = self._ordered_nodes(workflow)
-        text_to_fill = enhanced_text if enhanced_text is not None else command_text
-        text_filled = False
-
-        node_info_list: list[dict[str, str]] = []
-        waiting: list[dict[str, Any]] = []
-        for node in nodes:
-            field_value = str(node.field_value or "")
-            vtype = self._resolve_value_type(node)
-            node_id = node.node_id.strip()
-            field_name = node.field_name.strip() or "prompt"
-
-            if vtype == "prompt":
-                # 主提示词：用户输入/扩写文本优先，没有输入时回退到节点默认值；
-                # 文本只填第一个 prompt 节点，后续 prompt 节点按默认值处理。
-                if not text_filled and text_to_fill:
-                    node_info_list.append(
-                        {"nodeId": node_id, "fieldName": field_name, "fieldValue": text_to_fill}
-                    )
-                    text_filled = True
-                elif field_value:
-                    node_info_list.append(
-                        {"nodeId": node_id, "fieldName": field_name, "fieldValue": field_value}
-                    )
-                else:
-                    self.ctx.logger.info("主提示词节点 %s 未接收文本且无默认值，已跳过", node_id)
-                continue
-
-            if vtype == "text":
-                # 可编辑配置：先用默认值（可为空），上传文件后询问用户修改
-                node_info_list.append(
-                    {"nodeId": node_id, "fieldName": field_name, "fieldValue": field_value}
-                )
-                continue
-
-            if vtype == "default":
-                # 固定默认值：有值直接使用，无值跳过
-                if field_value:
-                    node_info_list.append(
-                        {"nodeId": node_id, "fieldName": field_name, "fieldValue": field_value}
-                    )
-                else:
-                    self.ctx.logger.info("节点 %s 类型为默认值但未填写输入内容，已跳过", node_id)
-                continue
-
-            # image / audio
-            if field_value:
-                node_info_list.append(
-                    {"nodeId": node_id, "fieldName": field_name, "fieldValue": field_value}
-                )
-                continue
-            waiting.append(
-                {
-                    "node": node,
-                    "node_id": node_id,
-                    "field_name": field_name,
-                    "value_type": vtype,
-                    "label": node.label.strip() or node_id,
-                }
-            )
-        return node_info_list, waiting
+        """构建 nodeInfoList 并返回需要等待用户输入的节点列表（委托 workflow_runner）。"""
+        return workflow_runner.build_node_info_list(
+            workflow,
+            command_text,
+            enhanced_text=enhanced_text,
+            logger=self.ctx.logger,
+        )
 
     def _editable_config_nodes(self, workflow: WorkflowItemSection) -> list[dict[str, str]]:
         """返回上传文件后需要询问用户修改的可编辑配置节点（text 类型）。"""
-        result: list[dict[str, str]] = []
-        for node in self._ordered_nodes(workflow):
-            if self._resolve_value_type(node) != "text":
-                continue
-            node_id = node.node_id.strip()
-            result.append(
-                {
-                    "node_id": node_id,
-                    "field_name": node.field_name.strip() or "prompt",
-                    "field_value": str(node.field_value or ""),
-                    "label": str(node.label or "").strip() or node_id,
-                }
-            )
-        return result
+        return workflow_runner.editable_config_nodes(workflow)
 
     async def _start_workflow(
         self,
@@ -1229,7 +1131,6 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 editable_nodes=editable_nodes,
                 chat_info=chat_info,
             )
-            key = self._session_key(user_id, stream_id)
             if waiting:
                 tips = self._build_waiting_tips(waiting)
                 required_files = [
@@ -1292,6 +1193,19 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 bucket[:] = [t for t in bucket if now - t < 3600]
                 bucket.append(now)
 
+        try:
+            journal = await self._load_task_journal()
+            await journal.mark_pending(
+                task_id,
+                workflow=str(workflow.name or workflow.workflow_id),
+                stream_id=stream_id,
+                region=str(workflow.region or "overseas").strip(),
+                user_id=str(kwargs.get("user_id") or ""),
+                group_id=str(kwargs.get("group_id") or ""),
+            )
+        except Exception as exc:
+            self.ctx.logger.warning("写入任务日志失败，任务仍会继续运行: %s", exc)
+
         self.ctx.logger.info(
             "任务已提交: task_id=%s workflow=%s nodes=%d",
             task_id,
@@ -1319,24 +1233,12 @@ class RunningHubGenericPlugin(MaiBotPlugin):
     @staticmethod
     def _build_waiting_tips(waiting: list[dict[str, Any]]) -> str:
         """构建等待上传的提示文本（按类型汇总剩余数量与说明）。"""
-        return RunningHubGenericPlugin._format_waiting_summary(waiting)
+        return workflow_runner.format_waiting_summary(waiting)
 
     @staticmethod
     def _format_waiting_summary(waiting: list[dict[str, Any]]) -> str:
-        _NAME_UNIT = {"image": ("图片", "张"), "audio": ("音频", "段"), "video": ("视频", "段")}
-        counts: dict[str, int] = {}
-        order: list[str] = []
-        for item in waiting:
-            vtype = item["value_type"]
-            if vtype not in counts:
-                counts[vtype] = 0
-                order.append(vtype)
-            counts[vtype] += 1
-        parts: list[str] = []
-        for vtype in order:
-            name, unit = _NAME_UNIT.get(vtype, (vtype, "个"))
-            parts.append(f"{name} {counts[vtype]} {unit}")
-        return "、".join(parts)
+        """兼容旧调用方。"""
+        return workflow_runner.format_waiting_summary(waiting)
 
     def _create_input_session(
         self,
@@ -1392,16 +1294,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     @staticmethod
     def _session_key(user_id: str, stream_id: str) -> str:
-        """会话键：user_id + stream_id 共同区分，避免同用户跨会话、同群多用户互相覆盖。"""
-        uid = str(user_id or "").strip()
-        sid = str(stream_id or "").strip()
-        if uid and sid:
-            return f"{uid}:{sid}"
-        if sid:
-            return f"stream:{sid}"
-        if uid:
-            return f"user:{uid}"
-        return "anonymous"
+        """会话键：user_id + stream_id 共同区分（委托 session_machine）。"""
+        return session_key(user_id, stream_id)
 
     def _register_input_session(self, session: InputSession) -> str:
         """把会话写入主表与 user/stream 索引，返回会话键。"""
@@ -1419,59 +1313,32 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         return key
 
     def _remove_input_session(self, key: str) -> InputSession | None:
-        """从主表与索引中删除会话，保持三张表一致。"""
-        session = self._input_sessions.pop(key, None)
+        """从主表与索引中删除会话（委托 session_machine）。"""
+        session = self._input_sessions.get(key)
         if session is None:
             return None
-        if session.stream_id:
-            stream_keys = self._input_session_keys_by_stream.get(session.stream_id)
-            if stream_keys is not None:
-                stream_keys.discard(key)
-                if not stream_keys:
-                    self._input_session_keys_by_stream.pop(session.stream_id, None)
-        if session.user_id:
-            user_keys = self._input_session_keys_by_user.get(session.user_id)
-            if user_keys is not None:
-                user_keys.discard(key)
-                if not user_keys:
-                    self._input_session_keys_by_user.pop(session.user_id, None)
+        remove_session_from_indexes(
+            session,
+            key,
+            self._input_sessions,
+            self._input_session_keys_by_stream,
+            self._input_session_keys_by_user,
+        )
         return session
 
     def _latest_session_for_keys(self, keys: set[str]) -> InputSession | None:
-        """从会话键集合中返回最近注册的会话（注册顺序，避免同秒时间戳不稳定）。"""
-        for key in reversed(self._input_sessions):
-            if key in keys:
-                return self._input_sessions[key]
-        return None
+        """从会话键集合中返回最近注册的会话（委托 session_machine）。"""
+        return latest_session_for_keys(self._input_sessions, keys)
 
     def _find_input_session(self, user_id: str, stream_id: str) -> InputSession | None:
         """按 user_id + stream_id 精确查找；降级时不得跨用户取同群其他人的会话。"""
-        user_id = str(user_id or "").strip()
-        stream_id = str(stream_id or "").strip()
-
-        if user_id and stream_id:
-            session = self._input_sessions.get(self._session_key(user_id, stream_id))
-            if session is not None:
-                return session
-            # 该流里存在匿名会话（工具/API 路径创建）时允许按 stream 命中；
-            # 否则不跨会话/跨用户回退，避免把文件误投到其他会话
-            anonymous_key = f"stream:{stream_id}"
-            if anonymous_key in self._input_sessions:
-                return self._input_sessions[anonymous_key]
-            return None
-        if stream_id:
-            stream_keys = self._input_session_keys_by_stream.get(stream_id)
-            if stream_keys:
-                # 工具路径创建的匿名流会话优先精确命中
-                anonymous_key = f"stream:{stream_id}"
-                if anonymous_key in stream_keys:
-                    return self._input_sessions.get(anonymous_key)
-                return self._latest_session_for_keys(stream_keys)
-        if user_id:
-            user_keys = self._input_session_keys_by_user.get(user_id)
-            if user_keys:
-                return self._latest_session_for_keys(user_keys)
-        return None
+        return find_input_session(
+            self._input_sessions,
+            self._input_session_keys_by_stream,
+            self._input_session_keys_by_user,
+            user_id,
+            stream_id,
+        )
 
     async def _handle_incoming_files(self, user_id: str, stream_id: str, message: dict) -> bool:
         """处理交互式收集中的文件消息，返回是否已消费该消息。"""
@@ -1760,168 +1627,32 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     @staticmethod
     def _extract_files_from_message(message: dict) -> list[tuple[str, str]]:
-        """从消息中提取文件，返回 [(类型 image/audio, 来源)]。
-
-        MaiBot 消息段真实格式（Host 序列化后）：
-        - 图片: {"type":"image","data":"<内容/url>","hash":"...","binary_data_base64":"<base64 或空>"}
-        - 语音: {"type":"voice","data":"<内容/url>","hash":"...","binary_data_base64":"<base64 或空>"}
-        优先用 binary_data_base64（真实字节，base64:// 前缀），否则回退 data（url/本地路径）。
-        """
-        raw = message.get("raw_message") or []
-        if not isinstance(raw, list):
-            return []
-        files: list[tuple[str, str]] = []
-        for seg in raw:
-            if not isinstance(seg, dict):
-                continue
-            seg_type = str(seg.get("type") or "")
-            data = seg.get("data")
-            if isinstance(data, dict):
-                # 兼容 dict 形态（{"url"/"file"/"path": ...}）
-                data_text = str(data.get("url") or data.get("file") or data.get("path") or "").strip()
-            else:
-                data_text = str(data).strip() if isinstance(data, str) else ""
-            b64 = str(seg.get("binary_data_base64") or "").strip()
-            if seg_type == "image":
-                source = ("base64://" + b64) if b64 else data_text
-                if source:
-                    files.append(("image", source))
-            elif seg_type in ("voice", "record", "audio"):
-                source = ("base64://" + b64) if b64 else data_text
-                if source:
-                    files.append(("audio", source))
-            elif seg_type == "file":
-                # QQ「文件」消息（type=file）不区分图片/音频/视频，按文件名/URL 扩展名推断真实类型。
-                # NapCat 的 data 字段名不统一：先试常见字段，再遍历 data 值找含扩展名的文件名，
-                # 最后从 URL 的 ?fname= 参数兜底。
-                filename = ""
-                if isinstance(data, dict):
-                    source = str(data.get("url") or data.get("file_url") or "").strip()
-                    filename = str(
-                        data.get("name") or data.get("file_name") or data.get("filename") or data.get("file") or ""
-                    ).strip()
-                    if not filename:
-                        for key, val in data.items():
-                            if key in ("url", "file_url"):
-                                continue
-                            if isinstance(val, str) and RunningHubGenericPlugin._detect_file_type_from_name(val) != "video":
-                                filename = val.strip()
-                                break
-                    if not source:
-                        source = filename
-                    if not filename:
-                        m = re.search(r"[?&]fname=([^&]+)", source)
-                        if m:
-                            filename = m.group(1)
-                else:
-                    source = data_text
-                    filename = source
-                if source:
-                    file_type = RunningHubGenericPlugin._detect_file_type_from_name(filename or source)
-                    files.append((file_type, source))
-            # 注意：QQ「文件」消息（群文件）会被转成 text 段（[文件] ... 链接: gzc-download URL），
-            # 但该直链下载到的是错误 ZIP（PK 魔数），不能直接下载；真正的文件内容由
-            # handle_notice_collector（after_process）通过 NapCat get_file API 获取。
-        return files
+        """从消息中提取文件（委托 file_source）。"""
+        return extract_files_from_message(message)
 
     @staticmethod
     def _detect_file_type_from_name(name: str) -> str:
-        """根据文件名 / URL 的扩展名推断文件类型（image / audio / video）。
-
-        QQ「文件」消息（type=file）不区分图片 / 音频 / 视频，统一走这里按扩展名判断，
-        否则以文件形式发的图片 / 音频会被当成视频而匹配不到对应节点。
-        """
-        path = str(name or "").split("?", 1)[0].strip().lower()
-        if path.endswith((
-            ".png", ".jpg", ".jpeg", ".jpe", ".jfif", ".webp", ".gif", ".bmp",
-            ".tif", ".tiff", ".ico", ".heic", ".heif", ".avif", ".jxl", ".svg", ".raw", ".dib",
-        )):
-            return "image"
-        if path.endswith((
-            ".mp3", ".wav", ".flac", ".aac", ".m4a", ".m4r", ".ogg", ".oga", ".opus",
-            ".wma", ".amr", ".silk", ".aiff", ".aif", ".ape", ".alac", ".wv",
-            ".mp2", ".mpga", ".ac3", ".mka", ".mid", ".midi",
-        )):
-            return "audio"
-        return "video"
+        """根据文件名 / URL 的扩展名推断文件类型（委托 file_source）。"""
+        return detect_file_type_from_name(name)
 
     @staticmethod
     def _extract_text_from_message(message: dict) -> str:
-        """从消息中提取纯文本内容（text 段 data 为字符串）。"""
-        raw = message.get("raw_message") or []
-        if not isinstance(raw, list):
-            return ""
-        parts: list[str] = []
-        for seg in raw:
-            if not isinstance(seg, dict):
-                continue
-            if str(seg.get("type") or "") != "text":
-                continue
-            data = seg.get("data")
-            if isinstance(data, str):
-                parts.append(data)
-        return "".join(parts).strip()
+        """从消息中提取纯文本内容（委托 file_source）。"""
+        return extract_text_from_message(message)
 
     @staticmethod
     def _is_finish_signal(text: str) -> bool:
-        """判断文本是否为"跳过剩余文件、直接开始运行"的触发词。
-
-        去掉前导斜杠、中文引号/括号等包裹符后再匹配，兼容「跳过剩余」/『跳过剩余』/（跳过剩余）等写法。
-        """
-        _STRIP = "/「」『』【】()（）[]\"'，。！!?？：: "
-        normalized = str(text or "").strip().strip(_STRIP).lower()
-        if not normalized:
-            return False
-        if normalized in _FINISH_KEYWORDS:
-            return True
-        return normalized.startswith("跳过") or normalized.startswith("开始运行")
+        """判断文本是否为"跳过剩余文件、直接开始运行"的触发词（委托 file_source）。"""
+        return is_finish_signal(text)
 
     async def _fetch_file_bytes(self, source: str) -> bytes:
-        """从 base64 数据、URL 或本地路径获取文件字节（带大小上限）。
-
-        注意：本地路径（如适配器传入的 /data/voice.amr 或缓存文件）是合法来源，
-        必须保留；这里只限制大小，不限制来源类型。
-        """
-        if source.startswith("base64://"):
-            import base64
-
-            encoded = source[len("base64://"):]
-            # base64 解码后约 3/4 大小，先按编码长度预估，避免解码超大内容
-            if len(encoded) > _MAX_FILE_BYTES * 4 // 3:
-                raise RunningHubError(f"上传内容超过 {_MAX_FILE_BYTES} 字节上限，已拒绝")
-            return base64.b64decode(encoded)
-        if source.startswith(("http://", "https://")):
-            client = self._client
-            if client is None:
-                raise RunningHubError("客户端未初始化")
-            data = await client.download_bytes(source)
-            return data
-        path = Path(source)
-        if path.is_file():
-            if path.stat().st_size > _MAX_FILE_BYTES:
-                raise RunningHubError(f"文件超过 {_MAX_FILE_BYTES} 字节上限，已拒绝: {source}")
-            return await asyncio.to_thread(path.read_bytes)
-        raise RunningHubError(f"无法读取文件: {source}")
+        """从 base64 数据、URL 或本地路径获取文件字节（委托 file_source）。"""
+        return await fetch_file_bytes(source, self._client)
 
     @staticmethod
     def _guess_filename(source: str, file_type: str, file_data: bytes | None = None) -> str:
-        """根据来源/字节猜测文件名（含扩展名，图片按魔数识别真实格式）。"""
-        base = source.split("?", 1)[0].rsplit("/", 1)[-1]
-        if base and "." in base and not base.startswith("base64:"):
-            return base
-        ext = ""
-        if file_type == "image" and file_data:
-            if file_data[:3] == b"\xff\xd8\xff":
-                ext = ".jpg"
-            elif file_data[:8] == b"\x89PNG\r\n\x1a\n":
-                ext = ".png"
-            elif len(file_data) >= 12 and file_data[:4] == b"RIFF" and file_data[8:12] == b"WEBP":
-                ext = ".webp"
-            elif file_data[:6] in (b"GIF87a", b"GIF89a"):
-                ext = ".gif"
-        if not ext:
-            ext = {"image": ".png", "audio": ".mp3", "video": ".mp4"}.get(file_type, ".bin")
-        return f"input_{file_type}_{int(time.time())}{ext}"
+        """根据来源/字节猜测文件名（委托 file_source）。"""
+        return guess_filename(source, file_type, file_data)
 
 
 
@@ -1939,17 +1670,34 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         """后台轮询任务状态，完成后下载并发送结果；按配置定时撤回。
 
         结果按类型分流：图片直接发送；其他类型（视频等）发送下载链接。
+        任务状态与消耗由 task_journal 持久化，进程重启后 pending 任务可恢复轮询。
         """
         client = client or self._client
         chat_info = self._extract_chat_info(kwargs or {})
+        journal = self._task_journal
+        try:
+            journal = await self._load_task_journal()
+        except asyncio.CancelledError:
+            self._pending.pop(task_id, None)
+            self._task_meta.pop(task_id, None)
+            self._semaphore.release()
+            raise
+        except Exception as exc:
+            self.ctx.logger.warning("读取任务日志失败，本次任务不记录: %s", exc)
+            journal = None
         try:
             try:
                 result = await client.wait_for_result(task_id)
             except (RunningHubError, TimeoutError) as exc:
                 self.ctx.logger.error("任务 %s 未成功完成: %s", task_id, exc)
+                if journal is not None:
+                    await journal.mark_failed(task_id, str(exc))
                 if stream_id:
                     await self.ctx.send.text("哦不好意思，任务运行失败了", stream_id)
                 return
+
+            if journal is not None:
+                await journal.mark_success(task_id, workflow_runner.consume_coins_from_result(result))
 
             result_items: list[tuple[str, str]] = []
             for item in result.get("results") or []:
@@ -1996,7 +1744,6 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                         )
                         if should_cleanup and message_id:
                             self._schedule_recall(message_id, recall_seconds)
-                        # 追加到 LLM 聊天上下文：让 LLM 能看到并记住自己生成的图片
                         await self._append_result_to_llm_context(
                             stream_id,
                             [{"type": "image", "binary_data_base64": image_base64, "description": "RunningHub 生成结果"}],
@@ -2007,7 +1754,6 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                     video_message_id = await self._send_video_with_id(url, stream_id, chat_info=chat_info)
                     if should_cleanup and video_message_id:
                         self._schedule_recall(video_message_id, recall_seconds)
-                    # 视频无法直接给 LLM 看，追加链接文本，让 LLM 知道生成了什么
                     await self._append_result_to_llm_context(
                         stream_id,
                         [{"type": "text", "data": url}],
@@ -2017,7 +1763,6 @@ class RunningHubGenericPlugin(MaiBotPlugin):
                 elif stream_id:
                     await self.ctx.send.text(f"任务结果 {index + 1}：{url}", stream_id)
 
-            # 所有结果都追加完后，统一触发一次 LLM 确认回复（避免多结果重复触发）
             if appended_result:
                 await self._trigger_llm_result_reply(stream_id)
         except asyncio.CancelledError:
@@ -2025,6 +1770,8 @@ class RunningHubGenericPlugin(MaiBotPlugin):
             raise
         except Exception as exc:
             self.ctx.logger.error("任务 %s 处理异常: %s", task_id, exc, exc_info=True)
+            if journal is not None:
+                await journal.mark_failed(task_id, str(exc))
             if stream_id:
                 await self.ctx.send.text("哦不好意思，处理结果时出了点问题", stream_id)
         finally:
@@ -2082,251 +1829,48 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     @staticmethod
     def _is_image_url(url: str, output_type: str = "") -> bool:
-        """判断结果是否指向图片：优先信 RunningHub 的 outputType，否则按扩展名粗判。"""
-        normalized = str(output_type or "").strip().lower()
-        if normalized in ("image", "png", "jpg", "jpeg", "webp", "gif", "bmp"):
-            return True
-        if normalized in ("video", "mp4", "mov", "webm", "avi", "mkv", "flv", "m4v", "mpg", "mpeg", "3gp", "wmv"):
-            return False
-        path = str(url or "").split("?", 1)[0].lower()
-        return path.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"))
+        """判断结果是否指向图片（委托 workflow_runner）。"""
+        return workflow_runner.is_image_url(url, output_type)
 
     @staticmethod
     def _is_video_url(url: str, output_type: str = "") -> bool:
-        """判断结果是否指向视频：优先信 RunningHub 的 outputType，否则按扩展名粗判。"""
-        normalized = str(output_type or "").strip().lower()
-        if normalized in ("video", "mp4", "mov", "webm", "avi", "mkv", "flv", "m4v", "mpg", "mpeg", "3gp", "wmv"):
-            return True
-        if normalized in ("image", "png", "jpg", "jpeg", "webp", "gif", "bmp"):
-            return False
-        path = str(url or "").split("?", 1)[0].lower()
-        return path.endswith((".mp4", ".mov", ".webm", ".avi", ".mkv", ".flv", ".m4v", ".mpg", ".mpeg", ".3gp", ".wmv"))
+        """判断结果是否指向视频（委托 workflow_runner）。"""
+        return workflow_runner.is_video_url(url, output_type)
 
     @staticmethod
     def _extract_chat_info(kwargs: dict) -> dict:
-        """从命令 kwargs 中提取群号/用户号，用于 NapCat 直发与撤回。"""
-        message = kwargs.get("message")
-        if isinstance(message, dict) and message:
-            info = message.get("message_info") or {}
-            group_info = info.get("group_info") or {}
-            user_info = info.get("user_info") or {}
-            group_id = str(group_info.get("group_id") or "")
-            user_id = str(user_info.get("user_id") or "")
-            return {"group_id": group_id, "user_id": user_id, "chat_type": "group" if group_id else "private"}
-        group_id = str(kwargs.get("group_id") or "")
-        user_id = str(kwargs.get("user_id") or "")
-        return {"group_id": group_id, "user_id": user_id, "chat_type": "group" if group_id else "private"}
+        """从命令 kwargs 中提取群号/用户号（委托 workflow_runner）。"""
+        return workflow_runner.extract_chat_info(kwargs)
 
     async def _call_napcat_action(self, action: str, params: dict) -> Any:
-        """调用 NapCat 动作，按候选 API 名逐个尝试并缓存命中。"""
-        candidates = _resolve_action_api(action, type(self)._resolved_action_api)
-        call_style = _ACTION_CALL_STYLE.get(action, "params")
-        last_error = ""
-        for index, api_name in enumerate(candidates):
-            try:
-                if call_style == "spread":
-                    result = await self.ctx.api.call(api_name, **params)
-                else:
-                    result = await self.ctx.api.call(api_name, params=params)
-            except Exception as exc:
-                last_error = str(exc)
-                if index < len(candidates) - 1:
-                    self.ctx.logger.info("NapCat 调用 %s 异常，尝试下一候选: %s", api_name, last_error)
-                    continue
-                self.ctx.logger.warning("NapCat 调用 %s 失败: %s", api_name, last_error)
-                return None
-            if isinstance(result, dict) and result.get("success") is False:
-                error_text = str(result.get("error") or "")
-                if index < len(candidates) - 1:
-                    self.ctx.logger.info("NapCat 调用 %s 业务失败，尝试下一候选: %s", api_name, error_text)
-                    continue
-                self.ctx.logger.warning("NapCat 调用 %s 业务失败: %s", api_name, error_text)
-                return None
-            if type(self)._resolved_action_api.get(action) != api_name:
-                type(self)._resolved_action_api[action] = api_name
-            self.ctx.logger.debug("NapCat 调用 %s 成功: %s", api_name, str(result)[:200])
-            return result
-        self.ctx.logger.error("NapCat 调用 %s 失败，所有候选 API 均不可用: %s", action, last_error)
-        return None
+        """调用 NapCat 动作（委托 delivery）。"""
+        return await self._ensure_delivery().call_action(action, params)
 
     async def _send_image_with_id(self, image_base64: str, stream_id: str, *, chat_info: dict) -> str:
-        """通过 NapCat 直发图片并返回平台 message_id（用于撤回）。
-
-        注：MaiBot 的 send.image(return_details=True) 当前不回填 message_id，撤回只能靠 NapCat 直发。
-        """
-        group_id = str(chat_info.get("group_id") or "")
-        user_id = str(chat_info.get("user_id") or "")
-
-        if group_id or user_id:
-            try:
-                if group_id:
-                    action = "send_group_msg"
-                    params = {
-                        "group_id": int(group_id),
-                        "message": [{"type": "image", "data": {"file": f"base64://{image_base64}"}}],
-                    }
-                else:
-                    action = "send_private_msg"
-                    params = {
-                        "user_id": int(user_id),
-                        "message": [{"type": "image", "data": {"file": f"base64://{image_base64}"}}],
-                    }
-            except (TypeError, ValueError):
-                self.ctx.logger.warning(
-                    "群号/用户号不是数字（group_id=%s user_id=%s），回退 ctx.send.image",
-                    group_id, user_id,
-                )
-                await self.ctx.send.image(image_base64, stream_id)
-                return ""
-            self.ctx.logger.debug(
-                "尝试 NapCat 直发图片: action=%s group_id=%s user_id=%s", action, group_id, user_id
-            )
-            try:
-                response = await self._call_napcat_action(action, params)
-            except Exception as exc:
-                response = None
-                self.ctx.logger.warning("NapCat 直发图片异常，回退 ctx.send.image: %s", exc)
-            if response is not None:
-                if self._is_napcat_failed(response):
-                    self.ctx.logger.warning(
-                        "NapCat 直发业务失败，回退 ctx.send.image: %s", str(response)[:200]
-                    )
-                else:
-                    message_id = self._extract_message_id(response)
-                    if message_id:
-                        return message_id
-                    self.ctx.logger.warning(
-                        "NapCat 发送成功但未返回 message_id，无法撤回: %s", str(response)[:200]
-                    )
-                    return ""
-        else:
-            self.ctx.logger.warning("无法解析群号/用户号，回退 ctx.send.image")
-
-        await self.ctx.send.image(image_base64, stream_id)
-        return ""
+        """NapCat 直发图片并返回平台 message_id（委托 delivery）。"""
+        return await self._ensure_delivery().send_image_with_id(image_base64, stream_id, chat_info=chat_info)
 
     async def _send_video_with_id(self, video_url: str, stream_id: str, *, chat_info: dict) -> str:
-        """通过 NapCat 直发视频并返回平台 message_id（用于撤回）；失败回退 send.custom 或发链接。
-
-        注：MaiBot 的 send.custom(return_details=True) 当前不回填 message_id，撤回只能靠 NapCat 直发。
-        """
-        group_id = str(chat_info.get("group_id") or "")
-        user_id = str(chat_info.get("user_id") or "")
-
-        if group_id or user_id:
-            try:
-                if group_id:
-                    action = "send_group_msg"
-                    params = {
-                        "group_id": int(group_id),
-                        "message": [{"type": "video", "data": {"file": video_url}}],
-                    }
-                else:
-                    action = "send_private_msg"
-                    params = {
-                        "user_id": int(user_id),
-                        "message": [{"type": "video", "data": {"file": video_url}}],
-                    }
-            except (TypeError, ValueError):
-                self.ctx.logger.warning("群号/用户号不是数字，回退 send.custom 发视频")
-            else:
-                self.ctx.logger.debug(
-                    "尝试 NapCat 直发视频: action=%s group_id=%s user_id=%s", action, group_id, user_id
-                )
-                try:
-                    response = await self._call_napcat_action(action, params)
-                except Exception as exc:
-                    response = None
-                    self.ctx.logger.warning("NapCat 直发视频异常，回退 send.custom: %s", exc)
-                if response is not None:
-                    if self._is_napcat_failed(response):
-                        self.ctx.logger.warning("NapCat 直发视频业务失败，回退 send.custom: %s", str(response)[:200])
-                    else:
-                        message_id = self._extract_message_id(response)
-                        if message_id:
-                            return message_id
-                        return ""
-        else:
-            self.ctx.logger.warning("无法解析群号/用户号，回退 send.custom 发视频")
-
-        # 回退 send.custom 发视频（拿不到 message_id，不撤回）
-        try:
-            ok = await self.ctx.send.custom("videourl", video_url, stream_id)
-            if ok:
-                return ""
-        except Exception as exc:
-            self.ctx.logger.warning("send.custom 发视频异常，回退发链接: %s", exc)
-
-        await self.ctx.send.text(video_url, stream_id)
-        return ""
+        """NapCat 直发视频并返回平台 message_id（委托 delivery）。"""
+        return await self._ensure_delivery().send_video_with_id(video_url, stream_id, chat_info=chat_info)
 
     @staticmethod
     def _is_napcat_failed(response: Any) -> bool:
-        """判断 NapCat 响应是否为业务失败（retcode 非 0 或 status 为 failed/error）。"""
-        if not isinstance(response, dict):
-            return False
-        retcode = response.get("retcode")
-        if retcode is not None:
-            try:
-                if int(retcode) != 0:
-                    return True
-            except (TypeError, ValueError):
-                pass
-        status = str(response.get("status") or "").strip().lower()
-        return status in {"failed", "error"}
+        """判断 NapCat 响应是否为业务失败（委托 delivery）。"""
+        return NapcatDelivery.is_failed(response)
 
     @staticmethod
     def _extract_message_id(response: Any) -> str:
-        """从 NapCat API 响应中提取 message_id。"""
-        if not isinstance(response, dict):
-            return ""
-        result = response.get("result")
-        if isinstance(result, dict):
-            mid = result.get("message_id") or result.get("msg_id")
-            if mid:
-                return str(mid)
-        mid = response.get("message_id") or response.get("msg_id")
-        if mid:
-            return str(mid)
-        data = response.get("data")
-        if isinstance(data, dict):
-            mid = data.get("message_id") or data.get("msg_id")
-            if mid:
-                return str(mid)
-        return ""
+        """从 NapCat API 响应中提取 message_id（委托 delivery）。"""
+        return NapcatDelivery.extract_message_id(response)
 
     def _schedule_recall(self, message_id: str, delay_seconds: int) -> None:
-        """调度一个延时撤回任务，并保存引用防止被回收。"""
-        task = asyncio.create_task(self._delayed_recall(message_id, delay_seconds))
-        self._recall_tasks.add(task)
-        task.add_done_callback(self._recall_tasks.discard)
+        """调度一个延时撤回任务（委托 delivery）。"""
+        self._ensure_delivery().schedule_recall(message_id, delay_seconds)
 
     async def _delayed_recall(self, message_id: str, delay_seconds: int) -> None:
-        """延迟指定秒数后撤回消息（仅 NapCat 适配器生效），失败时重试一次。"""
-        await asyncio.sleep(delay_seconds)
-        self.ctx.logger.info("开始撤回消息: message_id=%s", message_id)
-        try:
-            for attempt in (1, 2):
-                result = await self._call_napcat_action("delete_msg", {"message_id": message_id})
-                if result is None:
-                    self.ctx.logger.warning(
-                        "撤回消息 %s 失败（第 %d 次，API 调用未成功）", message_id, attempt
-                    )
-                elif self._is_napcat_failed(result):
-                    self.ctx.logger.warning(
-                        "撤回消息 %s 业务失败（第 %d 次）: %s", message_id, attempt, str(result)[:200]
-                    )
-                else:
-                    self.ctx.logger.info("已撤回消息 %s", message_id)
-                    return
-                if attempt == 1:
-                    await asyncio.sleep(5)
-            self.ctx.logger.error("撤回消息 %s 两次尝试均失败", message_id)
-        except asyncio.CancelledError:
-            self.ctx.logger.info("撤回任务已取消: message_id=%s", message_id)
-            raise
-        except Exception as exc:
-            self.ctx.logger.warning("撤回消息 %s 失败: %s", message_id, exc)
+        """延迟指定秒数后撤回消息（委托 delivery）。"""
+        await self._ensure_delivery().delayed_recall(message_id, delay_seconds)
 
     # ── 命令 / 工具 / API 组件 ────────────────────────────────────
 
@@ -2463,6 +2007,14 @@ class RunningHubGenericPlugin(MaiBotPlugin):
         if poll_task is not None:
             poll_task.cancel()
         self._task_meta.pop(task_id, None)
+        if not remote_cancel_error:
+            try:
+                await (await self._load_task_journal()).mark_cancelled(task_id)
+            except Exception as exc:
+                self.ctx.logger.warning("更新任务取消状态失败: %s", exc)
+        else:
+            self.ctx.logger.warning("任务 %s 平台取消失败，日志保持 pending 以便重启后继续跟踪", task_id)
+
 
         if remote_cancel_error:
             await self.ctx.send.text(
@@ -2559,67 +2111,12 @@ class RunningHubGenericPlugin(MaiBotPlugin):
 
     @staticmethod
     def _decode_base64_bounded(encoded: str, max_bytes: int = _MAX_FILE_BYTES) -> bytes:
-        """解码 base64 并强制大小上限，防止 QQ 群文件结果撑爆内存。"""
-        import base64
-
-        encoded = str(encoded or "").strip()
-        if not encoded:
-            return b""
-        if len(encoded) > max_bytes * 4 // 3 + 4:
-            raise RunningHubError(f"base64 内容超过 {max_bytes} 字节上限，已拒绝")
-        data = base64.b64decode(encoded, validate=False)
-        if len(data) > max_bytes:
-            raise RunningHubError(f"base64 解码后超过 {max_bytes} 字节上限，已拒绝")
-        return data
+        """解码 base64 并强制大小上限（委托 file_source）。"""
+        return decode_base64_bounded(encoded, max_bytes)
 
     async def _extract_bytes_from_napcat_result(self, result: Any) -> bytes | None:
-        """从 NapCat get_file / get_group_file_url 返回里解析出文件字节。"""
-        if isinstance(result, str):
-            result = result.strip()
-            if result.startswith("base64://"):
-                return self._decode_base64_bounded(result[len("base64://"):])
-            if result.startswith(("http://", "https://")):
-                client = self._client
-                if client is not None:
-                    return await client.download_bytes(result)
-            return None
-
-        if not isinstance(result, dict):
-            return None
-
-        data = result.get("data")
-        if isinstance(data, dict):
-            b64 = str(data.get("file") or data.get("base64") or data.get("data") or "").strip()
-            if b64.startswith("base64://"):
-                b64 = b64[len("base64://"):]
-            if b64:
-                try:
-                    return self._decode_base64_bounded(b64)
-                except RunningHubError:
-                    raise
-                except Exception:
-                    # 非法 base64 保持原行为：跳过该候选，继续尝试其他字段/API
-                    pass
-            url = str(data.get("url") or data.get("file_url") or data.get("download_url") or "").strip()
-            if url.startswith(("http://", "https://")):
-                client = self._client
-                if client is not None:
-                    return await client.download_bytes(url)
-            path = str(data.get("path") or data.get("file_path") or "").strip()
-            if path:
-                p = Path(path)
-                if p.is_file():
-                    if p.stat().st_size > _MAX_FILE_BYTES:
-                        raise RunningHubError(f"本地文件超过 {_MAX_FILE_BYTES} 字节上限，已拒绝: {path}")
-                    return await asyncio.to_thread(p.read_bytes)
-
-        url = result.get("url")
-        if isinstance(url, str) and url.startswith(("http://", "https://")):
-            client = self._client
-            if client is not None:
-                return await client.download_bytes(url)
-
-        return None
+        """从 NapCat get_file / get_group_file_url 返回里解析文件字节（委托 file_source）。"""
+        return await extract_bytes_from_napcat_result(result, self._client)
 
     @Command("工作流", description="列出已配置的工作流", pattern=r"^/工作流")
     async def handle_list_workflows(self, **kwargs: Any) -> tuple[bool, str, int]:

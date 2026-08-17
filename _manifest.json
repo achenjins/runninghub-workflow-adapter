@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
   "plugin_type": "media",
-  "id": "github.achenjins.runninghub-workflow-adapter",
-  "version": "1.0.1",
+  "id": "github.achenjins.runninghub-animaimage",
+  "version": "1.1.0",
   "name": "麦麦画师 · RunningHub",
   "description": "让麦麦亲手给你画画：从一句话文生图，到多参考图 / 视频生成，统统自动完成并把成品发回聊天。支持自定义工作流、自己优化成本、AI 扩写提示词和限流防刷。仅适配 NapCat / QQ。",
   "author": {
@@ -11,10 +11,10 @@
   },
   "license": "MIT",
   "urls": {
-    "repository": "https://github.com/achenjins/runninghub-workflow-adapter",
-    "homepage": "https://github.com/achenjins/runninghub-workflow-adapter",
-    "documentation": "https://github.com/achenjins/runninghub-workflow-adapter/blob/main/README.md",
-    "issues": "https://github.com/achenjins/runninghub-workflow-adapter/issues"
+    "repository": "https://github.com/achenjins/runninghub-animaimage",
+    "homepage": "https://github.com/achenjins/runninghub-animaimage",
+    "documentation": "https://github.com/achenjins/runninghub-animaimage/blob/main/README.md",
+    "issues": "https://github.com/achenjins/runninghub-animaimage/issues"
   },
   "host_application": {
     "min_version": "1.0.0",
