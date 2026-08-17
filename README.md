@@ -49,8 +49,8 @@
 ## 安装
 
     cd <MaiBot目录>/plugins
-    git clone https://github.com/achenjins/runninghub-animaimage.git runninghub-animaimage
-    pip install -r runninghub-animaimage/requirements.txt
+    git clone https://github.com/achenjins/runninghub-workflow-adapter.git runninghub-workflow-adapter
+    pip install -r runninghub-workflow-adapter/requirements.txt
 
 克隆并装好依赖后，重启 MaiBot（或在 WebUI 里热重载插件），插件即自动加载。
 
