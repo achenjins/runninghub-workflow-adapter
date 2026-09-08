@@ -1673,7 +1673,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
 
     # ── 命令 / 工具 / API 组件 ────────────────────────────────────
 
-    @HookHandler("before_process", name="generic_input_collector",
+    @HookHandler("chat.receive.before_process", name="generic_input_collector",
                  description="保存素材上下文并在后台串行收集命令输入", mode=HookMode.BLOCKING,
                  order=HookOrder.EARLY, timeout_ms=60000, error_policy=ErrorPolicy.SKIP)
     async def handle_input_collector(self, message: dict | None = None, **kwargs: Any) -> dict | None:
