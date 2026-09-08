@@ -89,12 +89,15 @@ class NaturalLanguageMixin:
         self._vision_cache[key] = {"created_at": time.time(), "description": summary}
         return summary
 
-    @Tool("run_workflow", description="执行用户明确要求的媒体生成/修改。先用 rh_context 查看实时工作流和素材，必要时 rh_inspect_media 看图。允许文生图、图生图、视频、多参考图及参数修改。参考素材仅用 media_id，按角色明确绑定；不知道的必填项返回给用户补充。成功表示已排队，结果异步发送；不要重复提交或声称已生成。", parameters=[
+    @Tool("run_workflow", description="执行用户明确要求的媒体生成/修改。先用 rh_context 查看实时工作流和素材，必要时 rh_inspect_media 看图。允许文生图、图生图、视频、多参考图及参数修改。参考素材必须取自 rh_context：input 用 workflows[].inputs[].key、media_id 用 media[].media_id（m- 开头，不得编造聊天里的图片编号）；只有一个媒体槽且只有一张当前/引用图时 references 可留空自动绑定；不知道的必填项返回给用户补充。成功表示已排队，结果异步发送；不要重复提交或声称已生成。", parameters=[
         Param(name="workflow_name", description="rh_context 中的工作流名称；不确定时留空自动规划", required=False, default=""),
         Param(name="prompt", description="用户的生成要求；修改任务时填写具体修改，保留用户约束", required=False, default=""),
         Param(name="context_id", description="rh_context 返回的上下文 ID", required=False, default=""),
         Param(name="references", param_type=Type.ARRAY, description="媒体输入角色绑定", required=False,
-              items_schema={"type": "object", "properties": {"input": {"type": "string"}, "media_id": {"type": "string"}}, "required": ["input", "media_id"], "additionalProperties": False}),
+              items_schema={"type": "object", "properties": {
+                  "input": {"type": "string", "description": "rh_context 返回的 workflows[].inputs[].key"},
+                  "media_id": {"type": "string", "description": "rh_context 返回的 media[].media_id"}},
+                  "required": ["input", "media_id"], "additionalProperties": False}),
         Param(name="parameters", param_type=Type.OBJECT, description="可编辑参数 key 到值，使用 rh_context 中的 key", required=False, additional_properties=True),
         Param(name="source_task_id", description="基于自己的上次任务继续修改时填写其任务 ID", required=False, default=""),
         Param(name="continue_draft", param_type=Type.BOOLEAN, description="本条是在补充 rh_context 返回的待办需求时为 true", required=False, default=False)])

@@ -525,6 +525,28 @@ class PureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(media, [])
         self.assertEqual({m["input"] for m in missing}, {"subject", "style"})
 
+    async def test_media_input_lenient_match_and_self_healing_errors(self):
+        # 模型常拿 类型/字段名/中文标签 当 input_key（"不存在的媒体输入：image" 的真实成因）：唯一命中自动归一
+        wf = WorkflowItemSection(name="draw", workflow_id="12345", input_nodes=[
+            InputNodeSection(node_id="1", field_name="prompt", value_type="prompt", label="description"),
+            InputNodeSection(node_id="3", field_name="image", value_type="image", label="参考图")])
+        candidates = [{"media_id": "m-abc", "type": "image", "origin": "current", "description": ""}]
+        _, media, missing = bind_plan(wf, "cat", [{"input": "image", "media_id": "m-abc"}], {}, candidates)
+        self.assertEqual([m["input"] for m in media], ["3.image"])
+        self.assertFalse(missing)
+        _, media, _ = bind_plan(wf, "cat", [{"input": "参考图", "media_id": "m-abc"}], {}, candidates)
+        self.assertEqual([m["input"] for m in media], ["3.image"])
+        # QQ 图片编号不在候选：报错列出真实 media_id，让模型下一轮自纠
+        with self.assertRaises(PlanError) as err:
+            bind_plan(wf, "cat", [{"input": "image", "media_id": "1359117711"}], {}, candidates)
+        self.assertIn("m-abc", str(err.exception))
+        # 两个同类媒体槽：不按到达顺序猜，报歧义并列出完整 key
+        wf2 = workflow(media=True, two=True)
+        with self.assertRaises(PlanError) as err:
+            bind_plan(wf2, "cat", [{"input": "image", "media_id": "a"}], {}, [{"media_id": "a", "type": "image", "origin": "current"}])
+        self.assertIn("歧义", str(err.exception))
+        self.assertIn("subject", str(err.exception))
+
     async def test_fixed_media_default_and_optional_skip(self):
         wf = workflow(media=True, two=True)
         wf.input_nodes[1].field_value = "openapi/fixed.png"

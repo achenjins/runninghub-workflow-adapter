@@ -113,6 +113,39 @@ def validate_parameter(node: Any, value: Any) -> str:
     return text
 
 
+def _media_key_hint(nodes: dict) -> str:
+    return "、".join(
+        f"{k}（{getattr(n, 'label', '') or resolve_value_type(n)}）"
+        for k, n in nodes.items() if resolve_value_type(n) in MEDIA_TYPES) or "无"
+
+
+def _match_media_key(key: str, nodes: dict, bindings: dict) -> str:
+    """精确 input_key 优先；否则按 类型/字段名/标签/角色 唯一命中时宽松归一。
+
+    模型常把 "image"、字段名或中文标签当 key 用；唯一命中没有猜测风险，
+    多义时列出候选让模型在下一轮推理里自我纠正，绝不按到达顺序猜。
+    """
+    node = nodes.get(key)
+    if node is not None:
+        if resolve_value_type(node) not in MEDIA_TYPES:
+            raise PlanError(f"输入 {key} 不是媒体节点；可用媒体输入：{_media_key_hint(nodes)}")
+        return key
+    lowered = key.strip().lower()
+    if not lowered:
+        raise PlanError(f"媒体输入为空；可用媒体输入：{_media_key_hint(nodes)}")
+    matches = [k for k, n in nodes.items() if resolve_value_type(n) in MEDIA_TYPES and (
+        resolve_value_type(n) == lowered
+        or k.rsplit(".", 1)[-1].lower() == lowered
+        or lowered in (str(getattr(n, "label", "") or "").strip().lower(),
+                       str(getattr(n, "role", "") or "").strip().lower()))]
+    matches = [k for k in dict.fromkeys(matches) if k not in bindings]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise PlanError(f"媒体输入 {key} 有歧义（唯一命中才会自动匹配）；请用完整 key：{'、'.join(matches)}")
+    raise PlanError(f"不存在的媒体输入：{key}；可用媒体输入：{_media_key_hint(nodes)}")
+
+
 def bind_plan(workflow: Any, prompt: str, references: list[dict], parameters: dict,
               candidates: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
     """Return overrides, resolved media bindings, missing inputs. No I/O or guesses."""
@@ -125,21 +158,25 @@ def bind_plan(workflow: Any, prompt: str, references: list[dict], parameters: di
     for ref in references:
         if not isinstance(ref, dict) or set(ref) - {"input", "media_id"}:
             raise PlanError("参考素材仅接受 input 和 media_id")
-        key = str(ref.get("input") or "")
-        node = nodes.get(key)
-        if node is None or resolve_value_type(node) not in MEDIA_TYPES:
-            raise PlanError(f"不存在的媒体输入：{key}")
+        key = _match_media_key(str(ref.get("input") or ""), nodes, bindings)
+        node = nodes[key]
         if key in bindings:
             raise PlanError(f"媒体输入 {key} 重复绑定")
         asset = available.get(str(ref.get("media_id") or ""))
         if asset is None:
-            raise PlanError("所选素材已过期或不属于本次会话候选，请重新调用 rh_context")
+            hints = "、".join(
+                f"{a['media_id']}[{a['type']}：{a.get('description') or a.get('origin', '')}]"
+                for a in candidates[:12])
+            raise PlanError(
+                f"素材 ID {ref.get('media_id')} 不在本次候选（media_id 必须取自 rh_context 的 media[].media_id，"
+                f"不能用聊天里的图片编号/URL）。当前候选：{hints or '空——请重新调用 rh_context'}")
         if asset["type"] != resolve_value_type(node):
-            raise PlanError(f"素材类型与 {key} 不符")
+            raise PlanError(f"素材类型与 {key} 不符（需要 {resolve_value_type(node)}）")
         bindings[key] = asset
     for key in parameters:
         if key not in nodes or resolve_value_type(nodes[key]) != "text":
-            raise PlanError(f"参数 {key} 不允许修改，请使用 rh_context 返回的参数标识")
+            text_keys = "、".join(k for k, n in nodes.items() if resolve_value_type(n) == "text") or "无"
+            raise PlanError(f"参数 {key} 不允许修改；可改参数：{text_keys}")
 
     # Only a unique current/quoted asset and a unique empty slot may bind automatically.
     # Multiple roles must be selected explicitly, never assigned by arrival order.
