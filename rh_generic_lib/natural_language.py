@@ -29,9 +29,9 @@ class NaturalLanguageMixin:
             cards = [workflow_card(w) for w in self.config.workflows.items if self._is_llm_callable_workflow(w)]
             draft = (self._drafts.get((uid, stream)) or {}).get("plan")
             return {"success": True, "context_id": snapshot["context_id"], "workflows": cards,
-                    "media": [{k: v for k, v in a.items() if k not in {"source", "file_id", "stream_id"}} for a in snapshot["assets"]],
+                    "media": [{k: v for k, v in a.items() if k not in {"source", "file_id", "stream_id", "group_id"}} for a in snapshot["assets"]],
                     "draft": {k: v for k, v in draft.items() if k != "assets"} if draft else None,
-                    "message": "需要看图时用 rh_inspect_media。run_workflow 使用本 context_id；仅填用户明确提出的参数，保留其他默认值。补充上一条需求时设置 continue_draft=true。"}
+                    "message": "需要看图时用 rh_inspect_media。run_workflow 使用本 context_id；仅填用户明确提出的参数，保留其他默认值。补充上一条需求时设置 continue_draft=true。「画我/用我头像」可把 media 里 avatar: 开头的头像绑给图片输入。"}
         except (PlanError, ValueError) as exc:
             return {"success": False, "message": str(exc)}
 

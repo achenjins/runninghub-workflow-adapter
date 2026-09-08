@@ -57,6 +57,7 @@ from rh_generic_lib.media_plan import validate_workflow, PlanError  # noqa: E402
 from rh_generic_lib.delivery import NapcatDelivery  # noqa: E402
 from rh_generic_lib.file_source import (  # noqa: E402
     MAX_FILE_BYTES as _MAX_FILE_BYTES,
+    add_trusted_root as file_source_add_trusted_root,
     decode_base64_bounded,
     detect_file_type_from_name,
     extract_bytes_from_napcat_result,
@@ -234,6 +235,7 @@ class NaturalLanguageSection(PluginConfigBase):
     planner_model: str = Field(default="utils", description="未指定工作流时内部规划使用的模型槽位")
     vision_model: str = Field(default="", description="可选：图片摘要模型槽位，必须支持视觉；留空由主对话模型通过 rh_inspect_media 看图")
     llm_timeout: int = Field(default=45, ge=5, le=180, description="规划、视觉摘要及扩写的超时秒数")
+    avatar_candidates: bool = Field(default=True, description="把用户头像（群聊含群头像）作为可选素材，支持「画我」类请求")
 
 
 class InputNodeSection(PluginConfigBase):
@@ -668,6 +670,10 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             self.ctx.logger.warning("未配置 RunningHub API Key，请编辑插件目录下 config.toml 的 server.api_key")
         # 启动临时文件定时清理（启动时 + 每 6 小时清理一次）
         self._cleanup_task = asyncio.create_task(self._cleanup_cache_loop())
+        # 本地素材直读白名单：只登记插件缓存目录（系统临时目录已在模块加载时登记）
+        cache_dir = self._get_cache_dir()
+        if cache_dir is not None:
+            file_source_add_trusted_root(cache_dir)
 
         self.ctx.logger.info(
             "麦麦画师插件已加载：base_url=%s 工作流数量=%d",

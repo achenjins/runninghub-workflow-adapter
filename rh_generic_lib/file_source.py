@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import os
 import re
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,57 @@ from rh_generic_lib.runninghub_client import RunningHubError
 
 # 上传/下载单个文件的最大字节数（512MB），防止异常或恶意超大内容撑爆内存
 MAX_FILE_BYTES = 512 * 1024 * 1024
+
+# 允许按本地路径读取的目录白名单：消息段里的 path/file 字段不可信，
+# 只有适配器缓存目录与系统临时目录内的普通文件才允许直读（插件 on_load 注册缓存根目录）。
+# resolve() 后做相对路径校验，符号链接越狱与 .. 逃逸一并拒绝；UNC 一律拒绝。
+TRUSTED_FILE_ROOTS: list[Path] = []
+
+
+def add_trusted_root(path: Any) -> None:
+    """登记一个可信本地目录（幂等）。适配器/缓存落盘文件只可能出现在这些树下。"""
+    try:
+        resolved = Path(str(path or "")).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return
+    if resolved and resolved not in TRUSTED_FILE_ROOTS:
+        TRUSTED_FILE_ROOTS.append(resolved)
+
+
+add_trusted_root(tempfile.gettempdir())
+
+
+def trusted_local_file(value: Any) -> Path | None:
+    """返回白名单内的可读普通文件路径，否则 None。"""
+    raw = str(value or "").strip()
+    if not raw or "\x00" in raw:
+        return None
+    if raw.lower().startswith("file://"):
+        from urllib.parse import unquote, urlparse
+        try:
+            parsed = urlparse(raw)
+        except ValueError:
+            return None
+        if parsed.netloc not in ("", "localhost"):
+            return None
+        raw = unquote(parsed.path)
+        if os.name == "nt" and re.match(r"^/[A-Za-z]:/", raw):
+            raw = raw[1:]
+    if raw.replace("/", "\\").startswith("\\\\"):
+        return None  # UNC：可能触发 SMB 凭据外发，直接拒绝
+    try:
+        resolved = Path(raw).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not resolved.is_file():
+        return None
+    for root in TRUSTED_FILE_ROOTS:
+        try:
+            resolved.relative_to(root)
+            return resolved
+        except ValueError:
+            continue
+    return None
 
 # 交互收集会话中，用于"跳过剩余文件、直接开始运行"的触发词
 FINISH_KEYWORDS = {
@@ -150,12 +203,12 @@ async def fetch_file_bytes(source: str, client: Any) -> bytes:
         if client is None:
             raise RunningHubError("客户端未初始化")
         return await client.download_bytes(source)
-    path = Path(source)
-    if path.is_file():
+    path = trusted_local_file(source)
+    if path is not None:
         if path.stat().st_size > getattr(client, "max_file_bytes", MAX_FILE_BYTES):
-            raise RunningHubError(f"文件超过 {MAX_FILE_BYTES} 字节上限，已拒绝: {source}")
+            raise RunningHubError(f"文件超过 {MAX_FILE_BYTES} 字节上限，已拒绝")
         return await asyncio.to_thread(path.read_bytes)
-    raise RunningHubError(f"无法读取文件: {source}")
+    raise RunningHubError("无法读取文件：本地路径仅限适配器缓存/系统临时目录，其他内容请通过 URL 或重发消息提供")
 
 
 def guess_filename(source: str, file_type: str, file_data: bytes | None = None) -> str:
@@ -231,10 +284,10 @@ async def extract_bytes_from_napcat_result(result: Any, client: Any) -> bytes | 
                 return await client.download_bytes(url)
         path = str(data.get("path") or data.get("file_path") or (raw_file if not raw_file.startswith(("base64://", "http://", "https://")) else "")).strip()
         if path:
-            p = Path(path)
-            if p.is_file():
+            p = trusted_local_file(path)
+            if p is not None:
                 if p.stat().st_size > getattr(client, "max_file_bytes", MAX_FILE_BYTES):
-                    raise RunningHubError(f"本地文件超过 {MAX_FILE_BYTES} 字节上限，已拒绝: {path}")
+                    raise RunningHubError(f"本地文件超过 {MAX_FILE_BYTES} 字节上限，已拒绝")
                 return await asyncio.to_thread(p.read_bytes)
 
     url = result.get("url")

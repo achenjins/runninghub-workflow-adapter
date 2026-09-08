@@ -43,11 +43,11 @@ def segments(message):
     return [s["data"] if s.get("type") == "dict" and isinstance(s.get("data"), dict) else s for s in raw if isinstance(s, dict)]
 
 
-def assets_from_message(message, stream, origin, id_ctx=""):
+def assets_from_message(message, stream, origin, id_ctx="", group_id=""):
     result = []
     mid = str(message.get("message_id") or "")
     for index, seg in enumerate(segments(message)):
-        kind = {"record": "audio", "voice": "audio"}.get(seg.get("type"), seg.get("type"))
+        kind = {"record": "audio", "voice": "audio", "emoji": "image"}.get(seg.get("type"), seg.get("type"))
         data = seg.get("data")
         fields = data if isinstance(data, dict) else {}
         if kind == "file":
@@ -61,10 +61,14 @@ def assets_from_message(message, stream, origin, id_ctx=""):
         if str(source).startswith("base64://"):
             source = ""
         key = hashlib.sha256(f"{stream}:{mid}:{index}:{id_ctx}:{seg.get('binary_hash', '')}".encode()).hexdigest()[:20]
-        result.append({"media_id": "m-" + key, "type": kind, "origin": origin, "message_id": mid,
-                       "stream_id": stream, "index": index, "source": str(source),
-                       "file_id": str(fields.get("file_id") or fields.get("file") or ""),
-                       "description": str(seg.get("description") or (data if isinstance(data, str) and not source else ""))[:500]})
+        asset = {"media_id": "m-" + key, "type": kind, "origin": origin, "message_id": mid,
+                 "stream_id": stream, "index": index, "source": str(source),
+                 "file_id": str(fields.get("file_id") or fields.get("file") or ""),
+                 "description": str(seg.get("description") or (data if isinstance(data, str) and not source else ""))[:500]}
+        if group_id:
+            # 群文件段解析需要 group_id 才能走 get_group_file_url 链路
+            asset["group_id"] = str(group_id)
+        result.append(asset)
     return result
 
 
@@ -147,16 +151,18 @@ class MediaContextMixin:
             anchor = max(own, key=timestamp) if own else None
         if not anchor or not anchor.get("message_id"):
             raise PlanError("暂时无法定位触发消息，请重新发送需求或使用 /rh运行")
-        assets = assets_from_message(anchor, stream, "current")
-        reply_ids = [s.get("data", {}).get("target_message_id") for s in segments(anchor)
-                     if s.get("type") == "reply" and isinstance(s.get("data"), dict)]
+        group_info = (anchor.get("message_info") or {}).get("group_info") or {}
+        gid = str(group_info.get("group_id") or kwargs.get("group_id") or "").strip()
+        assets = assets_from_message(anchor, stream, "current", group_id=gid)
+        reply_ids = [(d := s.get("data", {})).get("target_message_id") or d.get("message_id")
+                     for s in segments(anchor) if s.get("type") == "reply" and isinstance(s.get("data"), dict)]
         if isinstance(anchor.get("reply_to"), str):
             reply_ids.append(anchor["reply_to"])
         for mid in dict.fromkeys(str(m) for m in reply_ids if m):
             try:
                 quoted = unwrap(await self.ctx.message.get_by_id(mid, chat_id=stream))
                 if isinstance(quoted, dict) and identity(quoted)[1] in {"", stream}:
-                    assets.extend(assets_from_message(quoted, stream, "reply"))
+                    assets.extend(assets_from_message(quoted, stream, "reply", group_id=gid))
             except Exception:
                 pass
         # OneBot reply.data.id is a platform ID, distinct from MaiBot's message_id.
@@ -171,7 +177,7 @@ class MediaContextMixin:
                 if not isinstance(quoted, dict) or (quoted.get("group_id") and str(quoted["group_id"]) != group):
                     continue
                 # 平台消息 ID 掺入哈希：引用多条无 binary_hash 的旧消息时素材 ID 不互相碰撞
-                for asset in assets_from_message(quoted, stream, "reply", id_ctx=platform_id):
+                for asset in assets_from_message(quoted, stream, "reply", id_ctx=platform_id, group_id=gid):
                     asset.update(platform_message_id=platform_id, message_id="")
                     assets.append(asset)
             except Exception:
@@ -183,7 +189,14 @@ class MediaContextMixin:
                 except (TypeError, ValueError):
                     fresh = False
                 if fresh:
-                    assets.extend(assets_from_message(message, stream, "recent"))
+                    assets.extend(assets_from_message(message, stream, "recent", group_id=gid))
+        if self.config.natural_language.avatar_candidates:
+            # 头像不是消息段：以宿主可信的 uid/群号为目标生成候选，LLM 只能引用不能指定
+            assets.append({"media_id": f"avatar:{uid}", "type": "image", "origin": "avatar",
+                           "description": "当前用户的 QQ 头像（画我/用我头像类请求绑定它）", "stream_id": stream})
+            if gid and gid != uid:
+                assets.append({"media_id": f"avatar-group:{gid}", "type": "image", "origin": "avatar",
+                               "description": "本群的群头像", "stream_id": stream})
         journal = await self._load_task_journal()
         for record in journal.records():
             if record["user_id"] != uid or record["stream_id"] != stream or record["status"] != "success":
@@ -207,6 +220,10 @@ class MediaContextMixin:
         return snapshot
 
     async def _resolve_asset(self, asset, client):
+        media_id = str(asset.get("media_id") or "")
+        if media_id.startswith("avatar:") or media_id.startswith("avatar-group:"):
+            from .avatar_source import fetch_avatar_bytes
+            return await fetch_avatar_bytes(media_id, api=self.ctx.api, client=client, logger=self.ctx.logger)
         if asset.get("platform_message_id"):
             try:
                 message = unwrap(await self.ctx.api.call("adapter.napcat.action.call", action_name="get_msg", params={"message_id": asset["platform_message_id"]}))
@@ -240,6 +257,22 @@ class MediaContextMixin:
                     return data
             except Exception:
                 pass
+            if asset.get("group_id"):
+                # 群文件：gzc-download 直链常是坏 ZIP，改走 get_group_file_url 候选链
+                for call in (
+                    lambda: self.ctx.api.call("adapter.napcat.action.call", action_name="get_group_file_url",
+                                              params={"file_id": file_id, "group_id": asset["group_id"]}),
+                    lambda: self.ctx.api.call("adapter.napcat.file.get_group_file_url",
+                                              params={"file_id": file_id, "group_id": asset["group_id"]}),
+                    lambda: self.ctx.api.call("adapter.napcat.message.get_group_file_url",
+                                              params={"file_id": file_id, "group_id": asset["group_id"]}),
+                ):
+                    try:
+                        data = await extract_bytes_from_napcat_result(await call(), client)
+                        if data:
+                            return data
+                    except Exception:
+                        continue
         if asset.get("source"):
             return await fetch_file_bytes(asset["source"], client)
         raise PlanError("无法读取所选素材，文件链接可能已过期；请重新发送该文件")

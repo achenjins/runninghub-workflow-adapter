@@ -161,6 +161,36 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         await self.p._cancel_task(result["task_id"], "s1")
         self.assertEqual(self.p._task_journal.get(result["task_id"])["status"], "cancelled")
 
+    async def test_avatar_asset_binds_via_adapter_then_cdn_fallback(self):
+        # 「画我」：头像候选由宿主可信 uid/群号生成，绑定后现场解析字节并上传
+        self.set_config(workflow(media=True))
+        ctx = await self.p.handle_rh_context(user_id="11", stream_id="s1")
+        self.assertIn("avatar:11", {a["media_id"] for a in ctx["media"]})
+        self.assertIn("avatar-group:22", {a["media_id"] for a in ctx["media"]})
+        self.p.ctx.api.call = AsyncMock(return_value={"success": True, "result": {"code": 0, "data": {"b64": base64.b64encode(PNG).decode()}}})
+        result = await self.p.handle_run_workflow("draw", "画我", context_id=ctx["context_id"],
+                                                  references=[{"input": "subject", "media_id": "avatar:11"}],
+                                                  user_id="11", stream_id="s1")
+        self.assertTrue(result["success"], result.get("message"))
+        await self.settled()
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual(record["status"], "success")
+        self.client.upload_file.assert_awaited_once()
+        # 适配器不可用 → qlogo 公开直链兜底（大小/魔数校验后使用）
+        self.p.ctx.api.call = AsyncMock(side_effect=Exception("api not registered"))
+        downloads: list[str] = []
+        async def grab(url):
+            downloads.append(str(url))
+            return PNG
+        self.client.download_bytes = AsyncMock(side_effect=grab)
+        again = await self.p.handle_run_workflow("draw", "画我的另一张",
+                                                 references=[{"input": "subject", "media_id": "avatar:11"}],
+                                                 user_id="11", stream_id="s1")
+        self.assertTrue(again["success"], again.get("message"))
+        await self.settled()
+        self.assertEqual(self.client.submit.await_count, 2)
+        self.assertTrue(any(d.startswith("https://q4.qlogo.cn/headimg_dl?dst_uin=11") for d in downloads), downloads)
+
     async def test_single_prompt_end_to_end(self):
         result = await self.p.handle_run_workflow("draw", "cat", user_id="11", stream_id="s1")
         self.assertTrue(result["success"])
@@ -179,8 +209,8 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.set_config(workflow(media=True, parameter=True))
         ctx = await self.p.handle_rh_context(user_id="11", stream_id="s1")
         self.assertTrue(ctx["success"])
-        self.assertEqual({a["origin"] for a in ctx["media"]}, {"current", "reply", "recent"})
-        self.assertEqual({a["message_id"] for a in ctx["media"]}, {"m1", "quote", "own"})
+        self.assertEqual({a["origin"] for a in ctx["media"]}, {"current", "reply", "recent", "avatar"})
+        self.assertEqual({a["message_id"] for a in ctx["media"] if a["origin"] != "avatar"}, {"m1", "quote", "own"})
         self.assertEqual(ctx["workflows"][0]["inputs"][-1]["key"], "width")
 
     async def test_current_image_is_bound_and_uploaded(self):
@@ -504,6 +534,27 @@ class PureTests(unittest.IsolatedAsyncioTestCase):
             await delivery.send_image_with_id("data", "s1", chat_info={"user_id": "11"})
         ctx.api.call.assert_awaited_once()
         ctx.send.image.assert_not_awaited()
+
+    async def test_local_file_requires_trusted_root(self):
+        from rh_generic_lib.file_source import fetch_file_bytes
+        client = SimpleNamespace(download_bytes=AsyncMock(return_value=PNG), max_file_bytes=1024)
+        # 白名单外（含典型 LFI 目标）一律拒绝
+        for probe in ("C:/Windows/win.ini", "/etc/passwd", "\\\\evil\\share\\x.png"):
+            with self.assertRaises(RunningHubError):
+                await fetch_file_bytes(probe, client)
+        # 系统临时目录默认可信
+        tmp = Path(tempfile.gettempdir()) / "rh_trusted_probe.png"
+        tmp.write_bytes(PNG)
+        try:
+            self.assertEqual(await fetch_file_bytes(str(tmp), client), PNG)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    async def test_emoji_segment_and_group_id_stamp(self):
+        from rh_generic_lib.media_context import assets_from_message
+        msg = {"message_id": "e1", "raw_message": [{"type": "emoji", "data": {"url": "https://gchat.qpic.cn/emoji/x.gif"}}]}
+        assets = assets_from_message(msg, "s1", "current", group_id="22")
+        self.assertEqual([(a["type"], a.get("group_id")) for a in assets], [("image", "22")])
 
     async def test_video_and_unknown_file_segments(self):
         files = extract_files_from_message({"message": [{"type": "video", "data": {"file": "https://example.test/clip.mp4"}}, {"type": "file", "data": {"name": "x.zip", "url": "https://example.test/x.zip"}}]})

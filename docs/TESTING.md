@@ -10,7 +10,8 @@
 4. 如需聊天中识别并写入工作流，先填写 `access.admin_users`。默认 `manage_workflows_admin_only = true`。
 5. 重载插件，核对新工具 `rh_context`、`rh_inspect_media`、`run_workflow`、`rh_task` 已启用，并允许新增的 `message.get_recent`、`message.get_by_id` 能力。
 6. 主对话模型具备视觉能力时，可通过看图工具读取真实图片；若主对话模型只支持文本，配置 `natural_language.vision_model` 为视觉模型槽位。图像摘要缓存会按模型和内容区分。视频／音频支持上传和角色绑定，目前不自动分析帧或转写音轨。
-7. 群聊中 MaiBot 工具上下文不注入 `user_id`（上游群聊会话固定清空，见 chat_manager），插件回退使用「最近一条入站消息的宿主注入发言人身份」（约 5 分钟内有效）计费与限流；私聊由宿主直接注入，不走回退。
+7. 头像素材：`natural_language.avatar_candidates`（默认开启）把当前用户 QQ 头像（群聊还有群头像）注入素材候选，media_id 形如 `avatar:群内QQ`/`avatar-group:群号`，支持「画我/用我头像」；目标只取宿主可信身份，经 NapCat `get_avatar` 解析，失败自动回退 qlogo 公开直链，响应做图片魔数与大小校验。本地文件直读收紧为白名单（系统临时目录 + 插件缓存目录），UNC/file:// 与符号链接逃逸一律拒绝。
+8. 群聊中 MaiBot 工具上下文不注入 `user_id`（上游群聊会话固定清空，见 chat_manager），插件回退使用「最近一条入站消息的宿主注入发言人身份」（约 5 分钟内有效）计费与限流；私聊由宿主直接注入，不走回退。
 
 ### 升级时提示缺少 `plugin.config_version`
 

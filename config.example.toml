@@ -48,6 +48,8 @@ max_candidates = 12
 planner_model = "utils"
 # 留空由主对话模型使用 rh_inspect_media 看图；或填支持图片的模型槽位
 vision_model = ""
+# 把用户头像（群聊含群头像）作为可选素材，支持「画我」类请求；不需要可设 false
+avatar_candidates = true
 llm_timeout = 45
 
 # ────────────────────────────────────────────────────────────
