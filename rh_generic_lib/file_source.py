@@ -34,13 +34,15 @@ def extract_files_from_message(message: dict) -> list[tuple[str, str]]:
     - 语音: {"type":"voice","data":"<内容/url>","binary_data_base64":"<base64 或空>"}
     优先用 binary_data_base64，否则回退 data（url/本地路径）。
     """
-    raw = message.get("raw_message") or []
+    raw = message.get("raw_message") or message.get("message_segments") or message.get("message") or []
     if not isinstance(raw, list):
         return []
     files: list[tuple[str, str]] = []
     for seg in raw:
         if not isinstance(seg, dict):
             continue
+        if seg.get("type") == "dict" and isinstance(seg.get("data"), dict):
+            seg = seg["data"]
         seg_type = str(seg.get("type") or "")
         data = seg.get("data")
         if isinstance(data, dict):
@@ -56,6 +58,10 @@ def extract_files_from_message(message: dict) -> list[tuple[str, str]]:
             source = ("base64://" + b64) if b64 else data_text
             if source:
                 files.append(("audio", source))
+        elif seg_type == "video":
+            source = ("base64://" + b64) if b64 else data_text
+            if source:
+                files.append(("video", source))
         elif seg_type == "file":
             filename = ""
             if isinstance(data, dict):
@@ -67,7 +73,7 @@ def extract_files_from_message(message: dict) -> list[tuple[str, str]]:
                     for key, val in data.items():
                         if key in ("url", "file_url"):
                             continue
-                        if isinstance(val, str) and detect_file_type_from_name(val) != "video":
+                        if isinstance(val, str) and detect_file_type_from_name(val) != "unknown":
                             filename = val.strip()
                             break
                 if not source:
@@ -81,7 +87,8 @@ def extract_files_from_message(message: dict) -> list[tuple[str, str]]:
                 filename = source
             if source:
                 file_type = detect_file_type_from_name(filename or source)
-                files.append((file_type, source))
+                if file_type != "unknown":
+                    files.append((file_type, source))
     return files
 
 
@@ -99,12 +106,14 @@ def detect_file_type_from_name(name: str) -> str:
         ".mp2", ".mpga", ".ac3", ".mka", ".mid", ".midi",
     )):
         return "audio"
-    return "video"
+    if path.endswith((".mp4", ".mov", ".webm", ".mkv", ".avi", ".flv", ".m4v", ".mpeg", ".mpg", ".3gp", ".wmv")):
+        return "video"
+    return "unknown"
 
 
 def extract_text_from_message(message: dict) -> str:
     """从消息中提取纯文本内容。"""
-    raw = message.get("raw_message") or []
+    raw = message.get("raw_message") or message.get("message_segments") or message.get("message") or []
     if not isinstance(raw, list):
         return ""
     parts: list[str] = []
@@ -116,6 +125,8 @@ def extract_text_from_message(message: dict) -> str:
         data = seg.get("data")
         if isinstance(data, str):
             parts.append(data)
+        elif isinstance(data, dict) and isinstance(data.get("text"), str):
+            parts.append(data["text"])
     return "".join(parts).strip()
 
 
@@ -134,16 +145,14 @@ async def fetch_file_bytes(source: str, client: Any) -> bytes:
     """从 base64 数据、URL 或本地路径获取文件字节（带大小上限）。"""
     if source.startswith("base64://"):
         encoded = source[len("base64://"):]
-        if len(encoded) > MAX_FILE_BYTES * 4 // 3:
-            raise RunningHubError(f"上传内容超过 {MAX_FILE_BYTES} 字节上限，已拒绝")
-        return base64.b64decode(encoded)
+        return decode_base64_bounded(encoded, getattr(client, "max_file_bytes", MAX_FILE_BYTES))
     if source.startswith(("http://", "https://")):
         if client is None:
             raise RunningHubError("客户端未初始化")
         return await client.download_bytes(source)
     path = Path(source)
     if path.is_file():
-        if path.stat().st_size > MAX_FILE_BYTES:
+        if path.stat().st_size > getattr(client, "max_file_bytes", MAX_FILE_BYTES):
             raise RunningHubError(f"文件超过 {MAX_FILE_BYTES} 字节上限，已拒绝: {source}")
         return await asyncio.to_thread(path.read_bytes)
     raise RunningHubError(f"无法读取文件: {source}")
@@ -176,7 +185,7 @@ def decode_base64_bounded(encoded: str, max_bytes: int = MAX_FILE_BYTES) -> byte
         return b""
     if len(encoded) > max_bytes * 4 // 3 + 4:
         raise RunningHubError(f"base64 内容超过 {max_bytes} 字节上限，已拒绝")
-    data = base64.b64decode(encoded, validate=False)
+    data = base64.b64decode(encoded, validate=True)
     if len(data) > max_bytes:
         raise RunningHubError(f"base64 解码后超过 {max_bytes} 字节上限，已拒绝")
     return data
@@ -187,7 +196,7 @@ async def extract_bytes_from_napcat_result(result: Any, client: Any) -> bytes | 
     if isinstance(result, str):
         result = result.strip()
         if result.startswith("base64://"):
-            return decode_base64_bounded(result[len("base64://"):])
+            return decode_base64_bounded(result[len("base64://"):], getattr(client, "max_file_bytes", MAX_FILE_BYTES))
         if result.startswith(("http://", "https://")):
             if client is not None:
                 return await client.download_bytes(result)
@@ -196,27 +205,35 @@ async def extract_bytes_from_napcat_result(result: Any, client: Any) -> bytes | 
     if not isinstance(result, dict):
         return None
 
+    if result.get("success") is False:
+        return None
+    if isinstance(result.get("result"), dict):
+        return await extract_bytes_from_napcat_result(result["result"], client)
+
     data = result.get("data")
     if isinstance(data, dict):
-        b64 = str(data.get("file") or data.get("base64") or data.get("data") or "").strip()
+        raw_file = str(data.get("file") or "").strip()
+        b64 = str(data.get("base64") or data.get("binary_data_base64") or "").strip()
+        if raw_file.startswith("base64://"):
+            b64 = raw_file
         if b64.startswith("base64://"):
             b64 = b64[len("base64://"):]
         if b64:
             try:
-                return decode_base64_bounded(b64)
+                return decode_base64_bounded(b64, getattr(client, "max_file_bytes", MAX_FILE_BYTES))
             except RunningHubError:
                 raise
             except Exception:
                 pass
-        url = str(data.get("url") or data.get("file_url") or data.get("download_url") or "").strip()
+        url = str(data.get("url") or data.get("file_url") or data.get("download_url") or (raw_file if raw_file.startswith(("http://", "https://")) else "")).strip()
         if url.startswith(("http://", "https://")):
             if client is not None:
                 return await client.download_bytes(url)
-        path = str(data.get("path") or data.get("file_path") or "").strip()
+        path = str(data.get("path") or data.get("file_path") or (raw_file if not raw_file.startswith(("base64://", "http://", "https://")) else "")).strip()
         if path:
             p = Path(path)
             if p.is_file():
-                if p.stat().st_size > MAX_FILE_BYTES:
+                if p.stat().st_size > getattr(client, "max_file_bytes", MAX_FILE_BYTES):
                     raise RunningHubError(f"本地文件超过 {MAX_FILE_BYTES} 字节上限，已拒绝: {path}")
                 return await asyncio.to_thread(p.read_bytes)
 

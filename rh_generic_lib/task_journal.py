@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import time
 from pathlib import Path
@@ -16,6 +17,7 @@ STATUS_PENDING = "pending"
 STATUS_SUCCESS = "success"
 STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
+ACTIVE_STATUSES = {"queued", "submitting", "unknown_submission", "pending", "tracking_paused"}
 
 # 日志最多保留条数；超过后只裁剪已终结任务，pending 必须保留以支持重启恢复
 _MAX_RECORDS = 500
@@ -32,6 +34,8 @@ _RECORD_FIELDS = (
     "created_at",
     "updated_at",
     "message",
+    "remote_task_id", "request_key", "request", "submitted_at", "outputs", "delivery_status",
+    "delivered_indexes", "cancel_requested",
 )
 
 
@@ -46,7 +50,7 @@ class TaskJournal:
         self.loaded = False
 
     async def load(self) -> None:
-        """从磁盘读取日志；文件缺失或损坏时降级为空日志，不影响插件启动。
+        """从磁盘读取日志；缺失时初始化，损坏时拒绝覆盖和创建付费任务。
 
         同一实例只从磁盘加载一次：运行期间以内存状态为准，避免并发轮询时
         互相用旧快照覆盖对方刚写入的记录。
@@ -58,18 +62,21 @@ class TaskJournal:
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
             except FileNotFoundError:
                 return []
-            except (OSError, ValueError):
-                return []
             if not isinstance(raw, list):
-                return []
+                raise ValueError("任务日志结构损坏，拒绝覆盖；请备份并检查 task_journal.json")
             records: list[dict[str, Any]] = []
             for item in raw:
                 if not isinstance(item, dict) or not str(item.get("task_id") or "").strip():
-                    continue
-                records.append(self._normalize_record(item))
+                    raise ValueError("任务日志包含无效记录，请先备份并修复")
+                record = self._normalize_record(item)
+                if record.get("delivery_status") == "sending":
+                    record.update(delivery_status="uncertain", message="进程在发送期间退出，请确认是否收到后使用 /rh补发")
+                records.append(record)
             return records
 
         async with self._lock:
+            if self.loaded:
+                return
             self._records = await asyncio.to_thread(_read)
             self._trim_locked()
             self.loaded = True
@@ -103,10 +110,13 @@ class TaskJournal:
             force_status=True,
         )
 
-    async def mark_success(self, task_id: str, coins: Any) -> None:
+    async def mark_success(self, task_id: str, coins: Any, outputs: list | None = None) -> None:
+        updates = {"coins": str(coins if coins is not None else "0").strip(), "status": STATUS_SUCCESS, "message": ""}
+        if outputs is not None:
+            updates.update(outputs=outputs, delivery_status="pending")
         await self._upsert(
             task_id,
-            {"coins": str(coins if coins is not None else "0").strip(), "status": STATUS_SUCCESS, "message": ""},
+            updates,
         )
 
     async def mark_failed(self, task_id: str, message: str = "") -> None:
@@ -127,41 +137,66 @@ class TaskJournal:
         ]
 
     def records(self) -> list[dict[str, Any]]:
-        return [dict(record) for record in self._records]
+        return copy.deepcopy(self._records)
+
+    def get(self, task_id: str) -> dict[str, Any] | None:
+        return next((r for r in self.records() if r["task_id"] == task_id), None)
+
+    def find_request(self, request_key: str) -> dict[str, Any] | None:
+        if not request_key:
+            return None
+        return next((r for r in self.records() if r.get("request_key") == request_key), None)
+
+    def recoverable_records(self) -> list[dict[str, Any]]:
+        return [r for r in self.records() if r["status"] in ACTIVE_STATUSES
+                or (r["status"] == STATUS_SUCCESS and r.get("delivery_status") in {"pending", "partial", "failed"})]
+
+    def quota_used(self, user_id: str, now: float) -> int:
+        return sum(1 for r in self._records if r.get("user_id") == user_id and (
+            r["status"] == "queued" or
+            (float(r.get("submitted_at") or 0) > now - 3600)))
+
+    async def update(self, task_id: str, **updates: Any) -> None:
+        await self._upsert(task_id, updates, force_status=True)
 
     def _normalize_record(self, raw: dict[str, Any]) -> dict[str, Any]:
         record: dict[str, Any] = {}
         for field in _RECORD_FIELDS:
             record[field] = raw.get(field, "")
         record["task_id"] = str(record.get("task_id") or "").strip()
-        if record["status"] not in {STATUS_PENDING, STATUS_SUCCESS, STATUS_FAILED, STATUS_CANCELLED}:
+        if record["status"] not in ACTIVE_STATUSES | {STATUS_SUCCESS, STATUS_FAILED, STATUS_CANCELLED}:
             record["status"] = STATUS_PENDING
+        record["request"] = copy.deepcopy(raw.get("request")) if isinstance(raw.get("request"), dict) else {}
+        record["outputs"] = copy.deepcopy(raw.get("outputs")) if isinstance(raw.get("outputs"), list) else []
+        record["delivered_indexes"] = list(raw.get("delivered_indexes") or [])
+        # Version 1.1 records used the remote ID as the primary key.
+        if not record["remote_task_id"] and not record["task_id"].startswith("rh-"):
+            record["remote_task_id"] = record["task_id"]
+        if "delivery_status" not in raw and record["status"] == STATUS_SUCCESS:
+            record["delivery_status"] = "sent"
+        if "submitted_at" not in raw:
+            record["submitted_at"] = raw.get("created_at", 0)
         return record
 
     async def _upsert(self, task_id: str, updates: dict[str, Any], force_status: bool = False) -> None:
         now = time.time()
         async with self._lock:
+            previous = copy.deepcopy(self._records)
             for index, record in enumerate(self._records):
                 if str(record.get("task_id") or "") == task_id:
                     merged = dict(record)
                     merged.update(updates)
-                    if (
-                        record.get("status") == STATUS_PENDING
-                        and updates.get("status") == STATUS_PENDING
-                        and force_status
-                    ):
-                        # 重复提交同一个 pending 任务时保留第一次的上下文，
-                        # 避免把 workflow / stream_id 覆盖成空值
-                        return
-                    if merged.get("status") == STATUS_PENDING and not force_status:
-                        # 非强制状态更新不得覆盖 pending（例如取消回调竞态）
-                        return
                     merged["updated_at"] = now
                     self._records[index] = self._normalize_record(merged)
-                    await self._write_locked()
+                    try:
+                        await self._write_locked()
+                    except OSError:
+                        self._records = previous
+                        raise
                     return
             record = self._normalize_record(
                 {
+                    **updates,
                     "task_id": task_id,
                     "workflow": str(updates.get("workflow") or "").strip(),
                     "coins": str(updates.get("coins") or "0"),
@@ -177,18 +212,24 @@ class TaskJournal:
             )
             self._records.insert(0, record)
             self._trim_locked()
-            await self._write_locked()
+            try:
+                await self._write_locked()
+            except OSError:
+                self._records = previous
+                raise
 
     def _trim_locked(self) -> None:
         """超量时裁掉最旧的已终结记录；pending 永不裁掉。"""
         while len(self._records) > self.max_records:
             for index in range(len(self._records) - 1, -1, -1):
-                if self._records[index].get("status") != STATUS_PENDING:
+                record = self._records[index]
+                if (record.get("status") not in ACTIVE_STATUSES
+                        and record.get("delivery_status") not in {"pending", "partial", "failed", "sending", "uncertain"}
+                        and float(record.get("submitted_at") or 0) < time.time() - 3600):
                     self._records.pop(index)
                     break
             else:
-                # 全部 pending（理论上不会发生），保留最近 max_records 条
-                del self._records[self.max_records:]
+                # Unfinished work and the current quota window must never be trimmed.
                 return
 
     async def _write_locked(self) -> None:
@@ -206,5 +247,6 @@ class TaskJournal:
             )
             temp.replace(self.path)
         except OSError:
-            # 任务日志只是辅助记录，磁盘写失败不得影响任务运行
-            return
+            # A paid submission must not proceed if its reservation cannot be saved.
+            temp.unlink(missing_ok=True)
+            raise

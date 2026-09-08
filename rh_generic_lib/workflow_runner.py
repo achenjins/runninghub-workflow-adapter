@@ -212,6 +212,8 @@ def consume_coins_from_result(result: Any) -> str:
 
 def is_image_url(url: str, output_type: str = "") -> bool:
     normalized = str(output_type or "").strip().lower()
+    if normalized.startswith("image/"):
+        return True
     if normalized in ("image", "png", "jpg", "jpeg", "webp", "gif", "bmp"):
         return True
     if normalized in ("video", "mp4", "mov", "webm", "avi", "mkv", "flv", "m4v", "mpg", "mpeg", "3gp", "wmv"):
@@ -222,6 +224,8 @@ def is_image_url(url: str, output_type: str = "") -> bool:
 
 def is_video_url(url: str, output_type: str = "") -> bool:
     normalized = str(output_type or "").strip().lower()
+    if normalized.startswith("video/"):
+        return True
     if normalized in ("video", "mp4", "mov", "webm", "avi", "mkv", "flv", "m4v", "mpg", "mpeg", "3gp", "wmv"):
         return True
     if normalized in ("image", "png", "jpg", "jpeg", "webp", "gif", "bmp"):

@@ -1,0 +1,99 @@
+# 配置示例：复制需要的 [[workflows.items]] 到自己的 config.toml。
+# 工作流和节点 ID 均为占位示例，必须根据自己的 RunningHub 工作流替换。
+# 多图角色由工作流本身实现；本插件只负责选择、上传和映射输入。
+
+[[workflows.items]]
+name = "双参考图编辑"
+workflow_id = "REPLACE_WITH_YOUR_WORKFLOW_ID"
+region = "overseas"
+instance_type = "Standard"
+description = "以主体参考图保留人物身份，采用风格参考图的画风；支持指定宽度"
+capability = "multi_reference"
+output_type = "image"
+natural_language = true
+llm_enhance = true
+prompt_profile = "edit"
+# 可设置自己的 txt/md 扩写规则；提供时优先于 prompt_profile
+llm_template_path = ""
+
+[[workflows.items.input_nodes]]
+node_id = "1"
+field_name = "text"
+value_type = "prompt"
+input_key = "instruction"
+label = "修改要求"
+required = true
+
+[[workflows.items.input_nodes]]
+node_id = "2"
+field_name = "image"
+value_type = "image"
+input_key = "subject"
+role = "subject"
+label = "主体参考图"
+required = true
+
+[[workflows.items.input_nodes]]
+node_id = "3"
+field_name = "image"
+value_type = "image"
+input_key = "style"
+role = "style"
+label = "风格参考图"
+required = true
+
+[[workflows.items.input_nodes]]
+node_id = "4"
+field_name = "width"
+value_type = "text"
+input_key = "width"
+label = "宽度"
+field_value = "1024"
+parameter_type = "integer"
+minimum = 256
+maximum = 2048
+
+# 图生视频示例：角色提示帮助模型选择对应首尾帧。
+[[workflows.items]]
+name = "首尾帧视频"
+workflow_id = "REPLACE_WITH_YOUR_VIDEO_WORKFLOW_ID"
+region = "overseas"
+instance_type = "Standard"
+description = "用第一张图作为首帧、第二张作为尾帧，按用户描述生成过渡视频"
+capability = "image_to_video"
+output_type = "video"
+natural_language = true
+llm_enhance = true
+prompt_profile = "video"
+
+[[workflows.items.input_nodes]]
+node_id = "10"
+field_name = "prompt"
+value_type = "prompt"
+label = "运动与镜头要求"
+
+[[workflows.items.input_nodes]]
+node_id = "11"
+field_name = "image"
+value_type = "image"
+input_key = "first_frame"
+role = "first_frame"
+label = "首帧图片"
+
+[[workflows.items.input_nodes]]
+node_id = "12"
+field_name = "image"
+value_type = "image"
+input_key = "last_frame"
+role = "last_frame"
+label = "尾帧图片"
+
+[[workflows.items.input_nodes]]
+node_id = "13"
+field_name = "duration"
+value_type = "text"
+input_key = "duration"
+label = "时长（秒）"
+field_value = "5"
+parameter_type = "integer"
+choices = ["5", "10"]

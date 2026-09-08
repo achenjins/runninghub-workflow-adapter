@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 from typing import Any
 
 import requests
@@ -29,6 +30,18 @@ class RunningHubError(RuntimeError):
     """RunningHub API 调用失败时抛出的异常。"""
 
 
+class RunningHubTransportError(RunningHubError):
+    """The server outcome is unknown. Never automatically retry a paid POST."""
+
+
+class RunningHubTaskError(RunningHubError):
+    """The remote service explicitly reported a terminal failure."""
+
+    def __init__(self, message: str, status: str = "FAILED") -> None:
+        super().__init__(message)
+        self.status = status
+
+
 class RunningHubClient:
     """RunningHub 工作流客户端。"""
 
@@ -41,6 +54,8 @@ class RunningHubClient:
         timeout: int = 120,
         poll_interval: int = 10,
         max_wait: int = 1800,
+        max_file_bytes: int = _MAX_DOWNLOAD_BYTES,
+        query_retries: int = 3,
     ) -> None:
         self.base_url = str(base_url or "").rstrip("/")
         self.api_key = str(api_key or "")
@@ -48,6 +63,8 @@ class RunningHubClient:
         self.timeout = int(timeout)
         self.poll_interval = int(poll_interval)
         self.max_wait = int(max_wait)
+        self.max_file_bytes = max(1, int(max_file_bytes))
+        self.query_retries = max(0, int(query_retries))
 
     @staticmethod
     def _headers(api_key: str) -> dict[str, str]:
@@ -74,7 +91,10 @@ class RunningHubClient:
                 response.raise_for_status()
                 return response.json()
             except requests.RequestException as exc:
-                raise RunningHubError(f"请求失败: {exc}") from exc
+                response = getattr(exc, "response", None)
+                if response is not None and 400 <= response.status_code < 500 and response.status_code != 408:
+                    raise RunningHubError(f"请求被拒绝（HTTP {response.status_code}）") from exc
+                raise RunningHubTransportError(f"请求状态不确定: {exc}") from exc
 
         return await asyncio.to_thread(_do)
 
@@ -112,10 +132,14 @@ class RunningHubClient:
             "usePersonalQueue": "false",
         }
         result = await self._post(f"/openapi/v2/run/workflow/{target_workflow}", payload)
+        if not isinstance(result, dict):
+            raise RunningHubTransportError("提交响应格式异常，无法确认任务是否创建")
         task_id = result.get("taskId")
         if not task_id:
             error_message = result.get("errorMessage") or ""
-            raise RunningHubError(f"提交任务失败: {error_message or json.dumps(result, ensure_ascii=False)}")
+            if error_message or result.get("code") not in (None, 0, 200, "0", "200"):
+                raise RunningHubError(f"提交任务被拒绝: {error_message or result.get('code')}")
+            raise RunningHubTransportError("提交响应缺少 taskId，无法确认是否已创建任务")
         return str(task_id)
 
     async def query(self, task_id: str) -> dict[str, Any]:
@@ -161,18 +185,17 @@ class RunningHubClient:
                 }
                 response = requests.get(url, timeout=self.timeout, stream=True, headers=headers)
                 response.raise_for_status()
-                chunks: list[bytes] = []
-                total = 0
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if not chunk:
-                        continue
-                    total += len(chunk)
-                    if total > _MAX_DOWNLOAD_BYTES:
-                        raise RunningHubError(
-                            f"下载内容超过 {_MAX_DOWNLOAD_BYTES} 字节上限，已拒绝"
-                        )
-                    chunks.append(chunk)
-                return b"".join(chunks)
+                with response:
+                    chunks: list[bytes] = []
+                    total = 0
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > self.max_file_bytes:
+                            raise RunningHubError(f"下载内容超过 {self.max_file_bytes} 字节上限，已拒绝")
+                        chunks.append(chunk)
+                    return b"".join(chunks)
             except requests.RequestException as exc:
                 raise RunningHubError(f"下载失败: {exc}") from exc
 
@@ -196,6 +219,9 @@ class RunningHubClient:
         Raises:
             RunningHubError: 上传失败时抛出。
         """
+
+        if len(file_data) > self.max_file_bytes:
+            raise RunningHubError("上传文件超过配置的大小上限")
 
         def _do() -> dict[str, Any]:
             try:
@@ -301,9 +327,20 @@ class RunningHubClient:
         """
         interval = max(1, int(poll_interval if poll_interval is not None else self.poll_interval))
         limit = max(interval, int(max_wait if max_wait is not None else self.max_wait))
-        waited = 0
-        while waited < limit:
-            result = await self.query(task_id)
+        deadline = time.monotonic() + limit
+        failures = 0
+        while time.monotonic() < deadline:
+            try:
+                result = await asyncio.wait_for(self.query(task_id), timeout=max(0.01, deadline - time.monotonic()))
+            except RunningHubTransportError:
+                failures += 1
+                if failures > self.query_retries:
+                    raise
+                await asyncio.sleep(min(interval * failures, max(0, deadline - time.monotonic())))
+                continue
+            if not isinstance(result, dict):
+                raise RunningHubTransportError("查询响应格式异常，远端任务状态未知")
+            failures = 0
             status = str(result.get("status") or "").upper()
             if status == "SUCCESS":
                 return result
@@ -315,7 +352,6 @@ class RunningHubClient:
                     or (f"任务状态为 {status}" if status.startswith("CANCEL") else "")
                     or json.dumps(result, ensure_ascii=False)[:500]
                 )
-                raise RunningHubError(f"任务执行失败: {reason}")
-            await asyncio.sleep(interval)
-            waited += interval
+                raise RunningHubTaskError(f"任务执行失败: {reason}", status)
+            await asyncio.sleep(min(interval, max(0, deadline - time.monotonic())))
         raise TimeoutError(f"任务 {task_id} 在 {limit} 秒内未完成")
