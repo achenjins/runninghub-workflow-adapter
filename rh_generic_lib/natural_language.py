@@ -15,6 +15,13 @@ from .file_source import guess_filename
 from .media_plan import PlanError, bind_plan, workflow_card, parse_json_object
 
 
+def _tool_result(payload):
+    # MaiBot 优先使用 content/message 写入推理上下文，其他顶层字段不会一并展示。
+    # 显式序列化业务字段；图片仍通过 content_items 传递，不把 base64 写进文本。
+    payload["content"] = json.dumps({k: v for k, v in payload.items() if k != "content_items"}, ensure_ascii=False)
+    return payload
+
+
 class NaturalLanguageMixin:
     @Tool("rh_context", description="用户明确要求生成或修改图片/视频/音频时，先调用本工具获取最新工作流、可用素材 ID 和待补充需求。只选择匹配的工作流，缺少必填项才询问用户。不同参考图必须按主体/风格/首尾帧等角色绑定，不能猜测。", parameters=[])
     async def handle_rh_context(self, **kwargs):
@@ -28,10 +35,10 @@ class NaturalLanguageMixin:
             snapshot = await self._media_snapshot(kwargs)
             cards = [workflow_card(w) for w in self.config.workflows.items if self._is_llm_callable_workflow(w)]
             draft = (self._drafts.get((uid, stream)) or {}).get("plan")
-            return {"success": True, "context_id": snapshot["context_id"], "workflows": cards,
-                    "media": [{k: v for k, v in a.items() if k not in {"source", "file_id", "stream_id"}} for a in snapshot["assets"]],
+            return _tool_result({"success": True, "context_id": snapshot["context_id"], "workflows": cards,
+                    "media": [{k: v for k, v in a.items() if k not in {"source", "file_id", "stream_id", "group_id"}} for a in snapshot["assets"]],
                     "draft": {k: v for k, v in draft.items() if k != "assets"} if draft else None,
-                    "message": "需要看图时用 rh_inspect_media。run_workflow 使用本 context_id；仅填用户明确提出的参数，保留其他默认值。补充上一条需求时设置 continue_draft=true。"}
+                    "message": "需要看图时用 rh_inspect_media。run_workflow 使用本 context_id；references[].input 取所选工作流 inputs[].key，references[].media_id 取 media[].media_id。仅填用户明确提出的参数，保留其他默认值。补充上一条需求时设置 continue_draft=true。「画我/用我头像」可把 media 里 avatar: 开头的头像绑给图片输入。"})
         except (PlanError, ValueError) as exc:
             return {"success": False, "message": str(exc)}
 
@@ -47,8 +54,8 @@ class NaturalLanguageMixin:
             if not asset:
                 raise PlanError("素材不属于该上下文")
             if asset["type"] != "image":
-                return {"success": True, "media": {k: asset[k] for k in ("media_id", "type", "origin", "description")},
-                        "message": "此工具尚不解码视频或音频，请依据用户描述绑定用途"}
+                return _tool_result({"success": True, "media": {k: asset[k] for k in ("media_id", "type", "origin", "description")},
+                        "message": "此工具尚不解码视频或音频，请依据用户描述绑定用途"})
             client = self._client or self._client_cn
             data = await self._resolve_asset(asset, client)
             if len(data) > 10 * 1024 * 1024:
@@ -57,9 +64,10 @@ class NaturalLanguageMixin:
             mime = self._image_mime(data)
             if self.config.natural_language.vision_model:
                 summary = await self._describe_image(data)
-                return {"success": True, "media_id": media_id, "message": summary}
-            return {"success": True, "content_items": [{"type": "image", "data": encoded, "mime_type": mime,
-                    "name": media_id, "description": asset["description"] or "本次参考图片"}]}
+                return _tool_result({"success": True, "media_id": media_id, "message": summary})
+            return _tool_result({"success": True, "media_id": media_id,
+                    "content_items": [{"type": "image", "data": encoded, "mime_type": mime,
+                    "name": media_id, "description": asset["description"] or "本次参考图片"}]})
         except Exception as exc:
             return {"success": False, "message": str(exc) if isinstance(exc, PlanError) else "素材读取失败，请重新发送参考图"}
 
@@ -89,12 +97,15 @@ class NaturalLanguageMixin:
         self._vision_cache[key] = {"created_at": time.time(), "description": summary}
         return summary
 
-    @Tool("run_workflow", description="执行用户明确要求的媒体生成/修改。先用 rh_context 查看实时工作流和素材，必要时 rh_inspect_media 看图。允许文生图、图生图、视频、多参考图及参数修改。参考素材仅用 media_id，按角色明确绑定；不知道的必填项返回给用户补充。成功表示已排队，结果异步发送；不要重复提交或声称已生成。", parameters=[
+    @Tool("run_workflow", description="执行用户明确要求的媒体生成/修改。先用 rh_context 查看实时工作流和素材，必要时 rh_inspect_media 看图。允许文生图、图生图、视频、多参考图及参数修改。参考素材必须取自 rh_context：input 用 workflows[].inputs[].key、media_id 原样使用 media[].media_id（包括聊天素材、头像和生成结果，不得编造聊天里的图片编号）；只有一个媒体槽且只有一张当前/引用图时 references 可留空自动绑定；不知道的必填项返回给用户补充。成功表示已排队，结果异步发送；不要重复提交或声称已生成。", parameters=[
         Param(name="workflow_name", description="rh_context 中的工作流名称；不确定时留空自动规划", required=False, default=""),
         Param(name="prompt", description="用户的生成要求；修改任务时填写具体修改，保留用户约束", required=False, default=""),
         Param(name="context_id", description="rh_context 返回的上下文 ID", required=False, default=""),
         Param(name="references", param_type=Type.ARRAY, description="媒体输入角色绑定", required=False,
-              items_schema={"type": "object", "properties": {"input": {"type": "string"}, "media_id": {"type": "string"}}, "required": ["input", "media_id"], "additionalProperties": False}),
+              items_schema={"type": "object", "properties": {
+                  "input": {"type": "string", "description": "rh_context 返回的 workflows[].inputs[].key"},
+                  "media_id": {"type": "string", "description": "rh_context 返回的 media[].media_id"}},
+                  "required": ["input", "media_id"], "additionalProperties": False}),
         Param(name="parameters", param_type=Type.OBJECT, description="可编辑参数 key 到值，使用 rh_context 中的 key", required=False, additional_properties=True),
         Param(name="source_task_id", description="基于自己的上次任务继续修改时填写其任务 ID", required=False, default=""),
         Param(name="continue_draft", param_type=Type.BOOLEAN, description="本条是在补充 rh_context 返回的待办需求时为 true", required=False, default=False)])
@@ -143,7 +154,7 @@ class NaturalLanguageMixin:
                     raise PlanError("工作流规划失败，请从 rh_context 返回的列表指定工作流")
                 choice = parse_json_object(result.get("response", ""))
                 if choice.get("question"):
-                    return {"success": False, "status": "needs_input", "message": str(choice["question"])}
+                    return _tool_result({"success": False, "status": "needs_input", "message": str(choice["question"])})
                 plan["workflow_name"] = str(choice.get("workflow_name") or "")
             workflow = self._find_workflow(plan["workflow_name"])
             if not workflow or not self._is_llm_callable_workflow(workflow):
@@ -153,15 +164,15 @@ class NaturalLanguageMixin:
             plan["assets"] = [m["asset"] for m in media]
             if missing:
                 self._drafts[(uid, stream)] = {"created_at": time.time(), "plan": plan}
-                return {"success": False, "status": "needs_input", "missing": missing,
-                        "message": "只需补充：" + "、".join(m["label"] for m in missing) + "。有多个参考图时请明确各自用途"}
-            kwargs.update(user_id=uid, stream_id=stream, anchor_id=snapshot["anchor_id"], natural_plan=plan)
+                return _tool_result({"success": False, "status": "needs_input", "missing": missing,
+                        "message": "只需补充：" + "、".join(m["label"] for m in missing) + "。有多个参考图时请明确各自用途"})
+            kwargs.update(user_id=uid, stream_id=stream, anchor_id=snapshot["anchor_id"], natural_plan=plan, trigger="natural_language")
             result = await self._submit_and_poll(self._get_client(workflow.region), workflow, nodes, stream, kwargs)
             if result["success"]:
                 self._drafts.pop((uid, stream), None)
                 await self.ctx.send.text(result["message"], stream)
                 result["stop_after_execution"] = True
-            return result
+            return _tool_result(result)
         except (PlanError, ValueError, TimeoutError) as exc:
             return {"success": False, "message": str(exc) or "规划超时，请指定工作流后重试"}
 
@@ -212,13 +223,13 @@ class NaturalLanguageMixin:
                 self._schedule_job(records[0])
             elif action == "status":
                 for record in records:
-                    if record["status"] in {"queued", "pending", "tracking_paused"}:
+                    if record["status"] in {"queued", "pending", "tracking_paused", "needs_attention"}:
                         self._schedule_job(record)
             else:
                 raise PlanError("未知操作")
-            records = [journal.get(r["task_id"]) for r in records]
-            return {"success": True, "tasks": [{k: r[k] for k in ("task_id", "workflow", "status", "remote_task_id", "delivery_status", "message", "coins")} for r in records[:10]],
-                    "message": "操作已处理"}
+            records = [latest for latest in (journal.get(r["task_id"]) for r in records) if latest]
+            return _tool_result({"success": True, "tasks": [{k: r[k] for k in ("task_id", "workflow", "status", "remote_task_id", "delivery_status", "message", "coins")} for r in records[:10]],
+                    "message": "操作已处理"})
         except (PlanError, ValueError) as exc:
             return {"success": False, "message": str(exc)}
 

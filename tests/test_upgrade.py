@@ -1,7 +1,6 @@
 """Offline integration tests. No network, API keys, or MaiBot deployment required."""
 import asyncio
 import base64
-import copy
 import json
 import logging
 from pathlib import Path
@@ -107,11 +106,90 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse({p["name"] for p in component["metadata"]["parameters"]} & {"user_id", "group_id", "stream_id", "chat_id"})
 
     async def test_missing_identity_and_cross_context_fail(self):
+        # 完全未知身份（无 user_id、钩子也没记录过该会话）时保持 fail-closed
+        self.p._stream_last_sender.pop("s1", None)
         self.assertFalse((await self.p.handle_run_workflow("draw", "cat", stream_id="s1"))["success"])
         ctx = await self.p.handle_rh_context(user_id="11", stream_id="s1")
         bad = await self.p.handle_run_workflow("draw", "cat", context_id=ctx["context_id"], user_id="66", stream_id="s1")
         self.assertFalse(bad["success"])
         self.client.submit.assert_not_awaited()
+
+    async def test_group_tool_identity_falls_back_to_hook_sender(self):
+        # MaiBot 群聊工具上下文只注入 chat_id/group_id（会话级 user_id 被上游清空，
+        # 见 chat_manager._update_session_identity），插件回退到 before_process 记录的最近发言人
+        result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
+        self.assertTrue(result["success"], result.get("message"))
+        await self.settled()
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual(record["user_id"], "11")
+        self.assertEqual((record["status"], record["delivery_status"]), ("success", "sent"))
+        self.client.submit.assert_awaited_once()
+        # 超时限的发言人记录不得冒用（后台主动回复等无新消息场景保持 fail-closed）
+        self.p._stream_last_sender["s1"] = ("11", time.time() - 400)
+        stale = await self.p.handle_run_workflow("draw", "another cat", chat_id="s1", group_id="22")
+        self.assertFalse(stale["success"])
+        self.client.submit.assert_awaited_once()
+
+    async def test_definite_query_error_pauses_for_manual_recovery(self):
+        # 查询被服务端确定拒绝（如 Key 失效）：停止自动轮询并让出工作槽，修复后恢复且不重复提交
+        self.client.wait_for_result.side_effect = RunningHubError("请求被拒绝（HTTP 401）")
+        result = await self.enqueue()
+        for _ in range(50):
+            if self.p._task_journal.get(result["task_id"])["status"] == "needs_attention":
+                break
+            await asyncio.sleep(0.005)
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual(record["status"], "needs_attention")
+        self.assertEqual(record["remote_task_id"], "remote-1")
+        await asyncio.sleep(0.02)
+        self.assertNotIn(result["task_id"], self.p._pending)
+        self.client.wait_for_result.side_effect = None
+        await self.p._resume_pending_tasks()
+        await self.settled()
+        self.client.submit.assert_awaited_once()
+        self.assertEqual(self.p._task_journal.get(result["task_id"])["delivery_status"], "sent")
+
+    async def test_cancel_refused_by_dead_key_releases_locally(self):
+        # Key 已失效时远端取消同样被拒：本地取消并释放名额，避免队列被永久锁死
+        self.client.wait_for_result.side_effect = RunningHubError("请求被拒绝（HTTP 401）")
+        result = await self.enqueue()
+        for _ in range(50):
+            if self.p._task_journal.get(result["task_id"])["status"] == "needs_attention":
+                break
+            await asyncio.sleep(0.005)
+        self.client.cancel.side_effect = RunningHubError("请求被拒绝（HTTP 401）")
+        await self.p._cancel_task(result["task_id"], "s1")
+        self.assertEqual(self.p._task_journal.get(result["task_id"])["status"], "cancelled")
+
+    async def test_avatar_asset_binds_via_adapter_then_cdn_fallback(self):
+        # 「画我」：头像候选由宿主可信 uid/群号生成，绑定后现场解析字节并上传
+        self.set_config(workflow(media=True))
+        ctx = await self.p.handle_rh_context(user_id="11", stream_id="s1")
+        self.assertIn("avatar:11", {a["media_id"] for a in ctx["media"]})
+        self.assertIn("avatar-group:22", {a["media_id"] for a in ctx["media"]})
+        self.p.ctx.api.call = AsyncMock(return_value={"success": True, "result": {"code": 0, "data": {"b64": base64.b64encode(PNG).decode()}}})
+        result = await self.p.handle_run_workflow("draw", "画我", context_id=ctx["context_id"],
+                                                  references=[{"input": "subject", "media_id": "avatar:11"}],
+                                                  user_id="11", stream_id="s1")
+        self.assertTrue(result["success"], result.get("message"))
+        await self.settled()
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual(record["status"], "success")
+        self.client.upload_file.assert_awaited_once()
+        # 适配器不可用 → qlogo 公开直链兜底（大小/魔数校验后使用）
+        self.p.ctx.api.call = AsyncMock(side_effect=Exception("api not registered"))
+        downloads: list[str] = []
+        async def grab(url):
+            downloads.append(str(url))
+            return PNG
+        self.client.download_bytes = AsyncMock(side_effect=grab)
+        again = await self.p.handle_run_workflow("draw", "画我的另一张",
+                                                 references=[{"input": "subject", "media_id": "avatar:11"}],
+                                                 user_id="11", stream_id="s1")
+        self.assertTrue(again["success"], again.get("message"))
+        await self.settled()
+        self.assertEqual(self.client.submit.await_count, 2)
+        self.assertTrue(any(d.startswith("https://q4.qlogo.cn/headimg_dl?dst_uin=11") for d in downloads), downloads)
 
     async def test_single_prompt_end_to_end(self):
         result = await self.p.handle_run_workflow("draw", "cat", user_id="11", stream_id="s1")
@@ -131,8 +209,8 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.set_config(workflow(media=True, parameter=True))
         ctx = await self.p.handle_rh_context(user_id="11", stream_id="s1")
         self.assertTrue(ctx["success"])
-        self.assertEqual({a["origin"] for a in ctx["media"]}, {"current", "reply", "recent"})
-        self.assertEqual({a["message_id"] for a in ctx["media"]}, {"m1", "quote", "own"})
+        self.assertEqual({a["origin"] for a in ctx["media"]}, {"current", "reply", "recent", "avatar"})
+        self.assertEqual({a["message_id"] for a in ctx["media"] if a["origin"] != "avatar"}, {"m1", "quote", "own"})
         self.assertEqual(ctx["workflows"][0]["inputs"][-1]["key"], "width")
 
     async def test_current_image_is_bound_and_uploaded(self):
@@ -457,6 +535,27 @@ class PureTests(unittest.IsolatedAsyncioTestCase):
         ctx.api.call.assert_awaited_once()
         ctx.send.image.assert_not_awaited()
 
+    async def test_local_file_requires_trusted_root(self):
+        from rh_generic_lib.file_source import fetch_file_bytes
+        client = SimpleNamespace(download_bytes=AsyncMock(return_value=PNG), max_file_bytes=1024)
+        # 白名单外（含典型 LFI 目标）一律拒绝
+        for probe in ("C:/Windows/win.ini", "/etc/passwd", "\\\\evil\\share\\x.png"):
+            with self.assertRaises(RunningHubError):
+                await fetch_file_bytes(probe, client)
+        # 系统临时目录默认可信
+        tmp = Path(tempfile.gettempdir()) / "rh_trusted_probe.png"
+        tmp.write_bytes(PNG)
+        try:
+            self.assertEqual(await fetch_file_bytes(str(tmp), client), PNG)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    async def test_emoji_segment_and_group_id_stamp(self):
+        from rh_generic_lib.media_context import assets_from_message
+        msg = {"message_id": "e1", "raw_message": [{"type": "emoji", "data": {"url": "https://gchat.qpic.cn/emoji/x.gif"}}]}
+        assets = assets_from_message(msg, "s1", "current", group_id="22")
+        self.assertEqual([(a["type"], a.get("group_id")) for a in assets], [("image", "22")])
+
     async def test_video_and_unknown_file_segments(self):
         files = extract_files_from_message({"message": [{"type": "video", "data": {"file": "https://example.test/clip.mp4"}}, {"type": "file", "data": {"name": "x.zip", "url": "https://example.test/x.zip"}}]})
         self.assertEqual(files, [("video", "https://example.test/clip.mp4")])
@@ -476,6 +575,28 @@ class PureTests(unittest.IsolatedAsyncioTestCase):
         _, media, missing = bind_plan(wf, "cat", [], {}, assets)
         self.assertEqual(media, [])
         self.assertEqual({m["input"] for m in missing}, {"subject", "style"})
+
+    async def test_media_input_lenient_match_and_self_healing_errors(self):
+        # 模型常拿 类型/字段名/中文标签 当 input_key（"不存在的媒体输入：image" 的真实成因）：唯一命中自动归一
+        wf = WorkflowItemSection(name="draw", workflow_id="12345", input_nodes=[
+            InputNodeSection(node_id="1", field_name="prompt", value_type="prompt", label="description"),
+            InputNodeSection(node_id="3", field_name="image", value_type="image", label="参考图")])
+        candidates = [{"media_id": "m-abc", "type": "image", "origin": "current", "description": ""}]
+        _, media, missing = bind_plan(wf, "cat", [{"input": "image", "media_id": "m-abc"}], {}, candidates)
+        self.assertEqual([m["input"] for m in media], ["3.image"])
+        self.assertFalse(missing)
+        _, media, _ = bind_plan(wf, "cat", [{"input": "参考图", "media_id": "m-abc"}], {}, candidates)
+        self.assertEqual([m["input"] for m in media], ["3.image"])
+        # QQ 图片编号不在候选：报错列出真实 media_id，让模型下一轮自纠
+        with self.assertRaises(PlanError) as err:
+            bind_plan(wf, "cat", [{"input": "image", "media_id": "1359117711"}], {}, candidates)
+        self.assertIn("m-abc", str(err.exception))
+        # 两个同类媒体槽：不按到达顺序猜，报歧义并列出完整 key
+        wf2 = workflow(media=True, two=True)
+        with self.assertRaises(PlanError) as err:
+            bind_plan(wf2, "cat", [{"input": "image", "media_id": "a"}], {}, [{"media_id": "a", "type": "image", "origin": "current"}])
+        self.assertIn("歧义", str(err.exception))
+        self.assertIn("subject", str(err.exception))
 
     async def test_fixed_media_default_and_optional_skip(self):
         wf = workflow(media=True, two=True)

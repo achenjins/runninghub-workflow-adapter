@@ -237,6 +237,8 @@ class RunningHubClient:
                 raise RunningHubError(f"上传失败: {exc}") from exc
 
         result = await asyncio.to_thread(_do)
+        if not isinstance(result, dict):
+            raise RunningHubError("上传文件失败: 响应格式异常")
         code = result.get("code")
         # 新接口成功码为 200，旧接口为 0
         if code not in (0, 200, None):
@@ -290,6 +292,8 @@ class RunningHubClient:
                 raise RunningHubError(f"获取工作流失败: {exc}") from exc
 
         result = await asyncio.to_thread(_do)
+        if not isinstance(result, dict):
+            raise RunningHubError("获取工作流失败: 响应格式异常")
         code = result.get("code")
         # 兼容新旧成功码：文档为 0，新接口（如上传）实际返回 200
         if code not in (0, 200, None):
