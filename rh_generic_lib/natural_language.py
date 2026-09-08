@@ -62,10 +62,16 @@ class NaturalLanguageMixin:
                 raise PlanError("图片超过视觉工具 10MB 上限，请发送较小的参考预览")
             encoded = base64.b64encode(data).decode("ascii")
             mime = self._image_mime(data)
+            warning = ""
             if self.config.natural_language.vision_model:
-                summary = await self._describe_image(data)
-                return _tool_result({"success": True, "media_id": media_id, "message": summary})
+                try:
+                    summary = await self._describe_image(data)
+                    return _tool_result({"success": True, "media_id": media_id, "message": summary})
+                except Exception as exc:
+                    warning = f"视觉摘要不可用：{str(exc) or type(exc).__name__}。已返回原图，请直接查看。"
+                    self.ctx.logger.warning("参考图视觉摘要失败: %s", exc)
             return _tool_result({"success": True, "media_id": media_id,
+                    "message": warning or "已返回所选参考图。",
                     "content_items": [{"type": "image", "data": encoded, "mime_type": mime,
                     "name": media_id, "description": asset["description"] or "本次参考图片"}]})
         except Exception as exc:
@@ -92,12 +98,13 @@ class NaturalLanguageMixin:
                    {"type": "image_url", "image_url": {"url": f"data:{self._image_mime(data)};base64,{base64.b64encode(data).decode('ascii')}"}}]
         result = await asyncio.wait_for(self.ctx.llm.generate(prompt=[{"role": "user", "content": content}], model=model), self.config.natural_language.llm_timeout)
         if not result.get("success") or not str(result.get("response") or "").strip():
-            raise PlanError("参考图视觉解析失败，请检查 vision_model 是否支持图片")
+            detail = result.get("error") or result.get("message") or "模型没有返回图片描述"
+            raise PlanError(f"参考图视觉摘要失败（vision_model={model}）：{detail}")
         summary = str(result["response"])[:2000]
         self._vision_cache[key] = {"created_at": time.time(), "description": summary}
         return summary
 
-    @Tool("run_workflow", description="执行用户明确要求的媒体生成/修改。先用 rh_context 查看实时工作流和素材，必要时 rh_inspect_media 看图。允许文生图、图生图、视频、多参考图及参数修改。参考素材必须取自 rh_context：input 用 workflows[].inputs[].key、media_id 原样使用 media[].media_id（包括聊天素材、头像和生成结果，不得编造聊天里的图片编号）；只有一个媒体槽且只有一张当前/引用图时 references 可留空自动绑定；不知道的必填项返回给用户补充。成功表示已排队，结果异步发送；不要重复提交或声称已生成。", parameters=[
+    @Tool("run_workflow", description="执行用户明确要求的媒体生成/修改。先用 rh_context 查看实时工作流和素材，必要时 rh_inspect_media 看图。允许文生图、图生图、视频、多参考图及参数修改。参考素材必须取自 rh_context：input 用 workflows[].inputs[].key、media_id 原样使用 media[].media_id（包括聊天素材、头像和生成结果，不得编造聊天里的图片编号）；只有一个媒体槽且只有一张当前/引用图时 references 可留空自动绑定；不知道的必填项返回给用户补充。成功表示已排队，立即结束本轮，不调用 wait、不轮询 rh_task、不重复提交；后台完成或失败会主动通知你，结果会自动发送。", parameters=[
         Param(name="workflow_name", description="rh_context 中的工作流名称；不确定时留空自动规划", required=False, default=""),
         Param(name="prompt", description="用户的生成要求；修改任务时填写具体修改，保留用户约束", required=False, default=""),
         Param(name="context_id", description="rh_context 返回的上下文 ID", required=False, default=""),
@@ -170,8 +177,12 @@ class NaturalLanguageMixin:
             result = await self._submit_and_poll(self._get_client(workflow.region), workflow, nodes, stream, kwargs)
             if result["success"]:
                 self._drafts.pop((uid, stream), None)
-                await self.ctx.send.text(result["message"], stream)
                 result["stop_after_execution"] = True
+                result["next_action"] = "结束本轮，不调用 wait 或轮询 rh_task。插件后台处理任务，完成或失败后会主动通知你。"
+                try:
+                    await self.ctx.send.text(result["message"], stream)
+                except Exception as exc:
+                    self.ctx.logger.warning("排队确认发送失败，任务已记录，不要重复提交: %s", exc)
             return _tool_result(result)
         except (PlanError, ValueError, TimeoutError) as exc:
             return {"success": False, "message": str(exc) or "规划超时，请指定工作流后重试"}
@@ -184,24 +195,33 @@ class NaturalLanguageMixin:
             raise PlanError("仍缺少必填输入")
         summaries = []
         for item in media:
+            await self._task_journal.update(record["task_id"], message=f"读取参考素材「{item['role']}」")
             data = await self._resolve_asset(item["asset"], client)
             if not data:
                 raise PlanError("素材内容为空")
+            summary = f"{item['role']}（{item['asset']['type']}）：{item['asset'].get('description') or '按用户要求使用原始参考素材；没有额外视觉摘要'}"
             if workflow.llm_enhance and self.config.natural_language.vision_model and item["asset"]["type"] == "image":
-                if len(data) > 10 * 1024 * 1024:
-                    raise PlanError("视觉参考图片超过 10MB，请压缩预览图片")
-                summaries.append(f"{item['role']}：{await self._describe_image(data)}")
-            else:
-                summaries.append(f"{item['role']}（{item['asset']['type']}）：{item['asset'].get('description') or '按用户要求使用该素材；没有视觉解析结果'}")
+                try:
+                    await self._task_journal.update(record["task_id"], message=f"生成参考图视觉摘要「{item['role']}」")
+                    if len(data) > 10 * 1024 * 1024:
+                        raise PlanError("图片超过视觉摘要 10MB 上限")
+                    summary = f"{item['role']}：{await self._describe_image(data)}"
+                except Exception as exc:
+                    # 视觉摘要是扩写辅助，失败不应阻止原始参考图上传。
+                    self.ctx.logger.warning("任务 %s 视觉摘要失败，继续上传原图（vision_model=%s）: %s",
+                                            record["task_id"], self.config.natural_language.vision_model, exc)
+            summaries.append(summary)
+            await self._task_journal.update(record["task_id"], message=f"上传参考素材「{item['role']}」到 RunningHub")
             name = await client.upload_file(data, guess_filename(item["asset"].get("source", ""), item["asset"]["type"], data))
             nodes.append({"nodeId": item["node_id"], "fieldName": item["field_name"], "fieldValue": name})
+        await self._task_journal.update(record["task_id"], message="整理生成提示词")
         prompt = await self._enhance_text(workflow, plan["prompt"], actual_file_desc="\n".join(summaries))
         target = self._first_prompt_node(workflow)
         if target and prompt:
             self._patch_text_value(nodes, target.node_id, target.field_name, prompt)
         return nodes
 
-    @Tool("rh_task", description="查看、取消或补发当前会话中用户自己的 RunningHub 任务。不产生新生成费用。仅在用户明确要求补发时使用 retry_delivery；发送状态未知时可能重复发送。", parameters=[
+    @Tool("rh_task", description="仅在用户询问进度、要求取消或补发时操作当前会话中用户自己的 RunningHub 任务。不要在 run_workflow 后自动查询或循环调用；后台完成或失败会主动通知。不产生新生成费用。仅在用户明确要求补发时使用 retry_delivery；发送状态未知时可能重复发送。", parameters=[
         Param(name="action", description="任务操作", enum_values=["status", "cancel", "retry_delivery"], required=False, default="status"),
         Param(name="task_id", description="任务 ID，status 时可留空列出最近任务", required=False, default="")])
     async def handle_rh_task(self, action="status", task_id="", **kwargs):
@@ -229,7 +249,7 @@ class NaturalLanguageMixin:
                 raise PlanError("未知操作")
             records = [latest for latest in (journal.get(r["task_id"]) for r in records) if latest]
             return _tool_result({"success": True, "tasks": [{k: r[k] for k in ("task_id", "workflow", "status", "remote_task_id", "delivery_status", "message", "coins")} for r in records[:10]],
-                    "message": "操作已处理"})
+                    "message": "操作已处理", "next_action": "向用户说明当前状态即可。不要调用 wait 或循环查询，后台完成或失败会主动通知。"})
         except (PlanError, ValueError) as exc:
             return {"success": False, "message": str(exc)}
 

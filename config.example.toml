@@ -46,7 +46,8 @@ history_limit = 20
 media_ttl_seconds = 3600
 max_candidates = 12
 planner_model = "utils"
-# 留空由主对话模型使用 rh_inspect_media 看图；或填支持图片的模型槽位
+# 留空由主对话模型使用 rh_inspect_media 看图；或填宿主支持图片的模型任务名（不是模型 ID）
+# 视觉摘要只是扩写辅助，失败会记录日志并继续上传原图
 vision_model = ""
 # 把用户头像（群聊含群头像）作为可选素材，支持「画我」类请求；不需要可设 false
 avatar_candidates = true

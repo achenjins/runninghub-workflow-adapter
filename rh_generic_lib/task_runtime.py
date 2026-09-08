@@ -71,7 +71,7 @@ class TaskRuntimeMixin:
                                      group_id=kwargs.get("group_id", ""))
                 self._schedule_job(journal.get(task_id))
             return {"success": True, "task_id": task_id, "status": "queued",
-                    "message": f"任务已加入队列：{task_id}，结果会自动发回。可用 /rh状态 查询"}
+                    "message": f"任务已加入队列：{task_id}，结果会自动发回。"}
         except (PlanError, OSError, ValueError) as exc:
             return {"success": False, "message": str(exc)}
 
@@ -100,12 +100,16 @@ class TaskRuntimeMixin:
             elif record["status"] != "unknown_submission":
                 self._schedule_job(record)
 
-    async def _notify_job(self, record, message):
+    async def _notify_job(self, record, message, *, notify_model=False):
         if record.get("stream_id"):
             try:
                 await self.ctx.send.text(message, record["stream_id"])
             except Exception:
                 self.ctx.logger.warning("任务状态通知发送失败: %s", record["task_id"])
+            if notify_model:
+                await self._append_result_to_llm_context(record["stream_id"],
+                    [{"type": "text", "data": message}], visible_text=message)
+                await self._trigger_llm_result_reply(record["stream_id"], status_message=message)
 
     async def _run_job(self, task_id):
         journal = await self._load_task_journal()
@@ -118,7 +122,7 @@ class TaskRuntimeMixin:
                     return
                 client = self._get_client(record["region"])
                 if not client or not client.api_key:
-                    await self._notify_job(record, f"{task_id} 等待对应区域 API Key 配置后恢复")
+                    await self._notify_job(record, f"{task_id} 等待对应区域 API Key 配置后恢复", notify_model=True)
                     return
                 if record["status"] == "success":
                     await self._deliver_job(record, client)
@@ -144,20 +148,20 @@ class TaskRuntimeMixin:
                     allowed, reason = self._check_access(record["user_id"], record["group_id"])
                     if not allowed:
                         raise PlanError(reason)
-                    await journal.update(task_id, status="submitting", submitted_at=time.time())
+                    await journal.update(task_id, status="submitting", submitted_at=time.time(), message="提交 RunningHub 任务")
                     try:
                         remote = await client.submit(nodes, instance_type=request["workflow"]["instance_type"],
                                                      workflow_id=request["workflow"]["workflow_id"])
                     except RunningHubTransportError:
                         await journal.update(task_id, status="unknown_submission",
                                              message="提交响应丢失，请核对 RunningHub 记录；不会自动重复提交")
-                        await self._notify_job(record, f"{task_id} 提交状态不确定，请管理员核对 RunningHub 任务记录")
+                        await self._notify_job(record, f"{task_id} 提交状态不确定，请管理员核对 RunningHub 任务记录", notify_model=True)
                         return
                     except RunningHubError as exc:
                         await journal.update(task_id, status="failed", submitted_at=0, message=str(exc))
-                        await self._notify_job(record, f"{task_id} 提交被拒绝：{exc}")
+                        await self._notify_job(record, f"{task_id} 提交被拒绝：{exc}", notify_model=True)
                         return
-                    await journal.update(task_id, status="pending", remote_task_id=remote)
+                    await journal.update(task_id, status="pending", remote_task_id=remote, message="")
                     record = journal.get(task_id)
                     if record.get("cancel_requested"):
                         await self._cancel_remote(record, client)
@@ -174,7 +178,7 @@ class TaskRuntimeMixin:
                             await journal.mark_cancelled(task_id)
                         else:
                             await journal.mark_failed(task_id, str(exc))
-                        await self._notify_job(record, f"{task_id}：{exc}")
+                        await self._notify_job(record, f"{task_id}：{exc}", notify_model=True)
                         return
                     except (RunningHubTransportError, TimeoutError):
                         # 瞬态故障（断网/慢任务）：保留远端编号，占住名额继续后台跟踪，绝不重提
@@ -190,7 +194,7 @@ class TaskRuntimeMixin:
                         # 保留远端编号与名额，转需人工恢复状态并让出工作槽
                         await journal.update(task_id, status="needs_attention",
                                              message=f"查询被拒绝：{str(exc)[:200]}；修复 API Key 后用 /rh状态 恢复，或 /rh中断 取消")
-                        await self._notify_job(record, f"{task_id} 查询被服务端拒绝（常见于 API Key 失效），已停止自动轮询；修复配置后发 /rh状态 {task_id} 恢复")
+                        await self._notify_job(record, f"{task_id} 查询被服务端拒绝（常见于 API Key 失效），已停止自动轮询；修复配置后发 /rh状态 {task_id} 恢复", notify_model=True)
                         return
                     outputs = []
                     for item in result.get("results") or []:
@@ -214,23 +218,29 @@ class TaskRuntimeMixin:
             latest = journal.get(task_id)
             if latest is None:
                 raise
+            detail = str(exc).strip() or type(exc).__name__
+            self.ctx.logger.error("任务 %s 后台处理失败（%s）: %s", task_id, latest.get("message") or latest["status"], detail, exc_info=True)
             # Unexpected errors after a paid POST must preserve the uncertainty.
             if latest["status"] == "submitting":
                 await journal.update(task_id, status="unknown_submission", message="提交状态未知，请核对远端任务")
             elif latest["status"] == "queued":
-                await journal.mark_failed(task_id, str(exc) if isinstance(exc, (PlanError, RunningHubError)) else type(exc).__name__)
+                await journal.mark_failed(task_id, f"{latest.get('message') or '准备任务'}失败：{detail}")
             elif latest["status"] != "cancelled":
                 await journal.update(task_id, message="后台处理异常，可用 /rh状态 恢复")
-            await self._notify_job(record, f"任务 {task_id} 暂未完成，请用 /rh状态 查看详情")
+            await self._notify_job(record, f"任务 {task_id}：{journal.get(task_id)['message']}", notify_model=True)
 
     async def _deliver_job(self, record, client):
         for attempt in range(self.config.generation.delivery_retries + 1):
             await self._deliver_job_once(record, client)
             record = self._task_journal.get(record["task_id"])
-            if record["delivery_status"] != "failed" or not record["outputs"]:
+            if record["delivery_status"] == "sent":
                 return
+            if record["delivery_status"] != "failed" or not record["outputs"]:
+                break
             if attempt < self.config.generation.delivery_retries:
                 await asyncio.sleep(min(10, 2 ** attempt))
+        await self._notify_job(record,
+            f"{record['task_id']} 已生成，结果未全部送达：{record['message']}", notify_model=True)
 
     async def _deliver_job_once(self, record, client):
         journal = self._task_journal
@@ -238,7 +248,6 @@ class TaskRuntimeMixin:
         outputs = record["outputs"]
         if not outputs:
             await journal.update(record["task_id"], delivery_status="failed", message="生成成功但未返回可发送结果")
-            await self._notify_job(record, f"{record['task_id']} 生成完成，但服务没有返回结果文件")
             return
         for index, item in enumerate(outputs):
             if index in done:
@@ -267,7 +276,6 @@ class TaskRuntimeMixin:
                 uncertain = isinstance(exc, (DeliveryUncertain, OSError))
                 await journal.update(record["task_id"], delivery_status="uncertain" if uncertain else "failed",
                                      message=f"结果 {index + 1} 发送{'状态未知' if uncertain else '失败'}，用 /rh补发 {record['task_id']} 重试")
-                await self._notify_job(record, f"{record['task_id']} 已生成，部分结果发送失败；可用 /rh补发 {record['task_id']}")
                 return
         await journal.update(record["task_id"], delivery_status="sent", message="")
         try:

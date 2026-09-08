@@ -45,6 +45,10 @@ Runner 会在调用插件的配置解析和 `on_load` 前检查版本。插件�
 
 ## 状态与恢复
 
+自然语言任务排队后返回 `stop_after_execution=true`，模型应结束本轮，不调用 `wait` 或自动轮询 `rh_task`。插件负责后台处理，成功、失败或需要用户处理时追加状态到模型上下文并触发通知；`rh_task` 留给用户主动查询、取消和补发。
+
+工作流的 `llm_enhance` 是“启用 LLM 扩写”开关。开启且配置了 `natural_language.vision_model` 时，会额外生成参考图摘要；该配置填写宿主模型任务名。摘要失败会记录原因，继续按原始参考图和用户要求生成。取图或上传失败会在任务 `message` 中记录阶段及具体错误，不再只留下 `RPCError` 类名。
+
 - `queued`：已持久化预约，正在等待或准备输入。
 - `submitting`：已开始付费提交；进程在此阶段退出，会转为 `unknown_submission`。
 - `unknown_submission`：可能已创建远端任务，保留额度及并发名额，禁止自动重提。管理员在 RunningHub 后台核对后，发送 `/rh核对 本地任务ID 远端任务ID` 关联已有任务。只有确认没有创建时才使用 `/rh核对 本地任务ID 未创建` 释放名额。

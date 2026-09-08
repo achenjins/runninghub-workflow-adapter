@@ -233,7 +233,7 @@ class NaturalLanguageSection(PluginConfigBase):
     media_ttl_seconds: int = Field(default=3600, ge=60, le=86400, description="最近素材和待补充需求保留时间（秒）")
     max_candidates: int = Field(default=12, ge=1, le=32, description="每次供模型选择的素材上限")
     planner_model: str = Field(default="utils", description="未指定工作流时内部规划使用的模型槽位")
-    vision_model: str = Field(default="", description="可选：图片摘要模型槽位，必须支持视觉；留空由主对话模型通过 rh_inspect_media 看图")
+    vision_model: str = Field(default="", description="可选：宿主中支持视觉的模型任务名（不是模型 ID）；摘要失败时继续使用原图。留空由主对话模型通过 rh_inspect_media 看图")
     llm_timeout: int = Field(default=45, ge=5, le=180, description="规划、视觉摘要及扩写的超时秒数")
     avatar_candidates: bool = Field(default=True, description="把用户头像（群聊含群头像）作为可选素材，支持「画我」类请求")
 
@@ -1613,8 +1613,8 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         except Exception as exc:
             self.ctx.logger.warning("追加生成结果到 LLM 上下文失败: %s", exc)
 
-    async def _trigger_llm_result_reply(self, stream_id: str) -> None:
-        """所有结果追加完后，统一触发一次 LLM 主动回复：向用户确认生成结果。
+    async def _trigger_llm_result_reply(self, stream_id: str, *, status_message: str = "") -> None:
+        """结果发送或任务异常后，触发一次 LLM 主动回复说明状态。
 
         普通场景提醒「发好了」，角色扮演场景可用角色口吻提一句自己刚生成了什么；
         失败时静默降级。
@@ -1628,11 +1628,15 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             await maisaka.proactive.trigger(
                 stream_id,
                 intent=(
+                    f"RunningHub 后台任务状态更新：{status_message}。请按该状态简短说明；"
+                    "不要自动重新提交任务，不要调用 wait 或循环查询。"
+                ) if status_message else (
                     "你之前通过工具生成的图片/视频已经完成并发送给用户。"
                     "请结合上下文简短地向用户确认结果（例如「发好了，看看喜欢不喜欢」）；"
                     "如果你正在角色扮演，请用角色口吻自然地提一句自己刚生成了什么。"
+                    "结果已经发送，直接确认即可，不要再次生成、查询任务或调用 wait。"
                 ),
-                reason="RunningHub 生成结果已发送",
+                reason="RunningHub 任务状态更新" if status_message else "RunningHub 生成结果已发送",
                 priority="low",
             )
         except Exception as exc:
