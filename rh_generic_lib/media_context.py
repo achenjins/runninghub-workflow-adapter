@@ -9,6 +9,10 @@ import uuid
 from .file_source import detect_file_type_from_name, extract_files_from_message, fetch_file_bytes, extract_bytes_from_napcat_result
 from .media_plan import PlanError
 
+# 群聊工具上下文缺少 user_id 时，允许回退到"钩子记录的最近发言人"的时限（秒）。
+# 一次推理轮通常在数十秒内完成工具调用；后台主动回复等无新消息场景不会命中。
+_FALLBACK_SENDER_TTL = 300.0
+
 
 def unwrap(value):
     for _ in range(5):
@@ -39,7 +43,7 @@ def segments(message):
     return [s["data"] if s.get("type") == "dict" and isinstance(s.get("data"), dict) else s for s in raw if isinstance(s, dict)]
 
 
-def assets_from_message(message, stream, origin):
+def assets_from_message(message, stream, origin, id_ctx=""):
     result = []
     mid = str(message.get("message_id") or "")
     for index, seg in enumerate(segments(message)):
@@ -56,7 +60,7 @@ def assets_from_message(message, stream, origin):
         # Binary payloads are resolved from the host on demand, not retained in snapshots/journals.
         if str(source).startswith("base64://"):
             source = ""
-        key = hashlib.sha256(f"{stream}:{mid}:{index}:{seg.get('binary_hash', '')}".encode()).hexdigest()[:20]
+        key = hashlib.sha256(f"{stream}:{mid}:{index}:{id_ctx}:{seg.get('binary_hash', '')}".encode()).hexdigest()[:20]
         result.append({"media_id": "m-" + key, "type": kind, "origin": origin, "message_id": mid,
                        "stream_id": stream, "index": index, "source": str(source),
                        "file_id": str(fields.get("file_id") or fields.get("file") or ""),
@@ -73,12 +77,18 @@ class MediaContextMixin:
                     mapping.pop(key, None)
             while len(mapping) > 128:
                 mapping.pop(next(iter(mapping)))
+        now = time.time()
+        for key in [k for k, (_, seen) in self._stream_last_sender.items() if now - seen > 3600]:
+            self._stream_last_sender.pop(key, None)
 
     def _remember_anchor(self, message):
         uid, stream = identity(message)
         if not uid or not stream:
             return
         self._prune_context()
+        # 钩子消息由宿主序列化产生，发言人身份与命令 kwargs 同级可信；
+        # 记录为"该会话最近发言人"，供群聊工具上下文缺少 user_id 时限时回退。
+        self._stream_last_sender[stream] = (uid, time.time())
         # Keep bounded metadata; obtain binary payload from message.get_by_id only when selected.
         stripped = {k: message[k] for k in ("message_id", "timestamp", "session_id", "stream_id", "chat_id", "message_info", "reply_to") if k in message}
         stripped["raw_message"] = [{k: v for k, v in s.items() if k in {"type", "data", "binary_hash", "description"}} for s in segments(message)[:64]]
@@ -98,6 +108,13 @@ class MediaContextMixin:
             if (uid and message_uid and uid != message_uid) or (stream and message_stream and stream != message_stream):
                 raise PlanError("宿主消息与调用上下文身份不一致")
             uid, stream = uid or message_uid, stream or message_stream
+        if not uid and stream:
+            # MaiBot 对群聊会话固定清空 user_id（chat_manager："群聊不保存最近发言人的用户信息"），
+            # 工具上下文因此只注入 stream 不注入 user_id。回退到 before_process 钩子记录的
+            # 最近发言人——同为宿主注入的可信字段，LLM 无法伪造；超时限则保持 fail-closed。
+            last_uid, seen = self._stream_last_sender.get(stream, ("", 0.0))
+            if last_uid and time.time() - seen <= _FALLBACK_SENDER_TTL:
+                uid = last_uid
         if not uid or not stream:
             raise PlanError("宿主没有提供可信用户／会话身份，请使用 /rh运行 命令")
         return uid, stream
@@ -153,7 +170,8 @@ class MediaContextMixin:
                 group = str(kwargs.get("group_id") or (anchor.get("message_info", {}).get("group_info") or {}).get("group_id") or "")
                 if not isinstance(quoted, dict) or (quoted.get("group_id") and str(quoted["group_id"]) != group):
                     continue
-                for asset in assets_from_message(quoted, stream, "reply"):
+                # 平台消息 ID 掺入哈希：引用多条无 binary_hash 的旧消息时素材 ID 不互相碰撞
+                for asset in assets_from_message(quoted, stream, "reply", id_ctx=platform_id):
                     asset.update(platform_message_id=platform_id, message_id="")
                     assets.append(asset)
             except Exception:

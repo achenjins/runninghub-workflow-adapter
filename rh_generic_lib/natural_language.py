@@ -155,7 +155,7 @@ class NaturalLanguageMixin:
                 self._drafts[(uid, stream)] = {"created_at": time.time(), "plan": plan}
                 return {"success": False, "status": "needs_input", "missing": missing,
                         "message": "只需补充：" + "、".join(m["label"] for m in missing) + "。有多个参考图时请明确各自用途"}
-            kwargs.update(user_id=uid, stream_id=stream, anchor_id=snapshot["anchor_id"], natural_plan=plan)
+            kwargs.update(user_id=uid, stream_id=stream, anchor_id=snapshot["anchor_id"], natural_plan=plan, trigger="natural_language")
             result = await self._submit_and_poll(self._get_client(workflow.region), workflow, nodes, stream, kwargs)
             if result["success"]:
                 self._drafts.pop((uid, stream), None)
@@ -212,11 +212,11 @@ class NaturalLanguageMixin:
                 self._schedule_job(records[0])
             elif action == "status":
                 for record in records:
-                    if record["status"] in {"queued", "pending", "tracking_paused"}:
+                    if record["status"] in {"queued", "pending", "tracking_paused", "needs_attention"}:
                         self._schedule_job(record)
             else:
                 raise PlanError("未知操作")
-            records = [journal.get(r["task_id"]) for r in records]
+            records = [latest for latest in (journal.get(r["task_id"]) for r in records) if latest]
             return {"success": True, "tasks": [{k: r[k] for k in ("task_id", "workflow", "status", "remote_task_id", "delivery_status", "message", "coins")} for r in records[:10]],
                     "message": "操作已处理"}
         except (PlanError, ValueError) as exc:

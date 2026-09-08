@@ -41,9 +41,8 @@ from maibot_sdk import (
     HookHandler,
     MaiBotPlugin,
     PluginConfigBase,
-    Tool,
 )
-from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParamType, ToolParameterInfo
+from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 _PLUGIN_DIR = Path(__file__).resolve().parent
 if str(_PLUGIN_DIR) not in sys.path:
@@ -54,7 +53,7 @@ if str(_PLUGIN_DIR) not in sys.path:
 # 热重载交给 Runner 整体重载插件，不要在这里对子模块做部分 reload。
 from rh_generic_lib import workflow_runner  # noqa: E402
 from rh_generic_lib.config_compat import ensure_config_version  # noqa: E402
-from rh_generic_lib.media_plan import validate_workflow, workflow_card, PlanError  # noqa: E402
+from rh_generic_lib.media_plan import validate_workflow, PlanError  # noqa: E402
 from rh_generic_lib.delivery import NapcatDelivery  # noqa: E402
 from rh_generic_lib.file_source import (  # noqa: E402
     MAX_FILE_BYTES as _MAX_FILE_BYTES,
@@ -85,6 +84,9 @@ __all__ = ["RunningHubGenericPlugin", "create_plugin"]
 
 # 交互式收集的等待超时（秒）
 _INPUT_WAIT_TIMEOUT = 600
+
+# /rh中断 编号取消选择的有效期（秒）：过期后不再截胡普通数字消息
+_CANCEL_CHOICE_TTL = 120
 
 # 单个工作流的输入/配置节点总数上限（含参考图、配置节点，原 8 个对多参考图工作流不够）
 _MAX_NODES = 32
@@ -452,7 +454,7 @@ _LLM_DETECT_PROMPT = """你是 ComfyUI/RunningHub 工作流配置分析器。下
    - EmptyLatentImage：width / height / batch_size
    - 分辨率、画面比例（aspect ratio）、lora 强度、controlnet 强度等任何对出图效果有意义的标量参数
 4. 不要输出：CheckpointLoader、VAE、SaveImage、Upscale 等纯内部/保存类节点，也不要输出任何 <连线> 字段。
-5. 输入节点最多 8 个，配置节点最多 8 个，二者独立计数、互不影响；没有的类别可以少列或不列。
+5. 输入节点与配置节点合计最多 32 个；没有的类别可以少列或不列。
 6. label 一律用简短中文。
 
 工作流节点清单：
@@ -523,6 +525,8 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         self._request_lock = asyncio.Lock()
         self._background_tasks = set()
         self._anchors = {}
+        # stream -> (最近一次 before_process 宿主消息的 user_id, 记录时间)；群聊工具身份回退用
+        self._stream_last_sender = {}
         self._contexts = {}
         self._drafts = {}
         self._vision_cache = {}
@@ -536,7 +540,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         self._cache_dir: Path | None = None
         self._workflows: list[WorkflowItemSection] = []
         self._task_meta: dict[str, dict[str, str]] = {}
-        self._cancel_choices: dict[str, list[str]] = {}
+        self._cancel_choices: dict[str, tuple[float, list[str]]] = {}
         self._delivery: NapcatDelivery | None = None
         self._task_journal: TaskJournal | None = None
 
@@ -1701,17 +1705,22 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         if text.startswith("/"):
             return None
         key = self._session_key(uid, stream)
-        cancel_tasks = self._cancel_choices.get(key)
-        if cancel_tasks:
-            indices = self._parse_cancel_indices(text, len(cancel_tasks))
-            if indices:
-                self._cancel_choices.pop(key, None)
-                async def cancel_selected():
-                    for index in indices:
-                        await self.handle_rh_task("cancel", cancel_tasks[index], user_id=uid, stream_id=stream)
-                self._track_background(cancel_selected())
-                return {"action": "abort"}
         session = self._find_input_session(uid, stream)
+        entry = self._cancel_choices.get(key)
+        if entry:
+            expires, cancel_tasks = entry
+            if time.time() > expires:
+                self._cancel_choices.pop(key, None)
+            elif not (session and session.phase in {"text", "config"}):
+                # 活跃收集会话优先消费数字输入（如描述文本"1"）；取消选择只在空档期截胡
+                indices = self._parse_cancel_indices(text, len(cancel_tasks))
+                if indices:
+                    self._cancel_choices.pop(key, None)
+                    async def cancel_selected():
+                        for index in indices:
+                            await self.handle_rh_task("cancel", cancel_tasks[index], user_id=uid, stream_id=stream)
+                    self._track_background(cancel_selected())
+                    return {"action": "abort"}
         if not session:
             return None
         if session.phase not in {"text", "config"} and not self._is_finish_signal(text) and not self._extract_files_from_message(message):
@@ -1774,8 +1783,8 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         if not tasks:
             await self.ctx.send.text("当前没有进行中的任务", stream)
         else:
-            self._cancel_choices[self._session_key(uid, stream)] = [r["task_id"] for r in tasks]
-            await self.ctx.send.text("\n".join(f"{i}. {r['workflow']} {r['task_id']}" for i, r in enumerate(tasks, 1)) + "\n回复编号取消（如 1 或 1 2）", stream)
+            self._cancel_choices[self._session_key(uid, stream)] = (time.time() + _CANCEL_CHOICE_TTL, [r["task_id"] for r in tasks])
+            await self.ctx.send.text("\n".join(f"{i}. {r['workflow']} {r['task_id']}" for i, r in enumerate(tasks, 1)) + f"\n回复编号取消（如 1 或 1 2，{_CANCEL_CHOICE_TTL // 60} 分钟内有效）", stream)
         return True, "", 1
 
     @staticmethod

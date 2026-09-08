@@ -17,7 +17,7 @@ STATUS_PENDING = "pending"
 STATUS_SUCCESS = "success"
 STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
-ACTIVE_STATUSES = {"queued", "submitting", "unknown_submission", "pending", "tracking_paused"}
+ACTIVE_STATUSES = {"queued", "submitting", "unknown_submission", "pending", "tracking_paused", "needs_attention"}
 
 # 日志最多保留条数；超过后只裁剪已终结任务，pending 必须保留以支持重启恢复
 _MAX_RECORDS = 500
@@ -81,35 +81,6 @@ class TaskJournal:
             self._trim_locked()
             self.loaded = True
 
-    async def mark_pending(
-        self,
-        task_id: str,
-        *,
-        workflow: str = "",
-        stream_id: str = "",
-        region: str = "overseas",
-        user_id: str = "",
-        group_id: str = "",
-    ) -> None:
-        """记录一条刚提交的任务（pending）。"""
-        task_id = str(task_id or "").strip()
-        if not task_id:
-            return
-        await self._upsert(
-            task_id,
-            {
-                "workflow": str(workflow or "").strip(),
-                "coins": "0",
-                "status": STATUS_PENDING,
-                "stream_id": str(stream_id or ""),
-                "region": str(region or "overseas").strip() or "overseas",
-                "user_id": str(user_id or ""),
-                "group_id": str(group_id or ""),
-                "message": "",
-            },
-            force_status=True,
-        )
-
     async def mark_success(self, task_id: str, coins: Any, outputs: list | None = None) -> None:
         updates = {"coins": str(coins if coins is not None else "0").strip(), "status": STATUS_SUCCESS, "message": ""}
         if outputs is not None:
@@ -127,14 +98,6 @@ class TaskJournal:
 
     async def mark_cancelled(self, task_id: str) -> None:
         await self._upsert(task_id, {"status": STATUS_CANCELLED, "message": "用户取消"})
-
-    def pending_records(self) -> list[dict[str, Any]]:
-        """返回仍需要恢复轮询的记录（快照）。"""
-        return [
-            dict(record)
-            for record in self._records
-            if record.get("status") == STATUS_PENDING
-        ]
 
     def records(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self._records)
@@ -157,7 +120,7 @@ class TaskJournal:
             (float(r.get("submitted_at") or 0) > now - 3600)))
 
     async def update(self, task_id: str, **updates: Any) -> None:
-        await self._upsert(task_id, updates, force_status=True)
+        await self._upsert(task_id, updates)
 
     def _normalize_record(self, raw: dict[str, Any]) -> dict[str, Any]:
         record: dict[str, Any] = {}
@@ -178,7 +141,7 @@ class TaskJournal:
             record["submitted_at"] = raw.get("created_at", 0)
         return record
 
-    async def _upsert(self, task_id: str, updates: dict[str, Any], force_status: bool = False) -> None:
+    async def _upsert(self, task_id: str, updates: dict[str, Any]) -> None:
         now = time.time()
         async with self._lock:
             previous = copy.deepcopy(self._records)

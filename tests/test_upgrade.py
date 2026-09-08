@@ -1,7 +1,6 @@
 """Offline integration tests. No network, API keys, or MaiBot deployment required."""
 import asyncio
 import base64
-import copy
 import json
 import logging
 from pathlib import Path
@@ -107,11 +106,60 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse({p["name"] for p in component["metadata"]["parameters"]} & {"user_id", "group_id", "stream_id", "chat_id"})
 
     async def test_missing_identity_and_cross_context_fail(self):
+        # 完全未知身份（无 user_id、钩子也没记录过该会话）时保持 fail-closed
+        self.p._stream_last_sender.pop("s1", None)
         self.assertFalse((await self.p.handle_run_workflow("draw", "cat", stream_id="s1"))["success"])
         ctx = await self.p.handle_rh_context(user_id="11", stream_id="s1")
         bad = await self.p.handle_run_workflow("draw", "cat", context_id=ctx["context_id"], user_id="66", stream_id="s1")
         self.assertFalse(bad["success"])
         self.client.submit.assert_not_awaited()
+
+    async def test_group_tool_identity_falls_back_to_hook_sender(self):
+        # MaiBot 群聊工具上下文只注入 chat_id/group_id（会话级 user_id 被上游清空，
+        # 见 chat_manager._update_session_identity），插件回退到 before_process 记录的最近发言人
+        result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
+        self.assertTrue(result["success"], result.get("message"))
+        await self.settled()
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual(record["user_id"], "11")
+        self.assertEqual((record["status"], record["delivery_status"]), ("success", "sent"))
+        self.client.submit.assert_awaited_once()
+        # 超时限的发言人记录不得冒用（后台主动回复等无新消息场景保持 fail-closed）
+        self.p._stream_last_sender["s1"] = ("11", time.time() - 400)
+        stale = await self.p.handle_run_workflow("draw", "another cat", chat_id="s1", group_id="22")
+        self.assertFalse(stale["success"])
+        self.client.submit.assert_awaited_once()
+
+    async def test_definite_query_error_pauses_for_manual_recovery(self):
+        # 查询被服务端确定拒绝（如 Key 失效）：停止自动轮询并让出工作槽，修复后恢复且不重复提交
+        self.client.wait_for_result.side_effect = RunningHubError("请求被拒绝（HTTP 401）")
+        result = await self.enqueue()
+        for _ in range(50):
+            if self.p._task_journal.get(result["task_id"])["status"] == "needs_attention":
+                break
+            await asyncio.sleep(0.005)
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual(record["status"], "needs_attention")
+        self.assertEqual(record["remote_task_id"], "remote-1")
+        await asyncio.sleep(0.02)
+        self.assertNotIn(result["task_id"], self.p._pending)
+        self.client.wait_for_result.side_effect = None
+        await self.p._resume_pending_tasks()
+        await self.settled()
+        self.client.submit.assert_awaited_once()
+        self.assertEqual(self.p._task_journal.get(result["task_id"])["delivery_status"], "sent")
+
+    async def test_cancel_refused_by_dead_key_releases_locally(self):
+        # Key 已失效时远端取消同样被拒：本地取消并释放名额，避免队列被永久锁死
+        self.client.wait_for_result.side_effect = RunningHubError("请求被拒绝（HTTP 401）")
+        result = await self.enqueue()
+        for _ in range(50):
+            if self.p._task_journal.get(result["task_id"])["status"] == "needs_attention":
+                break
+            await asyncio.sleep(0.005)
+        self.client.cancel.side_effect = RunningHubError("请求被拒绝（HTTP 401）")
+        await self.p._cancel_task(result["task_id"], "s1")
+        self.assertEqual(self.p._task_journal.get(result["task_id"])["status"], "cancelled")
 
     async def test_single_prompt_end_to_end(self):
         result = await self.p.handle_run_workflow("draw", "cat", user_id="11", stream_id="s1")

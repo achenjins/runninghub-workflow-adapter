@@ -10,6 +10,7 @@
 4. 如需聊天中识别并写入工作流，先填写 `access.admin_users`。默认 `manage_workflows_admin_only = true`。
 5. 重载插件，核对新工具 `rh_context`、`rh_inspect_media`、`run_workflow`、`rh_task` 已启用，并允许新增的 `message.get_recent`、`message.get_by_id` 能力。
 6. 主对话模型具备视觉能力时，可通过看图工具读取真实图片；若主对话模型只支持文本，配置 `natural_language.vision_model` 为视觉模型槽位。图像摘要缓存会按模型和内容区分。视频／音频支持上传和角色绑定，目前不自动分析帧或转写音轨。
+7. 群聊中 MaiBot 工具上下文不注入 `user_id`（上游群聊会话固定清空，见 chat_manager），插件回退使用「最近一条入站消息的宿主注入发言人身份」（约 5 分钟内有效）计费与限流；私聊由宿主直接注入，不走回退。
 
 ### 升级时提示缺少 `plugin.config_version`
 
@@ -47,6 +48,7 @@ Runner 会在调用插件的配置解析和 `on_load` 前检查版本。插件�
 - `submitting`：已开始付费提交；进程在此阶段退出，会转为 `unknown_submission`。
 - `unknown_submission`：可能已创建远端任务，保留额度及并发名额，禁止自动重提。管理员在 RunningHub 后台核对后，发送 `/rh核对 本地任务ID 远端任务ID` 关联已有任务。只有确认没有创建时才使用 `/rh核对 本地任务ID 未创建` 释放名额。
 - `pending` / `tracking_paused`：已有远端编号；查询短暂失败或超时后继续后台跟踪，不表示远端生成失败。
+- `needs_attention`：查询被服务端确定拒绝（常见于 API Key 失效）。自动轮询已停止但保留远端编号，不会重复生成；修复配置后用 `/rh状态` 恢复，或 `/rh中断` 本地取消（远端取消同样被拒时按本地取消释放名额，请自行核对计费）。
 - `success`：生成完成。`delivery_status` 另行记录 `pending`、`partial`、`failed`、`uncertain`、`sent`。
 - `uncertain`：发送可能已经成功，自动重复发送可能造成重复消息。先查看聊天结果，再决定是否 `/rh补发`。进程退出前正在发送的项也按此处理。
 
