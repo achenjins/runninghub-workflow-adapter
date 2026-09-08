@@ -32,6 +32,9 @@ class InputSession:
     phase: str = "files"
     editable_nodes: list[dict[str, str]] = field(default_factory=list)
     chat_info: dict[str, str] = field(default_factory=dict)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    tasks: set[asyncio.Task] = field(default_factory=set)
+    cancelled: bool = False
 
 
 def session_key(user_id: str, stream_id: str) -> str:
@@ -78,17 +81,7 @@ def find_input_session(
         if anonymous_key in sessions:
             return sessions[anonymous_key]
         return None
-    if stream_id:
-        stream_keys = keys_by_stream.get(stream_id)
-        if stream_keys:
-            anonymous_key = f"stream:{stream_id}"
-            if anonymous_key in stream_keys:
-                return sessions.get(anonymous_key)
-            return latest_session_for_keys(sessions, stream_keys)
-    if user_id:
-        user_keys = keys_by_user.get(user_id)
-        if user_keys:
-            return latest_session_for_keys(sessions, user_keys)
+    # Partial identity must never select a different user's or another chat's session.
     return None
 
 

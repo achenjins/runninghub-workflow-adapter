@@ -15,10 +15,8 @@ __pycache__/
 .venv/
 venv/
 
-# 本地测试
-tests/
-
 # 运行产物
 data/
 temp/
 *.log
+/dist/

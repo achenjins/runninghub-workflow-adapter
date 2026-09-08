@@ -8,6 +8,24 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+
+class DeliveryError(RuntimeError):
+    """A definite failure; retrying cannot duplicate a successful send."""
+
+
+class DeliveryUncertain(RuntimeError):
+    """A send may have reached the adapter; automatic fallback could duplicate it."""
+
+
+def unwrap_response(value):
+    for _ in range(6):
+        if not isinstance(value, dict) or not isinstance(value.get("result"), dict):
+            return value
+        if value.get("success") is False:
+            return value
+        value = value["result"]
+    return value
+
 # NapCat 动作候选 API（兼容 napcat-adapter 与 SnowLuma 命名空间）
 ACTION_API_CANDIDATES: dict[str, tuple[str, ...]] = {
     "send_group_msg": (
@@ -30,7 +48,7 @@ ACTION_CALL_STYLE: dict[str, str] = {
 
 def resolve_action_api(action: str, cached: dict[str, str]) -> tuple[str, ...]:
     """返回动作的候选完整 API 名（命中过的排最前）。"""
-    candidates = list(ACTION_API_CANDIDATES.get(action, (f"adapter.napcat.message.{action}",)))
+    candidates = ["adapter.napcat.action.call", *ACTION_API_CANDIDATES.get(action, (f"adapter.napcat.message.{action}",))]
     cached_name = cached.get(action)
     if cached_name and cached_name in candidates:
         candidates.remove(cached_name)
@@ -53,24 +71,29 @@ class NapcatDelivery:
         last_error = ""
         for index, api_name in enumerate(candidates):
             try:
-                if call_style == "spread":
+                if api_name == "adapter.napcat.action.call":
+                    result = await self.ctx.api.call(api_name, action_name=action, params=params)
+                elif call_style == "spread":
                     result = await self.ctx.api.call(api_name, **params)
                 else:
                     result = await self.ctx.api.call(api_name, params=params)
             except Exception as exc:
                 last_error = str(exc)
-                if index < len(candidates) - 1:
-                    self.ctx.logger.info("NapCat 调用 %s 异常，尝试下一候选: %s", api_name, last_error)
+                if self._api_unavailable(last_error):
                     continue
-                self.ctx.logger.warning("NapCat 调用 %s 失败: %s", api_name, last_error)
-                return None
+                raise DeliveryUncertain("适配器发送响应丢失，需人工补发") from exc
             if isinstance(result, dict) and result.get("success") is False:
                 error_text = str(result.get("error") or "")
-                if index < len(candidates) - 1:
-                    self.ctx.logger.info("NapCat 调用 %s 业务失败，尝试下一候选: %s", api_name, error_text)
+                if self._api_unavailable(error_text):
                     continue
-                self.ctx.logger.warning("NapCat 调用 %s 业务失败: %s", api_name, error_text)
-                return None
+                raise DeliveryUncertain("适配器未确认发送结果，请查询后补发")
+            result = unwrap_response(result)
+            if result is None or not isinstance(result, dict):
+                raise DeliveryUncertain("适配器没有返回可识别的发送响应")
+            if (not self.is_failed(result) and not self.extract_message_id(result)
+                    and result.get("retcode") not in (0, "0")
+                    and str(result.get("status") or "").lower() not in {"ok", "success"}):
+                raise DeliveryUncertain("适配器没有明确确认发送成功")
             if self.cached_apis.get(action) != api_name:
                 self.cached_apis[action] = api_name
             self.ctx.logger.debug("NapCat 调用 %s 成功: %s", api_name, str(result)[:200])
@@ -79,10 +102,29 @@ class NapcatDelivery:
         return None
 
     @staticmethod
+    def _api_unavailable(text: str) -> bool:
+        text = text.lower()
+        return any(marker in text for marker in ("not found", "not registered", "unknown api", "unknown action", "不存在", "未注册", "不支持", "unexpected keyword", "permission denied", "capability denied"))
+
+    @staticmethod
+    async def _fallback_send(operation):
+        try:
+            result = await operation
+        except Exception as exc:
+            raise DeliveryUncertain("宿主发送响应丢失") from exc
+        if result is False or result is None or (isinstance(result, dict) and NapcatDelivery.is_failed(result)):
+            raise DeliveryError("宿主拒绝发送")
+        return result
+
+    @staticmethod
     def is_failed(response: Any) -> bool:
         """判断 NapCat 响应是否为业务失败。"""
         if not isinstance(response, dict):
-            return False
+            return response is None or response is False
+        if response.get("success") is False:
+            return True
+        if isinstance(response.get("result"), dict) and NapcatDelivery.is_failed(response["result"]):
+            return True
         retcode = response.get("retcode")
         if retcode is not None:
             try:
@@ -98,11 +140,9 @@ class NapcatDelivery:
         """从 NapCat API 响应中提取 message_id。"""
         if not isinstance(response, dict):
             return ""
-        result = response.get("result")
-        if isinstance(result, dict):
-            mid = result.get("message_id") or result.get("msg_id")
-            if mid:
-                return str(mid)
+        response = unwrap_response(response)
+        if not isinstance(response, dict):
+            return ""
         mid = response.get("message_id") or response.get("msg_id")
         if mid:
             return str(mid)
@@ -137,16 +177,12 @@ class NapcatDelivery:
                     "群号/用户号不是数字（group_id=%s user_id=%s），回退 ctx.send.image",
                     group_id, user_id,
                 )
-                await self.ctx.send.image(image_base64, stream_id)
+                await self._fallback_send(self.ctx.send.image(image_base64, stream_id))
                 return ""
             self.ctx.logger.debug(
                 "尝试 NapCat 直发图片: action=%s group_id=%s user_id=%s", action, group_id, user_id
             )
-            try:
-                response = await self.call_action(action, params)
-            except Exception as exc:
-                response = None
-                self.ctx.logger.warning("NapCat 直发图片异常，回退 ctx.send.image: %s", exc)
+            response = await self.call_action(action, params)
             if response is not None:
                 if self.is_failed(response):
                     self.ctx.logger.warning(
@@ -163,7 +199,7 @@ class NapcatDelivery:
         else:
             self.ctx.logger.warning("无法解析群号/用户号，回退 ctx.send.image")
 
-        await self.ctx.send.image(image_base64, stream_id)
+        await self._fallback_send(self.ctx.send.image(image_base64, stream_id))
         return ""
 
     async def send_video_with_id(self, video_url: str, stream_id: str, *, chat_info: dict) -> str:
@@ -191,11 +227,7 @@ class NapcatDelivery:
                 self.ctx.logger.debug(
                     "尝试 NapCat 直发视频: action=%s group_id=%s user_id=%s", action, group_id, user_id
                 )
-                try:
-                    response = await self.call_action(action, params)
-                except Exception as exc:
-                    response = None
-                    self.ctx.logger.warning("NapCat 直发视频异常，回退 send.custom: %s", exc)
+                response = await self.call_action(action, params)
                 if response is not None:
                     if self.is_failed(response):
                         self.ctx.logger.warning("NapCat 直发视频业务失败，回退 send.custom: %s", str(response)[:200])
@@ -208,13 +240,13 @@ class NapcatDelivery:
             self.ctx.logger.warning("无法解析群号/用户号，回退 send.custom 发视频")
 
         try:
-            ok = await self.ctx.send.custom("videourl", video_url, stream_id)
+            ok = await self._fallback_send(self.ctx.send.custom("videourl", video_url, stream_id))
             if ok:
                 return ""
-        except Exception as exc:
+        except DeliveryError as exc:
             self.ctx.logger.warning("send.custom 发视频异常，回退发链接: %s", exc)
 
-        await self.ctx.send.text(video_url, stream_id)
+        await self._fallback_send(self.ctx.send.text(video_url, stream_id))
         return ""
 
     def schedule_recall(self, message_id: str, delay_seconds: int) -> None:

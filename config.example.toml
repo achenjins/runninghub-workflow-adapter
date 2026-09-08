@@ -2,7 +2,7 @@
 # 注意：config.toml 已被 .gitignore 排除，不会提交到仓库
 
 [plugin]
-config_version = "1.1.0"
+config_version = "1.2.0"
 
 [server]
 base_url = "https://www.runninghub.ai"
@@ -15,6 +15,10 @@ poll_interval = 15
 max_wait = 1800
 max_concurrent = 2
 download_timeout = 120
+max_queued = 10
+max_file_mb = 64
+query_retries = 3
+delivery_retries = 2
 
 [feature]
 # 自动撤回（仅 NapCat / QQ 适配器生效）
@@ -33,6 +37,18 @@ allow_groups = []
 max_per_user_per_hour = 0
 # 管理员用户 ID（可用 /rh中断 中断所有人的任务）
 admin_users = []
+# 聊天中识别并写入工作流配置需要先填好上面的管理员 QQ
+manage_workflows_admin_only = true
+
+[natural_language]
+enabled = true
+history_limit = 20
+media_ttl_seconds = 3600
+max_candidates = 12
+planner_model = "utils"
+# 留空由主对话模型使用 rh_inspect_media 看图；或填支持图片的模型槽位
+vision_model = ""
+llm_timeout = 45
 
 # ────────────────────────────────────────────────────────────
 # 工作流列表（结构化配置，可在 WebUI「工作流列表」中增删）
@@ -50,6 +66,11 @@ admin_users = []
 # region = "overseas"             # overseas=海外(runninghub.ai) / domestic=国内(runninghub.cn)
 # llm_enhance = false             # LLM 扩写开关
 # llm_template_path = ""          # 扩写模板路径（相对插件目录）
+# description = "动漫角色文生图"
+# capability = "text_to_image"   # 或 image_to_image / text_to_video / image_to_video / multi_reference
+# output_type = "image"          # image / video / audio / file
+# natural_language = true
+# prompt_profile = "auto"        # auto / image / edit / video / raw；模板优先
 #
 # [[workflows.items.input_nodes]]
 # node_id = "353"
@@ -57,15 +78,22 @@ admin_users = []
 # field_value = ""                # 留空：由用户提供；填写：作为默认值
 # value_type = "prompt"           # prompt=主提示词 / text=可编辑配置 / default=固定默认值 / image=图片 / audio=语音 / 空=自动推断
 # label = "提示词"
+# input_key = "prompt"           # 留空时使用 节点ID.字段名
+# role = ""                      # 图片可填 subject/style/background/first_frame/last_frame
+# required = true                # 没有默认值时必须提供；可选素材才设为 false
+# parameter_type = "string"      # text 参数可设置 integer/number/boolean
+# choices = []                   # text 参数枚举，如 ["16:9", "1:1"]
+# minimum = 64                   # 数字参数下界；不限制时省略
+# maximum = 2048                 # 数字参数上界；不限制时省略
 #
 # 节点规则：
 # - prompt：主提示词，优先使用 /rh运行 后的描述或 LLM 扩写文本；
 #   没有输入时回退 field_value 默认值；无默认值且没输入时会先询问描述
 #   （整个工作流仅一个，多了报错）
-# - text：可编辑配置（带默认值 field_value），上传文件后询问用户是否修改
+# - text：自然语言保留默认值，只覆盖明确指定参数；命令路径保留配置确认
 # - default：固定默认值，直接使用、不询问；无默认值时跳过
-# - image/audio：留空时按顺序等待上传，可只上传部分；
-#   发送「跳过剩余」直接开始，未上传的节点使用工作流默认值
+# - image/audio/video：自然语言按素材 ID 和角色绑定，命令按提示顺序上传；
+#   只有 required=false 的可选素材能跳过。有默认值的媒体可在自然语言中明确覆盖。
 # - 总共最多 32 个节点
 #
 # 默认不带任何工作流，请按上面的注释自行添加或使用 /识别工作流 命令。
