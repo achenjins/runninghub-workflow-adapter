@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -51,6 +53,7 @@ if str(_PLUGIN_DIR) not in sys.path:
 # sys.modules，导致拿到对方的旧版 client（缺少 get_workflow_json 等方法）。
 # 热重载交给 Runner 整体重载插件，不要在这里对子模块做部分 reload。
 from rh_generic_lib import workflow_runner  # noqa: E402
+from rh_generic_lib.config_compat import ensure_config_version  # noqa: E402
 from rh_generic_lib.media_plan import validate_workflow, workflow_card, PlanError  # noqa: E402
 from rh_generic_lib.delivery import NapcatDelivery  # noqa: E402
 from rh_generic_lib.file_source import (  # noqa: E402
@@ -478,6 +481,27 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
     """麦麦画师 · RunningHub 插件主体。"""
 
     config_model: ClassVar[type[PluginConfigBase]] = GenericConfig
+
+    def normalize_plugin_config(
+        self, config_data: Mapping[str, Any] | None
+    ) -> tuple[dict[str, Any], bool]:
+        """在 SDK 检查版本前，兼容缺少版本号的旧配置与 WebUI 保存数据。"""
+        raw_config = dict(config_data) if isinstance(config_data, Mapping) else config_data
+        version_added = False
+        if raw_config:
+            plugin_section = raw_config.get("plugin", {})
+            if isinstance(plugin_section, Mapping) and not str(
+                plugin_section.get("config_version") or ""
+            ).strip():
+                # 不修改调用方字典；已有版本、启用状态和其他配置由 SDK 原样校验。
+                raw_config["plugin"] = {
+                    **plugin_section,
+                    "config_version": PluginMetaSection.model_fields["config_version"].default,
+                }
+                version_added = True
+        normalized, changed = super().normalize_plugin_config(raw_config)
+        # 供 SDK 直接注入配置和不强制版本检查的 WebUI 校验路径使用。
+        return normalized, changed or version_added
 
     # 缓存的 NapCat 动作 → 已解析 API 名（适配器热切换时自愈）
     _resolved_action_api: dict[str, str] = {}
@@ -2603,4 +2627,13 @@ def _safe_int(value: Any) -> int:
 
 def create_plugin() -> RunningHubGenericPlugin:
     """MaiBot Runner 要求提供的模块级工厂函数。"""
+    # Runner 在调用 normalize_plugin_config / on_load 之前检查文件版本，
+    # 因此旧文件的版本字段必须在实例交给 Runner 前修复。
+    try:
+        if ensure_config_version(
+            _PLUGIN_DIR / "config.toml", PluginMetaSection.model_fields["config_version"].default
+        ):
+            logging.getLogger(__name__).info("已备份旧配置并补齐 plugin.config_version")
+    except (OSError, ValueError) as exc:
+        logging.getLogger(__name__).warning("旧配置版本字段自动修复失败：%s", exc)
     return RunningHubGenericPlugin()

@@ -11,6 +11,12 @@
 5. 重载插件，核对新工具 `rh_context`、`rh_inspect_media`、`run_workflow`、`rh_task` 已启用，并允许新增的 `message.get_recent`、`message.get_by_id` 能力。
 6. 主对话模型具备视觉能力时，可通过看图工具读取真实图片；若主对话模型只支持文本，配置 `natural_language.vision_model` 为视觉模型槽位。图像摘要缓存会按模型和内容区分。视频／音频支持上传和角色绑定，目前不自动分析帧或转写音轨。
 
+### 升级时提示缺少 `plugin.config_version`
+
+Runner 会在调用插件的配置解析和 `on_load` 前检查版本。插件创建时会先备份旧文件到同目录的 `config.toml.pre-version-时间戳.bak`，仅补齐缺失或为空的版本号；已有非空版本号及其他配置值保留。更新代码后需要重载插件（必要时重启 MaiBot），仅保存配置不会替换仍在运行的旧代码。备份含原配置，请按配置文件同样保管，不要提交到仓库。
+
+若仍在使用旧代码，可先在服务器插件 `config.toml` 已有的 `[plugin]` 表内补上 `config_version = "1.2.0"`，再重载。若没有 `[plugin]` 表，在文件开头新增该表和版本行；不要重复创建同名表，也不要把版本行写到 `[server]` 或工作流表下。
+
 ## 建议验证顺序
 
 每条生成测试都可能消耗 RunningHub 余额，先使用自己的低成本工作流。所有场景均应核对 RunningHub 后台实际任务数，以及聊天中的结果和任务编号。
