@@ -288,8 +288,16 @@ class InputNodeSection(PluginConfigBase):
     required: bool = Field(default=True, description="没有默认值时是否必须提供；可选文件才允许跳过")
     parameter_type: Literal["string", "integer", "number", "boolean"] = Field(default="string", description="可编辑参数值类型")
     choices: list[str] = Field(default_factory=list, description="可编辑参数允许的值；留空不限制枚举")
-    minimum: float | None = Field(default=None, description="数字参数最小值；留空不限制")
-    maximum: float | None = Field(default=None, description="数字参数最大值；留空不限制")
+    minimum: float | Literal[""] = Field(default="", description="数字参数最小值；留空不限制")
+    maximum: float | Literal[""] = Field(default="", description="数字参数最大值；留空不限制")
+
+    @field_validator("minimum", "maximum", mode="before")
+    @classmethod
+    def _normalize_optional_bound(cls, value: Any) -> Any:
+        # TOML 不支持 None；空字符串表示未设置，已有数字配置仍然兼容。
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return ""
+        return value
 
     @field_validator("value_type", mode="before")
     @classmethod
@@ -602,7 +610,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             extra = getattr(field_info, "json_schema_extra", None)
             json_extra = dict(extra) if isinstance(extra, dict) else {}
             item_field: dict[str, Any] = {
-                "type": "select" if field_name in {"value_type", "parameter_type"} else ("boolean" if field_name == "required" else "array" if field_name == "choices" else "number" if field_name in {"minimum", "maximum"} else "string"),
+                "type": "select" if field_name in {"value_type", "parameter_type"} else ("boolean" if field_name == "required" else "array" if field_name == "choices" else "string"),
                 "label": str(json_extra.get("label") or field_info.description or field_name),
                 "placeholder": str(json_extra.get("placeholder") or ""),
                 "default": default_values.get(field_name),

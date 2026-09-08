@@ -20,6 +20,11 @@ def input_key(node: Any) -> str:
     return str(getattr(node, "input_key", "") or "").strip() or f"{node.node_id}.{node.field_name}"
 
 
+def _optional_bound(node: Any, field: str) -> float | None:
+    value = getattr(node, field, None)
+    return None if value == "" else value
+
+
 def validate_workflow(workflow: Any) -> None:
     nodes = [n for n in workflow.input_nodes if str(n.node_id).strip()]
     if len(nodes) > 32:
@@ -35,7 +40,7 @@ def validate_workflow(workflow: Any) -> None:
             raise PlanError(f"输入标识或节点字段重复／为空：{key}")
         keys.add(key)
         fields.add(field)
-        low, high = getattr(node, "minimum", None), getattr(node, "maximum", None)
+        low, high = _optional_bound(node, "minimum"), _optional_bound(node, "maximum")
         if any(bound is not None and not math.isfinite(bound) for bound in (low, high)):
             raise PlanError(f"参数 {key} 的边界必须是有限数字")
         if low is not None and high is not None and low > high:
@@ -59,8 +64,8 @@ def workflow_card(workflow: Any) -> dict[str, Any]:
         }
         if kind == "text":
             item.update(default=node.field_value, parameter_type=getattr(node, "parameter_type", "string"),
-                        choices=getattr(node, "choices", []), minimum=getattr(node, "minimum", None),
-                        maximum=getattr(node, "maximum", None))
+                        choices=getattr(node, "choices", []), minimum=_optional_bound(node, "minimum"),
+                        maximum=_optional_bound(node, "maximum"))
         inputs.append(item)
     return {
         "name": workflow.name, "description": getattr(workflow, "description", ""),
@@ -95,7 +100,7 @@ def validate_parameter(node: Any, value: Any) -> str:
             except ValueError:
                 raise PlanError(f"参数 {key} 必须使用整数字面值") from None
         for attr, failed in (("minimum", lambda x: number < x), ("maximum", lambda x: number > x)):
-            bound = getattr(node, attr, None)
+            bound = _optional_bound(node, attr)
             if bound is not None and failed(bound):
                 raise PlanError(f"参数 {key} 超出允许范围：{getattr(node, 'minimum', None)}～{getattr(node, 'maximum', None)}")
     elif kind == "boolean":
