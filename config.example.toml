@@ -27,9 +27,9 @@ enable = false
 recall_seconds = 90
 # 节点识别
 use_llm = true
-model = "通用模型"
+model = "utils"
 # 提示词扩写
-enhance_model = "通用模型"
+enhance_model = "utils"
 
 [access]
 # 访问控制（留空=不限制；max_per_user_per_hour = 0 表示不限频）
@@ -46,10 +46,10 @@ enabled = true
 history_limit = 20
 media_ttl_seconds = 3600
 max_candidates = 12
-planner_model = "通用模型"
-# 在配置页下拉选择：通用模型、回复模型、规划模型、视觉模型。
+planner_model = "utils"
+# 模型仅可选择：replyer、planner、utils、vlm。
 # 视觉模型默认对应宿主的 vlm；旧空值也改用此项。识图失败仍上传原图。
-vision_model = "视觉模型"
+vision_model = "vlm"
 # 每人每个会话保留最近使用的原图与约五十字简介；填零关闭并清空。
 recent_images = 5
 # 把用户头像（群聊含群头像）作为可选素材，支持「画我」类请求；不需要可设 false

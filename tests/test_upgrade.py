@@ -287,7 +287,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
     async def test_vision_model_sees_actual_bytes_before_enhancing(self):
         wf = workflow(media=True)
         wf.llm_enhance = True
-        self.set_config(wf, natural_language={"vision_model": "vision"})
+        self.set_config(wf, natural_language={"vision_model": "vlm"})
         self.messages["m1"] = message(images=1)
         self.p._remember_anchor(self.messages["m1"])
         self.ctx.llm.generate.side_effect = [{"success": True, "response": "white cat by a window"}, {"success": True, "response": "blue cat by the same window"}]

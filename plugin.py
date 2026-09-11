@@ -225,7 +225,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
 
     def get_webui_config_schema(self, **kwargs: Any) -> dict[str, Any]:
         """使用中文下拉选项，并补齐工作流、节点两层列表表单。"""
-        return localize_schema(super().get_webui_config_schema(**kwargs), self.get_plugin_config_data())
+        return localize_schema(super().get_webui_config_schema(**kwargs))
 
     @staticmethod
     def _build_input_node_item_fields() -> dict[str, dict[str, Any]]:

@@ -3,17 +3,26 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Literal, get_args, get_origin
+from typing import Annotated, Any, Literal, get_args, get_origin
 
 from maibot_sdk import Field, PluginConfigBase
-from pydantic import field_validator, model_serializer, model_validator
+from pydantic import BeforeValidator, field_validator, model_serializer, model_validator
 
 from .media_plan import validate_workflow
 
 
-# 表单统一生成下拉框；保留字符串类型以兼容已有的自定义模型任务名。
-ModelTask = str
-MODEL_OPTIONS = {"utils": "通用模型", "replyer": "回复模型", "planner": "规划模型", "vlm": "视觉模型"}
+# 模型选项与配置文件均使用宿主原始任务名；中文旧值只在读入时兼容。
+MODEL_OPTIONS = ["replyer", "planner", "utils", "vlm"]
+
+
+def _normalize_model_task(value):
+    if isinstance(value, str):
+        value = value.strip()
+        return {"通用模型": "utils", "回复模型": "replyer", "规划模型": "planner", "视觉模型": "vlm"}.get(value, value)
+    return value
+
+
+ModelTask = Annotated[Literal["replyer", "planner", "utils", "vlm"], BeforeValidator(_normalize_model_task)]
 WORKFLOW_OPTIONS = {
     "region": {"overseas": "国外", "domestic": "国内"},
     "instance_type": {"Standard": "标准", "Plus": "增强", "Ultra": "旗舰"},
@@ -28,32 +37,19 @@ NODE_OPTIONS = {
     "parameter_type": {"string": "文字", "integer": "整数", "number": "小数", "boolean": "开关"},
 }
 MODEL_FIELDS = {"feature": ("model", "enhance_model"), "natural_language": ("planner_model", "vision_model")}
-_CUSTOM_MODEL_PREFIX = "已有模型："
-
-
-def _model_label(value):
-    return MODEL_OPTIONS.get(value, _CUSTOM_MODEL_PREFIX + str(value)) if value else MODEL_OPTIONS["vlm"]
 
 
 def _translate_values(data, *, display):
     """仅转换已声明的选项值，不改键名、默认内容或用户提示词。"""
     data = copy.deepcopy(data)
-    def convert(record, field, labels, model=False):
+    def convert(record, field, labels):
         if not isinstance(record, dict) or field not in record:
             return
         value = record[field]
         if not isinstance(value, str):
             return
-        if model and display:
-            record[field] = _model_label(value)
-        elif model and not display and value.startswith(_CUSTOM_MODEL_PREFIX):
-            record[field] = value[len(_CUSTOM_MODEL_PREFIX):]
-        else:
-            choices = labels if display else {label: key for key, label in labels.items()}
-            record[field] = choices.get(value, value)
-    for section, fields in MODEL_FIELDS.items():
-        for field in fields:
-            convert(data.get(section), field, MODEL_OPTIONS, model=True)
+        choices = labels if display else {label: key for key, label in labels.items()}
+        record[field] = choices.get(value, value)
     workflows = data.get("workflows")
     items = workflows.get("items", []) if isinstance(workflows, dict) else workflows if isinstance(workflows, list) else []
     for workflow in items:
@@ -304,21 +300,16 @@ def build_item_fields(model):
     return fields
 
 
-def localize_schema(schema, current_config):
-    """使用控件实际支持的中文 choices，并保留旧自定义模型的当前选项。"""
+def localize_schema(schema):
+    """模型只提供四个原始任务名，工作流与节点选项使用中文。"""
     sections = schema.get("sections") or {}
     for section, names in MODEL_FIELDS.items():
         fields = (sections.get(section) or {}).get("fields") or {}
-        current = current_config.get(section) or {}
         for name in names:
             if name not in fields:
                 continue
             field = fields[name]
-            choices = list(MODEL_OPTIONS.values())
-            selected = current.get(name)
-            if selected and selected not in choices:
-                choices.append(selected)
-            field.update(type="select", ui_type="select", choices=choices)
+            field.update(type="select", ui_type="select", choices=list(MODEL_OPTIONS))
     items = ((sections.get("workflows") or {}).get("fields") or {}).get("items")
     if isinstance(items, dict):
         items.update(item_type="object", item_fields=build_item_fields(WorkflowItemSection))

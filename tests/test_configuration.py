@@ -62,14 +62,14 @@ class ConfigurationTests(unittest.TestCase):
         reloaded.set_plugin_config(data)
         return reloaded, data
 
-    def test_english_config_normalizes_to_stable_chinese_without_mutating_input(self):
+    def test_workflow_options_localize_without_changing_model_names_or_input(self):
         original = sample_config()
         untouched = copy.deepcopy(original)
         normalized, changed = self.plugin.normalize_plugin_config(original)
         self.assertTrue(changed)
         self.assertEqual(original, untouched)
-        self.assertEqual(normalized["feature"]["model"], "规划模型")
-        self.assertEqual(normalized["natural_language"]["vision_model"], "视觉模型")
+        self.assertEqual(normalized["feature"]["model"], "planner")
+        self.assertEqual(normalized["natural_language"]["vision_model"], "vlm")
         workflow = normalized["workflows"]["items"][0]
         self.assertEqual(workflow["region"], "国内")
         self.assertEqual(workflow["instance_type"], "增强")
@@ -97,10 +97,10 @@ class ConfigurationTests(unittest.TestCase):
                                  sample_config()["workflows"]["items"][0]["input_nodes"][4]["field_value"])
 
     def test_all_model_choices_are_selectable_and_roundtrip_to_host_task_names(self):
-        task_labels = {"utils": "通用模型", "replyer": "回复模型", "planner": "规划模型", "vlm": "视觉模型"}
+        tasks = ["replyer", "planner", "utils", "vlm"]
         fields = (("feature", "model"), ("feature", "enhance_model"),
                   ("natural_language", "planner_model"), ("natural_language", "vision_model"))
-        for task, label in task_labels.items():
+        for task in tasks:
             with self.subTest(task=task):
                 self.plugin.set_plugin_config({
                     "feature": {"model": task, "enhance_model": task},
@@ -112,43 +112,47 @@ class ConfigurationTests(unittest.TestCase):
                     field = schema[section]["fields"][name]
                     self.assertEqual(field["type"], "select")
                     self.assertEqual(field["ui_type"], "select")
-                    self.assertEqual(set(field["choices"]), set(task_labels.values()))
+                    self.assertEqual(field["choices"], tasks)
                     self.assertIn(field["default"], field["choices"])
-                    self.assertEqual(data[section][name], label)
+                    self.assertEqual(data[section][name], task)
                     self.assertIn(data[section][name], field["choices"])
-                # Simulate saving the exact Chinese values submitted by select controls.
-                self.plugin.set_plugin_config(data)
+                # Exercise the actual file boundary as well as select values.
+                self.plugin, saved = self.save_and_reload()
                 for section, name in fields:
                     self.assertEqual(getattr(getattr(self.plugin.config, section), name), task)
+                    self.assertEqual(saved[section][name], task)
 
-    def test_existing_custom_model_survives_repeated_ui_save(self):
-        self.plugin.set_plugin_config({
-            "feature": {"model": "custom_node_task", "enhance_model": "custom_enhance_task"},
-            "natural_language": {"planner_model": "custom_planner_task", "vision_model": "custom_vision_task"},
-        })
-        for cycle in range(3):
-            with self.subTest(cycle=cycle):
-                data = self.plugin.get_plugin_config_data()
-                sections = self.plugin.get_webui_config_schema()["sections"]
+    def test_unsupported_models_are_rejected(self):
+        for section, name in (("feature", "model"), ("feature", "enhance_model"),
+                              ("natural_language", "planner_model"), ("natural_language", "vision_model")):
+            for value in ("custom_model", "已有模型：custom_model", "vision"):
+                with self.subTest(section=section, name=name, value=value), self.assertRaises(ValueError):
+                    self.plugin.set_plugin_config({section: {name: value}})
+
+    def test_previous_chinese_model_choices_save_as_original_task_names(self):
+        labels = {"通用模型": "utils", "回复模型": "replyer", "规划模型": "planner", "视觉模型": "vlm"}
+        for label, task in labels.items():
+            with self.subTest(label=label):
+                self.plugin.set_plugin_config({
+                    "feature": {"model": label, "enhance_model": label},
+                    "natural_language": {"planner_model": label, "vision_model": label},
+                })
+                self.plugin, saved = self.save_and_reload()
                 for section, names in (("feature", ("model", "enhance_model")),
                                        ("natural_language", ("planner_model", "vision_model"))):
                     for name in names:
-                        self.assertIn(data[section][name], sections[section]["fields"][name]["choices"])
-                self.plugin, _ = self.save_and_reload()
-                self.assertEqual(self.plugin.config.feature.model, "custom_node_task")
-                self.assertEqual(self.plugin.config.feature.enhance_model, "custom_enhance_task")
-                self.assertEqual(self.plugin.config.natural_language.planner_model, "custom_planner_task")
-                self.assertEqual(self.plugin.config.natural_language.vision_model, "custom_vision_task")
+                        self.assertEqual(saved[section][name], task)
+                        self.assertEqual(getattr(getattr(self.plugin.config, section), name), task)
 
     def test_missing_or_blank_vision_model_uses_vlm(self):
         for section in ({}, {"vision_model": ""}, {"vision_model": "  "}, {"vision_model": None}):
             with self.subTest(section=section):
                 self.plugin.set_plugin_config({"natural_language": section})
                 self.assertEqual(self.plugin.config.natural_language.vision_model, "vlm")
-                self.assertEqual(self.plugin.get_plugin_config_data()["natural_language"]["vision_model"], "视觉模型")
+                self.assertEqual(self.plugin.get_plugin_config_data()["natural_language"]["vision_model"], "vlm")
                 schema = self.plugin.get_webui_config_schema()["sections"]["natural_language"]["fields"]["vision_model"]
-                self.assertEqual(schema["default"], "视觉模型")
-                self.assertIn("视觉模型", schema["choices"])
+                self.assertEqual(schema["default"], "vlm")
+                self.assertEqual(schema["choices"], ["replyer", "planner", "utils", "vlm"])
 
     def test_new_node_defaults_optional_and_explicit_required_survives_save(self):
         self.assertFalse(InputNodeSection().required)
@@ -237,8 +241,11 @@ class ConfigurationTests(unittest.TestCase):
                         self.assertRegex(field[key], r"[\u4e00-\u9fff]")
                         self.assertNotRegex(field[key], r"[A-Za-z]")
                     if field.get("choices"):
-                        for choice in field["choices"]:
-                            self.assertRegex(choice, r"[\u4e00-\u9fff]")
+                        if name in {"model", "enhance_model", "planner_model", "vision_model"}:
+                            self.assertEqual(field["choices"], ["replyer", "planner", "utils", "vlm"])
+                        else:
+                            for choice in field["choices"]:
+                                self.assertRegex(choice, r"[\u4e00-\u9fff]")
                         self.assertIn(field["default"], field["choices"])
                     if field.get("item_fields"):
                         check_fields(field["item_fields"])
