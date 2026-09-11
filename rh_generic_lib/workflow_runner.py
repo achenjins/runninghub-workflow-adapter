@@ -99,7 +99,8 @@ def build_node_info_list(
             continue
 
         if vtype == "text":
-            node_info_list.append({"nodeId": node_id, "fieldName": field_name, "fieldValue": field_value})
+            if field_value:
+                node_info_list.append({"nodeId": node_id, "fieldName": field_name, "fieldValue": field_value})
             continue
 
         if vtype == "default":

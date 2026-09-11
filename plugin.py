@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -29,15 +30,12 @@ import sys
 import time
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, ClassVar, Literal
-
-from pydantic import field_validator, model_validator
+from typing import Any, ClassVar
 
 from maibot_sdk import (
     API,
     Command,
     CONFIG_RELOAD_SCOPE_SELF,
-    Field,
     HookHandler,
     MaiBotPlugin,
     PluginConfigBase,
@@ -53,12 +51,14 @@ if str(_PLUGIN_DIR) not in sys.path:
 # 热重载交给 Runner 整体重载插件，不要在这里对子模块做部分 reload。
 from rh_generic_lib import workflow_runner  # noqa: E402
 from rh_generic_lib.config_compat import ensure_config_version  # noqa: E402
+from rh_generic_lib.configuration import (  # noqa: E402
+    GenericConfig, InputNodeSection, PluginMetaSection, WorkflowItemSection, build_item_fields, localize_schema,
+    migrate_legacy_feature_sections,
+)
 from rh_generic_lib.media_plan import validate_workflow, PlanError  # noqa: E402
 from rh_generic_lib.delivery import NapcatDelivery  # noqa: E402
 from rh_generic_lib.file_source import (  # noqa: E402
-    MAX_FILE_BYTES as _MAX_FILE_BYTES,
     add_trusted_root as file_source_add_trusted_root,
-    decode_base64_bounded,
     detect_file_type_from_name,
     extract_bytes_from_napcat_result,
     extract_files_from_message,
@@ -88,352 +88,6 @@ _INPUT_WAIT_TIMEOUT = 600
 
 # /rh中断 编号取消选择的有效期（秒）：过期后不再截胡普通数字消息
 _CANCEL_CHOICE_TTL = 120
-
-# 单个工作流的输入/配置节点总数上限（含参考图、配置节点，原 8 个对多参考图工作流不够）
-_MAX_NODES = 32
-
-
-class PluginMetaSection(PluginConfigBase):
-    """插件配置版本信息（SDK 要求，请勿删除）。"""
-
-    __ui_label__ = "配置版本"
-
-    config_version: str = Field(
-        default="1.2.0",
-        description="插件配置版本号（一般无需修改）",
-        json_schema_extra={"label": "配置版本", "hidden": True},
-    )
-    # MaiBot 的「禁用/启用」会在 [plugin] 写 enabled；必须声明该字段，
-    # 否则 pydantic(extra=ignore) 会在配置归一化时把它丢弃，
-    # 导致禁用后 inspect 误判为已启用、点「启用」又被翻转回禁用。
-    enabled: bool = Field(
-        default=True,
-        description="插件启用状态（由 MaiBot 管理，请勿手动修改）",
-        json_schema_extra={"label": "启用状态", "hidden": True},
-    )
-
-
-class ServerSection(PluginConfigBase):
-    """RunningHub 服务配置。"""
-
-    __ui_label__ = "RunningHub 服务"
-
-    base_url: str = Field(
-        default="https://www.runninghub.ai",
-        description="国外平台基地址（runninghub.ai）",
-        json_schema_extra={"label": "国外基地址", "disabled": True},
-    )
-    api_key: str = Field(
-        default="",
-        description="国外 RunningHub API Key（在平台个人中心获取，务必保密）",
-        json_schema_extra={"label": "国外 API Key", "placeholder": "粘贴你的 API Key", "x-widget": "password"},
-    )
-    base_url_cn: str = Field(
-        default="https://www.runninghub.cn",
-        description="国内平台基地址（runninghub.cn）",
-        json_schema_extra={"label": "国内基地址", "disabled": True},
-    )
-    api_key_cn: str = Field(
-        default="",
-        description="国内 RunningHub API Key（可与国外只填一个；只填一个时拉取默认用该 key）",
-        json_schema_extra={"label": "国内 API Key", "placeholder": "粘贴你的国内 API Key", "x-widget": "password"},
-    )
-
-
-class GenerationSection(PluginConfigBase):
-    """生成与轮询配置。"""
-
-    __ui_label__ = "生成参数"
-
-    poll_interval: int = Field(
-        default=15, ge=3, description="任务轮询间隔（秒）", json_schema_extra={"label": "轮询间隔（秒）"}
-    )
-    max_wait: int = Field(
-        default=1800, ge=60, description="任务最大等待时间（秒）", json_schema_extra={"label": "最大等待（秒）"}
-    )
-    max_concurrent: int = Field(
-        default=2, ge=1, le=10, description="同时进行中的任务数上限", json_schema_extra={"label": "并发上限"}
-    )
-    download_timeout: int = Field(
-        default=120, ge=30, description="下载图片超时（秒）", json_schema_extra={"label": "下载超时（秒）"}
-    )
-    max_queued: int = Field(default=10, ge=0, le=100, description="运行名额之外允许等待的任务数")
-    max_file_mb: int = Field(default=64, ge=1, le=512, description="单个输入／结果文件大小上限（MB）")
-    query_retries: int = Field(default=3, ge=0, le=10, description="查询连续网络失败重试次数")
-    delivery_retries: int = Field(default=2, ge=0, le=5, description="结果下载／投递失败自动重试次数")
-
-
-class FeatureSection(PluginConfigBase):
-    """可选功能设置（自动撤回 / 节点识别 / 提示词扩写）。"""
-
-    __ui_label__ = "功能设置"
-
-    enable: bool = Field(
-        default=False,
-        description="启用发送后自动撤回（仅在使用 NapCat 适配器时生效，其他平台无效）",
-        json_schema_extra={"label": "启用自动撤回", "hint": "仅 NapCat 适配器生效"},
-    )
-    recall_seconds: int = Field(
-        default=90,
-        ge=0,
-        description="图片发送后自动撤回的秒数（0 表示不撤回）",
-        json_schema_extra={"label": "撤回延迟（秒）", "hint": "0 表示不撤回"},
-    )
-    use_llm: bool = Field(
-        default=True,
-        description="用内置 LLM 识别输入节点与配置节点（覆盖任意节点类型，比白名单更准）；失败时自动回退启发式规则",
-        json_schema_extra={"label": "LLM 识别"},
-    )
-    model: Literal["utils", "replyer", "planner"] = Field(
-        default="utils",
-        description="识别使用的模型槽位（utils=通用快模型；replyer=主回复模型；planner=规划快模型）",
-        json_schema_extra={"label": "识别模型槽位", "hint": "要快选 utils，要效果选 replyer"},
-    )
-    enhance_model: Literal["utils", "replyer", "planner"] = Field(
-        default="utils",
-        description="扩写使用的模型任务槽位（utils=通用快模型；replyer=主回复模型；planner=规划快模型）",
-        json_schema_extra={"label": "扩写模型槽位", "hint": "要快选 utils，要效果选 replyer"},
-    )
-
-
-class AccessSection(PluginConfigBase):
-    """访问控制与费用保护（默认全部放行，与旧版行为一致）。"""
-
-    __ui_label__ = "访问控制"
-
-    allow_users: list[str] = Field(
-        default_factory=list,
-        description="允许使用本插件的用户 ID 白名单；留空表示不限制任何用户",
-        json_schema_extra={"label": "用户白名单", "placeholder": "用户ID，每行一个"},
-    )
-    allow_groups: list[str] = Field(
-        default_factory=list,
-        description="允许使用本插件的群组 ID 白名单；留空表示不限制群组（私聊不受群组白名单约束）",
-        json_schema_extra={"label": "群组白名单", "placeholder": "群号，每行一个"},
-    )
-    max_per_user_per_hour: int = Field(
-        default=0,
-        ge=0,
-        description="每个用户每小时最多触发的任务数（0 表示不限制）",
-        json_schema_extra={"label": "每用户每小时上限", "hint": "0 表示不限制"},
-    )
-    admin_users: list[str] = Field(
-        default_factory=list,
-        description="管理员用户 ID 列表；管理员可用 /rh中断 中断所有人的任务",
-        json_schema_extra={"label": "管理员 ID", "placeholder": "用户ID，每行一个"},
-    )
-    manage_workflows_admin_only: bool = Field(default=True, description="仅管理员可以通过聊天导入工作流；未配置管理员时请使用 WebUI")
-
-
-class NaturalLanguageSection(PluginConfigBase):
-    __ui_label__ = "自然语言生成"
-
-    enabled: bool = Field(default=True, description="启用自然语言工作流、素材和任务工具")
-    history_limit: int = Field(default=20, ge=1, le=100, description="查询当前会话最近消息条数")
-    media_ttl_seconds: int = Field(default=3600, ge=60, le=86400, description="最近素材和待补充需求保留时间（秒）")
-    max_candidates: int = Field(default=12, ge=1, le=32, description="每次供模型选择的素材上限")
-    planner_model: str = Field(default="utils", description="未指定工作流时内部规划使用的模型槽位")
-    vision_model: str = Field(default="", description="可选：宿主中支持视觉的模型任务名（不是模型 ID）；摘要失败时继续使用原图。留空由主对话模型通过 rh_inspect_media 看图")
-    llm_timeout: int = Field(default=45, ge=5, le=180, description="规划、视觉摘要及扩写的超时秒数")
-    avatar_candidates: bool = Field(default=True, description="把用户头像（群聊含群头像）作为可选素材，支持「画我」类请求")
-
-
-class InputNodeSection(PluginConfigBase):
-    """单个工作流输入节点配置（可自由增加数量，最多 32 个）。
-
-    类型下拉框选择该节点的用途：
-    - prompt：主提示词，接收命令/LLM 扩写文本（整个工作流仅一个，多了报错）
-    - text：可编辑配置（带默认值），上传文件后询问用户是否修改
-    - default：固定默认值，直接使用不询问
-    - image / audio：上传文件（留空则等待上传）
-    - 自动推断：按字段名推断（含 image→图片、audio/voice→语音、其余→文字）
-    """
-
-    __ui_label__ = "输入节点"
-
-    node_id: str = Field(
-        default="",
-        description="RunningHub 工作流中的节点 ID（如 353）",
-        json_schema_extra={"label": "节点 ID", "placeholder": "353"},
-    )
-    field_name: str = Field(
-        default="prompt",
-        description="节点字段名，可自定义；自动识别时会自动填写（如 prompt / text / image / audio）",
-        json_schema_extra={"label": "字段名", "placeholder": "prompt"},
-    )
-    field_value: str = Field(
-        default="",
-        description="输入内容。默认输入值；default 类型固定，prompt/text/媒体类型可由用户明确覆盖；留空按 required 要求补充",
-        json_schema_extra={"label": "输入内容（默认值）", "hint": "留空=等待用户输入；填写=固定默认值"},
-    )
-    value_type: Literal["", "default", "text", "image", "audio", "video", "prompt"] = Field(
-        default="",
-        description="节点用途：prompt=主提示词（接收命令/扩写文本，仅一个）；text=可编辑配置（上传后询问修改）；default=固定默认值；image/audio/video=上传文件",
-        json_schema_extra={
-            "label": "节点类型",
-            "x-widget": "select",
-            "options": [
-                {"value": "prompt", "label": "主提示词（接收命令/扩写文本）"},
-                {"value": "text", "label": "可编辑配置（上传后询问修改）"},
-                {"value": "default", "label": "默认值（固定使用输入内容）"},
-                {"value": "image", "label": "图片（等待上传）"},
-                {"value": "audio", "label": "语音（等待上传）"},
-                {"value": "video", "label": "视频（等待上传）"},
-            ],
-        },
-    )
-    label: str = Field(
-        default="",
-        description="该输入的中文说明（等待上传时提示用户），留空使用节点 ID",
-        json_schema_extra={"label": "输入说明", "placeholder": "角色参考图"},
-    )
-    input_key: str = Field(default="", description="给自然语言工具使用的参数标识；留空使用 节点ID.字段名")
-    role: str = Field(default="", description="媒体用途，例如 subject/style/background/first_frame/last_frame")
-    required: bool = Field(default=True, description="没有默认值时是否必须提供；可选文件才允许跳过")
-    parameter_type: Literal["string", "integer", "number", "boolean"] = Field(default="string", description="可编辑参数值类型")
-    choices: list[str] = Field(default_factory=list, description="可编辑参数允许的值；留空不限制枚举")
-    minimum: float | Literal[""] = Field(default="", description="数字参数最小值；留空不限制")
-    maximum: float | Literal[""] = Field(default="", description="数字参数最大值；留空不限制")
-
-    @field_validator("minimum", "maximum", mode="before")
-    @classmethod
-    def _normalize_optional_bound(cls, value: Any) -> Any:
-        # TOML 不支持 None；空字符串表示未设置，已有数字配置仍然兼容。
-        if value is None or (isinstance(value, str) and not value.strip()):
-            return ""
-        return value
-
-    @field_validator("value_type", mode="before")
-    @classmethod
-    def _normalize_value_type(cls, value: Any) -> Any:
-        """WebUI 下拉的 SelectItem 不允许空字符串选项，用 "auto" 表示自动推断。"""
-        if value == "auto":
-            return ""
-        return value
-
-
-class WorkflowItemSection(PluginConfigBase):
-    """单个工作流配置（可自由增加数量）。"""
-
-    __ui_label__ = "工作流"
-
-    name: str = Field(
-        default="",
-        description="工作流显示名称，用于命令调用，如 /rh运行 动漫生图",
-        json_schema_extra={"label": "工作流名称", "placeholder": "动漫生图"},
-    )
-    workflow_id: str = Field(
-        default="",
-        description="RunningHub 工作流 ID",
-        json_schema_extra={"label": "工作流 ID", "placeholder": "2087492768787685378"},
-    )
-    instance_type: Literal["Standard", "Plus", "Ultra"] = Field(
-        default="Standard",
-        description="设备类型：Standard / Plus / Ultra",
-        json_schema_extra={"label": "设备类型"},
-    )
-    region: Literal["overseas", "domestic"] = Field(
-        default="overseas",
-        description="区域：overseas=国外（runninghub.ai），domestic=国内（runninghub.cn）；决定用哪个 API 拉取与提交",
-        json_schema_extra={"label": "区域", "hint": "overseas=国外 / domestic=国内"},
-    )
-    llm_enhance: bool = Field(
-        default=False,
-        description="开启后，命令文本先按模板扩写再传入文字节点",
-        json_schema_extra={"label": "启用 LLM 扩写"},
-    )
-    llm_template_path: str = Field(
-        default="",
-        description="LLM 扩写提示词模板文件路径，使用相对路径（相对插件目录，如 templates/my_template.txt）",
-        json_schema_extra={
-            "label": "扩写模板路径（相对插件目录）",
-            "placeholder": "templates/my_template.txt",
-            "hint": "相对路径相对插件目录解析",
-        },
-    )
-    description: str = Field(default="", description="工作流用途和适用场景，帮助 bot 自动选择")
-    capability: Literal["auto", "text_to_image", "image_to_image", "text_to_video", "image_to_video", "multi_reference", "other"] = Field(default="auto", description="工作流能力类型")
-    output_type: Literal["image", "video", "audio", "file"] = Field(default="image", description="主要输出类型；视频工作流请设为 video")
-    natural_language: bool = Field(default=True, description="允许通过自然语言使用此工作流")
-    cost_hint: str = Field(default="", description="可选的费用／耗时说明，给 bot 选择时参考")
-    prompt_profile: Literal["auto", "image", "edit", "video", "raw"] = Field(default="auto", description="扩写策略；raw 始终保留原文，专属模板优先")
-    input_nodes: list[InputNodeSection] = Field(
-        default_factory=list,
-        description="输入节点列表，最多 32 个；自然语言按输入标识和用途绑定素材",
-        json_schema_extra={"label": "输入节点"},
-    )
-
-
-class WorkflowsSection(PluginConfigBase):
-    """工作流列表配置（WebUI 中可自由增删工作流与输入节点）。"""
-
-    __ui_label__ = "工作流列表"
-
-    items: list[WorkflowItemSection] = Field(
-        default_factory=list,
-        description="工作流列表，可自由增删；每个工作流包含名称、工作流 ID、设备类型、LLM 扩写开关与输入节点",
-        json_schema_extra={"label": "工作流列表", "min_items": 0, "max_items": 20},
-    )
-
-
-class GenericConfig(PluginConfigBase):
-    """插件完整配置。"""
-
-    @model_validator(mode="after")
-    def _validate_workflow_contracts(self):
-        names = set()
-        for workflow in self.workflows.items:
-            validate_workflow(workflow)
-            name = workflow.name.strip()
-            if not name and not workflow.workflow_id.strip():
-                continue
-            if not name or name in names:
-                raise ValueError(f"工作流名称为空或重复：{name}")
-            names.add(name)
-        return self
-
-    plugin: PluginMetaSection = Field(default_factory=PluginMetaSection)
-    server: ServerSection = Field(default_factory=ServerSection)
-    generation: GenerationSection = Field(default_factory=GenerationSection)
-    feature: FeatureSection = Field(default_factory=FeatureSection)
-    access: AccessSection = Field(default_factory=AccessSection)
-    natural_language: NaturalLanguageSection = Field(default_factory=NaturalLanguageSection)
-    workflows: WorkflowsSection = Field(default_factory=WorkflowsSection)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _merge_legacy_feature_sections(cls, data: Any) -> Any:
-        """兼容旧配置：把 cleanup / detect / llm 三节合并为 feature 一节。"""
-        if not isinstance(data, dict):
-            return data
-        feature = dict(data.get("feature") or {})
-        for old_key in ("cleanup", "detect", "llm"):
-            old = data.get(old_key)
-            if isinstance(old, dict):
-                for key, value in old.items():
-                    feature.setdefault(key, value)
-        if feature:
-            data = {key: value for key, value in data.items() if key not in ("cleanup", "detect", "llm")}
-            data["feature"] = feature
-        return data
-
-    @field_validator("workflows", mode="before")
-    @classmethod
-    def _coerce_legacy_workflows(cls, value: Any) -> Any:
-        """兼容最老版本配置：顶层 ``workflows = [ {...}, ... ]`` 数组形态。
-
-        该形态会被归一化为 ``{"items": [...]}``，加载后由 on_load 的迁移逻辑
-        落盘为新结构，避免旧配置直接导致激活失败。
-        """
-        if isinstance(value, list):
-            return {
-                "items": [
-                    item.model_dump(mode="python") if isinstance(item, WorkflowItemSection) else item
-                    for item in value
-                ]
-            }
-        return value
-
 
 _LLM_DETECT_PROMPT = """你是 ComfyUI/RunningHub 工作流配置分析器。下面是一个工作流的节点清单（"节点 ID（class_type）标题" + 各字段：字段名: 值/连线，<连线> 表示该字段来自其他节点输出，不可编辑）。
 
@@ -499,6 +153,9 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
     ) -> tuple[dict[str, Any], bool]:
         """在 SDK 检查版本前，兼容缺少版本号的旧配置与 WebUI 保存数据。"""
         raw_config = dict(config_data) if isinstance(config_data, Mapping) else config_data
+        migrated = migrate_legacy_feature_sections(raw_config)
+        legacy_changed = migrated != raw_config
+        raw_config = migrated
         version_added = False
         if raw_config:
             plugin_section = raw_config.get("plugin", {})
@@ -513,7 +170,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
                 version_added = True
         normalized, changed = super().normalize_plugin_config(raw_config)
         # 供 SDK 直接注入配置和不强制版本检查的 WebUI 校验路径使用。
-        return normalized, changed or version_added
+        return normalized, changed or version_added or legacy_changed
 
     # 缓存的 NapCat 动作 → 已解析 API 名（适配器热切换时自愈）
     _resolved_action_api: dict[str, str] = {}
@@ -532,6 +189,9 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         self._contexts = {}
         self._drafts = {}
         self._vision_cache = {}
+        self._vision_locks = {}
+        self._image_memory = None
+        self._image_memory_limit = None
         self._pending: dict[str, asyncio.Task] = {}
         self._recall_tasks: set[asyncio.Task] = set()
         self._input_sessions: dict[str, InputSession] = {}
@@ -557,80 +217,20 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
     def _workflow_from_snapshot(data: dict) -> WorkflowItemSection:
         return WorkflowItemSection.model_validate(data)
 
-    def _workflow_names(self) -> list[str]:
-        """返回当前已配置的工作流名称列表（配置未就绪时回退缓存）。"""
-        try:
-            return [str(w.name or "").strip() for w in self.config.workflows.items if str(w.name or "").strip()]
-        except Exception:
-            return [str(w.name or "").strip() for w in self._workflows if str(w.name or "").strip()]
 
     def _is_llm_callable_workflow(self, workflow: WorkflowItemSection) -> bool:
         return bool(workflow.name.strip() and workflow.workflow_id.strip() and workflow.natural_language)
 
-    def _llm_callable_workflow_names(self) -> list[str]:
-        """返回支持 LLM 工具调用的工作流名称列表。"""
-        try:
-            workflows = list(self.config.workflows.items)
-        except Exception:
-            workflows = list(self._workflows)
-        return [
-            str(w.name or "").strip()
-            for w in workflows
-            if str(w.name or "").strip() and self._is_llm_callable_workflow(w)
-        ]
 
-    def get_components(self) -> list[dict[str, Any]]:
-        # Tool descriptions point to live rh_context; no stale workflow names or identity arguments.
-        return super().get_components()
 
     def get_webui_config_schema(self, **kwargs: Any) -> dict[str, Any]:
-        """生成 WebUI 配置 Schema，并补全二级嵌套列表（input_nodes）的元素字段定义。
-
-        SDK 的 schema 生成只展开一层 list[PluginConfigBase]：workflows.items 的
-        item_fields 里 input_nodes 只会标成 {"type": "array"}，没有自己的
-        item_fields，WebUI 会把它渲染成字符串列表。这里手动补上
-        item_type/item_fields，让输入节点也能用表单增删。
-        """
-        schema = super().get_webui_config_schema(**kwargs)
-        if not isinstance(schema, dict):
-            return schema
-        section = (schema.get("sections") or {}).get("workflows") or {}
-        items_field = (section.get("fields") or {}).get("items")
-        if not isinstance(items_field, dict):
-            return schema
-        item_fields = items_field.get("item_fields")
-        if not isinstance(item_fields, dict):
-            return schema
-        input_nodes_field = item_fields.get("input_nodes")
-        if isinstance(input_nodes_field, dict):
-            input_nodes_field["item_type"] = "object"
-            input_nodes_field["item_fields"] = self._build_input_node_item_fields()
-        return schema
+        """使用中文下拉选项，并补齐工作流、节点两层列表表单。"""
+        return localize_schema(super().get_webui_config_schema(**kwargs), self.get_plugin_config_data())
 
     @staticmethod
     def _build_input_node_item_fields() -> dict[str, dict[str, Any]]:
-        """为输入节点列表元素构造字段定义（供 WebUI 渲染嵌套表单）。"""
-        default_values = InputNodeSection().model_dump(mode="python")
-        item_fields: dict[str, dict[str, Any]] = {}
-        for field_name, field_info in InputNodeSection.model_fields.items():
-            extra = getattr(field_info, "json_schema_extra", None)
-            json_extra = dict(extra) if isinstance(extra, dict) else {}
-            item_field: dict[str, Any] = {
-                "type": "select" if field_name in {"value_type", "parameter_type"} else ("boolean" if field_name == "required" else "array" if field_name == "choices" else "string"),
-                "label": str(json_extra.get("label") or field_info.description or field_name),
-                "placeholder": str(json_extra.get("placeholder") or ""),
-                "default": default_values.get(field_name),
-            }
-            if field_name == "value_type":
-                # SelectItem 不允许空字符串 value，用 "auto" 表示自动推断（模型层归一化为 ""）
-                item_field["choices"] = ["auto", "prompt", "text", "default", "image", "audio", "video"]
-                item_field["placeholder"] = "auto=自动推断"
-            if field_name == "parameter_type":
-                item_field["choices"] = ["string", "integer", "number", "boolean"]
-            if field_name == "choices":
-                item_field["item_type"] = "string"
-            item_fields[field_name] = item_field
-        return item_fields
+        """保留旧调用入口，字段定义统一由配置模块生成。"""
+        return build_item_fields(InputNodeSection)
 
     # ── 生命周期 ──────────────────────────────────────────────────
 
@@ -664,6 +264,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
 
         # 任务日志：加载磁盘状态，并把上次进程退出前未跑完的任务重新拉起来轮询
         await self._load_task_journal()
+        await self._load_image_memory()
         await self._resume_pending_tasks()
 
         if not cfg.server.api_key:
@@ -728,6 +329,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             await self._limiter.resize(self.config.generation.max_concurrent)
             self._refresh_workflows()
             self._validate_workflows()
+            await self._load_image_memory()
             self.ctx.logger.info(
                 "插件配置已热更新: version=%s 工作流数量=%d",
                 version,
@@ -908,7 +510,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         return uid in admins
 
     def _ordered_nodes(self, workflow: WorkflowItemSection) -> list[InputNodeSection]:
-        """按配置顺序返回有效节点（最多 _MAX_NODES 个）。"""
+        """按配置顺序返回有效节点，数量上限由工作流模块统一控制。"""
         return workflow_runner.ordered_nodes(workflow)
 
     def _load_llm_template(self, workflow: WorkflowItemSection) -> str:
@@ -1091,14 +693,14 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         text_target = self._first_prompt_node(workflow)
         editable_nodes = self._editable_config_nodes(workflow)
         # 存在无默认值的 prompt 节点且用户没给描述：不能直接提交，先交互收集描述
-        missing_prompt_text = bool(text_node is not None and not command_text)
+        missing_prompt_text = bool(text_node is not None and text_node.required and not command_text)
         # 会话中需要回填文字的目标节点：给了文本或需要补文本时才记录
         session_text_node = text_target if (command_text or missing_prompt_text) else None
 
         # 先用原始文本构建节点参数（文字节点暂填原文，扩写见下）
         node_info_list, waiting = self._build_node_info_list(workflow, command_text)
 
-        if not node_info_list and not waiting and not editable_nodes and not missing_prompt_text:
+        if not self._ordered_nodes(workflow):
             return {"success": False, "message": f"工作流「{workflow.name}」未配置任何输入节点"}
 
         if missing_prompt_text:
@@ -1163,7 +765,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
                 }
             # 无文件但需确认可编辑配置：直接进入配置确认
             await self._ask_config_edit(session, stream_id)
-            return {"success": True, "waiting": True, "required_files": [], "message": "请确认配置"}
+            return {"success": True, "waiting": True, "required_files": [], "message": "请确认配置", "announced": True}
 
         return await self._submit_and_poll(client, workflow, node_info_list, stream_id, kwargs)
 
@@ -1206,7 +808,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
                     "field_name": item["field_name"],
                     "value_type": item["value_type"],
                     "label": item["label"],
-                    "required": bool(getattr(item.get("node"), "required", True)),
+                    "required": bool(getattr(item.get("node"), "required", False)),
                 }
                 for item in waiting_nodes
             ],
@@ -1358,6 +960,11 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             )
             if file_type == "image":
                 session.uploaded_images += 1
+                await self._remember_image_usage(
+                    {"media_id": "input-" + hashlib.sha256(file_data).hexdigest(), "type": "image"},
+                    file_data, session.user_id, stream_id)
+                if session.cancelled or self._input_sessions.get(key) is not session:
+                    return True
             elif file_type == "audio":
                 session.uploaded_audios += 1
             elif file_type == "video":
@@ -1506,7 +1113,8 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             self._remove_input_session(key)
             if session.expire_task:
                 session.expire_task.cancel()
-        await self.ctx.send.text(result["message"], stream_id)
+        if not result["success"]:
+            await self.ctx.send.text(result["message"], stream_id)
 
     async def _finish_input_session(
         self,
@@ -1529,7 +1137,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             self._cancel_input_session(key)
             await self.ctx.send.text("插件客户端未初始化，已取消本次任务", stream_id)
             return True
-        required = [n for n in session.waiting_nodes if n.get("required", True)]
+        required = [n for n in session.waiting_nodes if n.get("required", False)]
         if required:
             await self.ctx.send.text("仍需提供：" + "、".join(n["label"] for n in required), stream_id)
             return True
@@ -1590,57 +1198,30 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
     # ── 轮询发送 / 撤回 ──────────────────────────────────────────
 
 
-    async def _append_result_to_llm_context(
-        self, stream_id: str, segments: list[dict[str, Any]], visible_text: str
-    ) -> None:
-        """把单个生成结果追加到 LLM 聊天上下文（纯记忆，不触发回复）。
-
-        走 Maisaka 的 context.append（不会重复发送给用户）；
-        失败时静默降级，不影响结果正常发送。
-        """
+    async def _trigger_llm_result_reply(self, stream_id: str, *, status_message: str = "") -> bool | None:
+        """返回 True=已接受、False=明确不可用、None=响应未知，不重复触发。"""
         if not stream_id:
-            return
-        try:
-            maisaka = getattr(self.ctx, "maisaka", None)
-            if maisaka is None or not hasattr(maisaka, "context"):
-                return
-            await maisaka.context.append(
-                stream_id,
-                segments,
-                visible_text=visible_text,
-                source_kind="runninghub_result",
-            )
-        except Exception as exc:
-            self.ctx.logger.warning("追加生成结果到 LLM 上下文失败: %s", exc)
-
-    async def _trigger_llm_result_reply(self, stream_id: str, *, status_message: str = "") -> None:
-        """结果发送或任务异常后，触发一次 LLM 主动回复说明状态。
-
-        普通场景提醒「发好了」，角色扮演场景可用角色口吻提一句自己刚生成了什么；
-        失败时静默降级。
-        """
-        if not stream_id:
-            return
+            return False
         try:
             maisaka = getattr(self.ctx, "maisaka", None)
             if maisaka is None or not hasattr(maisaka, "proactive"):
-                return
-            await maisaka.proactive.trigger(
+                return False
+            result = await maisaka.proactive.trigger(
                 stream_id,
                 intent=(
-                    f"RunningHub 后台任务状态更新：{status_message}。请按该状态简短说明；"
-                    "不要自动重新提交任务，不要调用 wait 或循环查询。"
-                ) if status_message else (
-                    "你之前通过工具生成的图片/视频已经完成并发送给用户。"
-                    "请结合上下文简短地向用户确认结果（例如「发好了，看看喜欢不喜欢」）；"
-                    "如果你正在角色扮演，请用角色口吻自然地提一句自己刚生成了什么。"
-                    "结果已经发送，直接确认即可，不要再次生成、查询任务或调用 wait。"
+                    f"后台结果：{status_message or '生成结果已发送'}\n"
+                    "顺着当前聊天语气，用一句短话交代结果。若已说过同一结果就不再回复。"
+                    "不报编号、接口或费用，不臆测成品细节；不要查询、重跑或 wait。"
                 ),
                 reason="RunningHub 任务状态更新" if status_message else "RunningHub 生成结果已发送",
                 priority="low",
             )
+            if isinstance(result, dict):
+                return result.get("success") if isinstance(result.get("success"), bool) else None
+            return result if isinstance(result, bool) else None
         except Exception as exc:
             self.ctx.logger.warning("触发生成结果确认回复失败: %s", exc)
+            return None
 
     @staticmethod
     def _is_image_url(url: str, output_type: str = "") -> bool:
@@ -1663,9 +1244,6 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             return raw
         return self._extract_text_from_message(kwargs.get("message") or {})
 
-    async def _call_napcat_action(self, action: str, params: dict) -> Any:
-        """调用 NapCat 动作（委托 delivery）。"""
-        return await self._ensure_delivery().call_action(action, params)
 
     async def _send_image_with_id(self, image_base64: str, stream_id: str, *, chat_info: dict) -> str:
         """NapCat 直发图片并返回平台 message_id（委托 delivery）。"""
@@ -1675,23 +1253,12 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         """NapCat 直发视频并返回平台 message_id（委托 delivery）。"""
         return await self._ensure_delivery().send_video_with_id(video_url, stream_id, chat_info=chat_info)
 
-    @staticmethod
-    def _is_napcat_failed(response: Any) -> bool:
-        """判断 NapCat 响应是否为业务失败（委托 delivery）。"""
-        return NapcatDelivery.is_failed(response)
 
-    @staticmethod
-    def _extract_message_id(response: Any) -> str:
-        """从 NapCat API 响应中提取 message_id（委托 delivery）。"""
-        return NapcatDelivery.extract_message_id(response)
 
     def _schedule_recall(self, message_id: str, delay_seconds: int) -> None:
         """调度一个延时撤回任务（委托 delivery）。"""
         self._ensure_delivery().schedule_recall(message_id, delay_seconds)
 
-    async def _delayed_recall(self, message_id: str, delay_seconds: int) -> None:
-        """延迟指定秒数后撤回消息（委托 delivery）。"""
-        await self._ensure_delivery().delayed_recall(message_id, delay_seconds)
 
     # ── 命令 / 工具 / API 组件 ────────────────────────────────────
 
@@ -1728,7 +1295,8 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
                     self._cancel_choices.pop(key, None)
                     async def cancel_selected():
                         for index in indices:
-                            await self.handle_rh_task("cancel", cancel_tasks[index], user_id=uid, stream_id=stream)
+                            result = await self.handle_rh_task("cancel", cancel_tasks[index], user_id=uid, stream_id=stream)
+                            await self.ctx.send.text(result.get("message") or "已处理取消请求", stream)
                     self._track_background(cancel_selected())
                     return {"action": "abort"}
         if not session:
@@ -1891,10 +1459,6 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
                 return content
         raise RunningHubError(f"无法通过 NapCat API 获取文件 file_id={file_id}")
 
-    @staticmethod
-    def _decode_base64_bounded(encoded: str, max_bytes: int = _MAX_FILE_BYTES) -> bytes:
-        """解码 base64 并强制大小上限（委托 file_source）。"""
-        return decode_base64_bounded(encoded, max_bytes)
 
     async def _extract_bytes_from_napcat_result(self, result: Any) -> bytes | None:
         """从 NapCat get_file / get_group_file_url 返回里解析文件字节（委托 file_source）。"""
@@ -2177,6 +1741,8 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
     def _serialize_config_file(self, items: list[dict[str, Any]]) -> str:
         data = self.config.model_dump(mode="python")
         data["workflows"] = {"items": items}
+        # 识别导入的节点仍使用平台标识，整份配置统一转换为页面中的中文选项。
+        data = GenericConfig.model_validate(data).model_dump(mode="python")
         def scalar(value):
             if isinstance(value, str):
                 return self._toml_string(value)
@@ -2625,7 +2191,8 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         command_text = parts[1].strip() if len(parts) > 1 else ""
 
         result = await self._start_workflow(workflow_name, command_text, **kwargs)
-        await self.ctx.send.text(result["message"], stream_id)
+        if not result["success"] or (result.get("waiting") and not result.get("announced")):
+            await self.ctx.send.text(result["message"], stream_id)
         return True, "", 1
 
 

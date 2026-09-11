@@ -39,7 +39,6 @@
     "llm.generate",
     "message.get_recent",
     "message.get_by_id",
-    "maisaka.context.append",
     "maisaka.proactive.trigger"
   ],
   "i18n": {

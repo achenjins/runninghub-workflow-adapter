@@ -15,6 +15,7 @@ from plugin import RunningHubGenericPlugin, WorkflowItemSection, InputNodeSectio
 from rh_generic_lib.delivery import NapcatDelivery, DeliveryUncertain
 from rh_generic_lib.file_source import extract_files_from_message, extract_bytes_from_napcat_result
 from rh_generic_lib.media_plan import bind_plan, validate_parameter, validate_workflow, PlanError
+from rh_generic_lib.media_context import assets_from_message
 from rh_generic_lib.runninghub_client import RunningHubClient, RunningHubError, RunningHubTransportError
 from rh_generic_lib.task_journal import TaskJournal
 from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF
@@ -23,11 +24,12 @@ PNG = b"\x89PNG\r\n\x1a\n" + b"test-image"
 
 
 def workflow(media=False, two=False, parameter=False):
-    nodes = [dict(node_id="1", field_name="prompt", value_type="prompt", label="description")]
+    # Collection tests use deliberately required inputs; new-node defaults are tested separately.
+    nodes = [dict(node_id="1", field_name="prompt", value_type="prompt", label="description", required=True)]
     if media:
-        nodes.append(dict(node_id="2", field_name="image", value_type="image", input_key="subject", role="subject", label="subject image"))
+        nodes.append(dict(node_id="2", field_name="image", value_type="image", input_key="subject", role="subject", label="subject image", required=True))
     if two:
-        nodes.append(dict(node_id="3", field_name="image", value_type="image", input_key="style", role="style", label="style image"))
+        nodes.append(dict(node_id="3", field_name="image", value_type="image", input_key="style", role="style", label="style image", required=True))
     if parameter:
         nodes.append(dict(node_id="4", field_name="width", value_type="text", input_key="width", field_value="512", parameter_type="integer", minimum=64, maximum=2048))
     return WorkflowItemSection(name="draw", workflow_id="12345", input_nodes=nodes)
@@ -68,8 +70,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             download_base64=AsyncMock(return_value=base64.b64encode(PNG).decode()), cancel=AsyncMock(return_value={"code": 0}))
         self.p._client = self.p._client_cn = self.client
         self.p._task_journal = TaskJournal(Path(self.tmp.name) / "tasks.json")
-        self.p._append_result_to_llm_context = AsyncMock()
-        self.p._trigger_llm_result_reply = AsyncMock()
+        self.p._trigger_llm_result_reply = AsyncMock(return_value=True)
         self.p._remember_anchor(self.messages["m1"])
         await self.p._limiter.resize(1)
 
@@ -131,7 +132,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.client.submit.assert_awaited_once()
 
     async def test_definite_query_error_pauses_for_manual_recovery(self):
-        # 查询被服务端确定拒绝（如 Key 失效）：停止自动轮询并让出工作槽，修复后恢复且不重复提交
+        # 查询被拒绝时停止自动轮询，保留远端任务；修复后恢复且不重复提交。
         self.client.wait_for_result.side_effect = RunningHubError("请求被拒绝（HTTP 401）")
         result = await self.enqueue()
         for _ in range(50):
@@ -149,8 +150,8 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.client.submit.assert_awaited_once()
         self.assertEqual(self.p._task_journal.get(result["task_id"])["delivery_status"], "sent")
 
-    async def test_cancel_refused_by_dead_key_releases_locally(self):
-        # Key 已失效时远端取消同样被拒：本地取消并释放名额，避免队列被永久锁死
+    async def test_cancel_refused_by_dead_key_preserves_remote_task(self):
+        # 取消被拒不能当作远端已停止；保留任务，恢复凭据后继续查询。
         self.client.wait_for_result.side_effect = RunningHubError("请求被拒绝（HTTP 401）")
         result = await self.enqueue()
         for _ in range(50):
@@ -159,7 +160,15 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.005)
         self.client.cancel.side_effect = RunningHubError("请求被拒绝（HTTP 401）")
         await self.p._cancel_task(result["task_id"], "s1")
-        self.assertEqual(self.p._task_journal.get(result["task_id"])["status"], "cancelled")
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual(record["status"], "needs_attention")
+        self.assertEqual(record["remote_task_id"], "remote-1")
+        self.assertEqual(self.p._task_journal.quota_used("11", time.time()), 1)
+        self.client.wait_for_result.side_effect = None
+        await self.p._resume_pending_tasks()
+        await self.settled()
+        self.client.submit.assert_awaited_once()
+        self.assertEqual(self.p._task_journal.get(result["task_id"])["delivery_status"], "sent")
 
     async def test_avatar_asset_binds_via_adapter_then_cdn_fallback(self):
         # 「画我」：头像候选由宿主可信 uid/群号生成，绑定后现场解析字节并上传
@@ -183,6 +192,8 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             downloads.append(str(url))
             return PNG
         self.client.download_bytes = AsyncMock(side_effect=grab)
+        self.messages["m2"] = message("m2", text="画我的另一张")
+        self.p._remember_anchor(self.messages["m2"])
         again = await self.p.handle_run_workflow("draw", "画我的另一张",
                                                  references=[{"input": "subject", "media_id": "avatar:11"}],
                                                  user_id="11", stream_id="s1")
@@ -210,7 +221,12 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         ctx = await self.p.handle_rh_context(user_id="11", stream_id="s1")
         self.assertTrue(ctx["success"])
         self.assertEqual({a["origin"] for a in ctx["media"]}, {"current", "reply", "recent", "avatar"})
-        self.assertEqual({a["message_id"] for a in ctx["media"] if a["origin"] != "avatar"}, {"m1", "quote", "own"})
+        expected = [*assets_from_message(self.messages["m1"], "s1", "current"),
+                    *assets_from_message(self.messages["quote"], "s1", "reply"),
+                    *assets_from_message(self.recent[0], "s1", "recent")]
+        self.assertEqual({a["media_id"] for a in ctx["media"] if a["origin"] != "avatar"},
+                         {a["media_id"] for a in expected})
+        self.assertTrue(all(not {"source", "message_id", "platform_message_id"} & a.keys() for a in ctx["media"]))
         self.assertEqual(ctx["workflows"][0]["inputs"][-1]["key"], "width")
 
     async def test_current_image_is_bound_and_uploaded(self):
@@ -246,7 +262,22 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result["success"])
         self.client.submit.assert_not_awaited()
 
-    async def test_inspect_returns_real_image(self):
+    async def test_inspect_default_vlm_sees_image_and_caches_summary(self):
+        self.messages["m1"] = message(images=1)
+        self.p._remember_anchor(self.messages["m1"])
+        ctx = await self.p.handle_rh_context(user_id="11", stream_id="s1")
+        for _ in range(2):
+            result = await self.p.handle_rh_inspect_media(ctx["context_id"], ctx["media"][0]["media_id"], user_id="11", stream_id="s1")
+            self.assertTrue(result["success"])
+            self.assertEqual(result["message"], "enhanced")
+        self.ctx.llm.generate.assert_awaited_once()
+        call = self.ctx.llm.generate.await_args.kwargs
+        self.assertEqual(call["model"], "vlm")
+        self.assertEqual(call["prompt"][0]["content"][1]["image_url"]["url"],
+                         "data:image/png;base64," + base64.b64encode(PNG).decode())
+
+    async def test_inspect_vision_failure_returns_real_image(self):
+        self.ctx.llm.generate.side_effect = RuntimeError("vision unavailable")
         self.messages["m1"] = message(images=1)
         self.p._remember_anchor(self.messages["m1"])
         ctx = await self.p.handle_rh_context(user_id="11", stream_id="s1")
@@ -370,6 +401,10 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.set_config(workflow(), access={"max_per_user_per_hour": 1})
         result = await self.p._start_workflow("draw", "", user_id="11", stream_id="s1")
         self.assertTrue(result["waiting"])
+        journal = await self.p._load_task_journal()
+        await journal.update("rh-quota-used", status="success", user_id="11", stream_id="s1",
+                             submitted_at=time.time(), delivery_status="sent")
+        self.assertEqual(journal.quota_used("11", time.time()), 1)
         control = message("cancel", text="/rh中断")
         self.assertIsNone(await self.p.handle_input_collector(control))
         await self.p.handle_rh_cancel(user_id="11", stream_id="s1")
@@ -498,7 +533,11 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             "message_id": "qq-123", "group_id": "22", "message": [{"type": "image", "data": {"url": "https://example.test/ref.png"}}]}}}
         ctx = await self.p.handle_rh_context(user_id="11", stream_id="s1", group_id="22")
         self.assertEqual(ctx["media"][0]["origin"], "reply")
-        self.assertEqual(ctx["media"][0]["platform_message_id"], "qq-123")
+        self.ctx.api.call.assert_awaited_with("adapter.napcat.action.call", action_name="get_msg", params={"message_id": "qq-123"})
+        self.ctx.llm.generate.side_effect = RuntimeError("vision unavailable")
+        result = await self.p.handle_rh_inspect_media(ctx["context_id"], ctx["media"][0]["media_id"], user_id="11", stream_id="s1", group_id="22")
+        self.assertEqual(base64.b64decode(result["content_items"][0]["data"]), PNG)
+        self.client.download_bytes.assert_awaited_once_with("https://example.test/ref.png")
         self.ctx.message.get_by_id.assert_not_awaited()
 
     async def test_draft_does_not_expose_file_sources(self):
@@ -512,12 +551,82 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         ctx = await self.p.handle_rh_context(user_id="11", stream_id="s1")
         self.assertNotIn("private-image.png", json.dumps(ctx))
 
-    async def test_workflow_selection_uses_live_cards(self):
+    async def test_unique_workflow_selection_skips_planner(self):
+        result = await self.p.handle_run_workflow(prompt="cat", user_id="11", stream_id="s1")
+        self.assertTrue(result["success"], result)
+        await self.settled()
+        # Only the generated image gets a short memory description; no planner call.
+        self.ctx.llm.generate.assert_awaited_once()
+        self.assertEqual(self.ctx.llm.generate.await_args.kwargs["model"], "vlm")
+        self.client.submit.assert_awaited_once()
+
+    async def test_multiple_workflow_selection_uses_live_cards(self):
+        first, second = workflow(), workflow(parameter=True)
+        second.name = "alternate"
+        second.workflow_id = "67890"
+        self.set_config(first, workflows={"items": [first.model_dump(), second.model_dump()]})
         self.ctx.llm.generate.return_value = {"success": True, "response": '{"workflow_name":"draw"}'}
         result = await self.p.handle_run_workflow(prompt="cat", user_id="11", stream_id="s1")
         self.assertTrue(result["success"], result)
         await self.settled()
-        self.assertIn('"name": "draw"', self.ctx.llm.generate.await_args.kwargs["prompt"])
+        planner_calls = [call for call in self.ctx.llm.generate.await_args_list if call.kwargs["model"] == "utils"]
+        self.assertEqual(len(planner_calls), 1)
+        payload = json.loads(planner_calls[0].kwargs["prompt"].split("\n", 1)[1])
+        self.assertEqual({card["name"] for card in payload["workflows"]}, {"draw", "alternate"})
+        self.assertEqual(payload["request"]["prompt"], "cat")
+
+    async def test_generated_image_is_saved_when_vision_is_unavailable(self):
+        self.ctx.llm.generate.side_effect = RuntimeError("vision unavailable")
+        result = await self.p.handle_run_workflow("draw", "cat", user_id="11", stream_id="s1")
+        self.assertTrue(result["success"], result)
+        await self.settled()
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual((record["status"], record["delivery_status"]), ("success", "sent"))
+        memory = await self.p._load_image_memory()
+        saved = memory.list_images("11", "s1", 5)
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(await memory.read("11", "s1", saved[0]["memory_id"]), PNG)
+        self.assertEqual(saved[0]["description"], "")
+        ctx = await self.p.handle_rh_context(user_id="11", stream_id="s1")
+        asset = next(a for a in ctx["media"] if a.get("recent_index"))
+        reply = await self.p.handle_rh_inspect_media(ctx["context_id"], asset["media_id"], user_id="11", stream_id="s1")
+        self.assertTrue(reply["cached"])
+        self.assertIn("没有可靠简介", reply["message"])
+        self.ctx.llm.generate.assert_awaited_once()
+
+    async def test_image_memory_disk_failure_does_not_fail_generation(self):
+        self.p._image_memory = SimpleNamespace(load=AsyncMock(side_effect=OSError("disk unavailable")))
+        result = await self.p.handle_run_workflow("draw", "cat", user_id="11", stream_id="s1")
+        self.assertTrue(result["success"], result)
+        await self.settled()
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual((record["status"], record["delivery_status"]), ("success", "sent"))
+        self.client.submit.assert_awaited_once()
+
+    async def test_bad_media_reference_returns_repair_candidates(self):
+        self.set_config(workflow(media=True))
+        self.messages["m1"] = message(images=1)
+        self.p._remember_anchor(self.messages["m1"])
+        result = await self.p.handle_run_workflow("draw", "cat", references=[{"input": "subject", "media_id": "invalid"}], user_id="11", stream_id="s1")
+        self.assertFalse(result["success"])
+        self.assertEqual(result["status"], "needs_input")
+        self.assertTrue(result["context_id"])
+        self.assertEqual(result["workflows"][0]["inputs"][1]["key"], "subject")
+        self.assertEqual(result["media"][0]["media_id"], assets_from_message(self.messages["m1"], "s1", "current")[0]["media_id"])
+        self.assertEqual(json.loads(result["content"])["media"], result["media"])
+        self.client.submit.assert_not_awaited()
+
+    async def test_new_optional_prompt_can_use_remote_default(self):
+        wf = WorkflowItemSection(name="draw", workflow_id="12345", input_nodes=[
+            InputNodeSection(node_id="1", field_name="prompt", value_type="prompt")])
+        self.set_config(wf)
+        result = await self.p._start_workflow("draw", "", user_id="11", group_id="22", stream_id="s1")
+        self.assertTrue(result["success"], result)
+        self.assertFalse(result.get("waiting"))
+        await self.settled()
+        self.client.submit.assert_awaited_once()
+        self.assertEqual(self.client.submit.await_args.args[0], [])
+        self.assertIsNone(self.p._find_input_session("11", "s1"))
 
 
 class PureTests(unittest.IsolatedAsyncioTestCase):
@@ -587,10 +696,10 @@ class PureTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(missing)
         _, media, _ = bind_plan(wf, "cat", [{"input": "参考图", "media_id": "m-abc"}], {}, candidates)
         self.assertEqual([m["input"] for m in media], ["3.image"])
-        # QQ 图片编号不在候选：报错列出真实 media_id，让模型下一轮自纠
+        # QQ 图片编号不在候选：错误引导使用外层工具返回的候选字段。
         with self.assertRaises(PlanError) as err:
             bind_plan(wf, "cat", [{"input": "image", "media_id": "1359117711"}], {}, candidates)
-        self.assertIn("m-abc", str(err.exception))
+        self.assertIn("media[].media_id", str(err.exception))
         # 两个同类媒体槽：不按到达顺序猜，报歧义并列出完整 key
         wf2 = workflow(media=True, two=True)
         with self.assertRaises(PlanError) as err:

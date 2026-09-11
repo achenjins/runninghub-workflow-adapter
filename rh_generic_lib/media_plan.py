@@ -57,23 +57,30 @@ def workflow_card(workflow: Any) -> dict[str, Any]:
             continue
         item = {
             "key": input_key(node), "type": kind,
-            "label": node.label or input_key(node),
-            "role": getattr(node, "role", "") or "reference",
-            "required": bool(getattr(node, "required", True) and not node.field_value),
-            "has_default": bool(node.field_value),
+            "required": bool(getattr(node, "required", False) and not node.field_value),
         }
+        if node.label and node.label != item["key"]:
+            item["label"] = node.label
+        if kind in MEDIA_TYPES and getattr(node, "role", ""):
+            item["role"] = node.role
+        if node.field_value:
+            item["has_default"] = True
         if kind == "text":
-            item.update(default=node.field_value, parameter_type=getattr(node, "parameter_type", "string"),
-                        choices=getattr(node, "choices", []), minimum=_optional_bound(node, "minimum"),
-                        maximum=_optional_bound(node, "maximum"))
+            item["parameter_type"] = getattr(node, "parameter_type", "string")
+            if node.field_value:
+                item["default"] = node.field_value
+            if getattr(node, "choices", []):
+                item["choices"] = node.choices
+            for field in ("minimum", "maximum"):
+                if (bound := _optional_bound(node, field)) is not None:
+                    item[field] = bound
         inputs.append(item)
-    return {
-        "name": workflow.name, "description": getattr(workflow, "description", ""),
-        "capability": getattr(workflow, "capability", "auto"),
-        "output_type": getattr(workflow, "output_type", "image"),
-        "cost_hint": getattr(workflow, "cost_hint", ""),
-        "inputs": inputs,
-    }
+    card = {"name": workflow.name, "output_type": getattr(workflow, "output_type", "image"), "inputs": inputs}
+    for field in ("description", "capability", "cost_hint"):
+        value = getattr(workflow, field, "")
+        if value and value != "auto":
+            card[field] = value
+    return card
 
 
 def validate_parameter(node: Any, value: Any) -> str:
@@ -164,12 +171,7 @@ def bind_plan(workflow: Any, prompt: str, references: list[dict], parameters: di
             raise PlanError(f"媒体输入 {key} 重复绑定")
         asset = available.get(str(ref.get("media_id") or ""))
         if asset is None:
-            hints = "、".join(
-                f"{a['media_id']}[{a['type']}：{a.get('description') or a.get('origin', '')}]"
-                for a in candidates[:12])
-            raise PlanError(
-                f"素材 ID {ref.get('media_id')} 不在本次候选（media_id 必须取自 rh_context 的 media[].media_id，"
-                f"不能用聊天里的图片编号/URL）。当前候选：{hints or '空——请重新调用 rh_context'}")
+            raise PlanError(f"素材 ID {ref.get('media_id')} 不在候选中；请用返回的 media[].media_id，不能用聊天图片编号或 URL")
         if asset["type"] != resolve_value_type(node):
             raise PlanError(f"素材类型与 {key} 不符（需要 {resolve_value_type(node)}）")
         bindings[key] = asset
@@ -198,7 +200,7 @@ def bind_plan(workflow: Any, prompt: str, references: list[dict], parameters: di
             media.append({"input": key, "node_id": node.node_id, "field_name": node.field_name,
                           "role": getattr(node, "role", "") or node.label or key, "asset": bindings[key]})
             continue
-        if not value and kind != "default" and getattr(node, "required", True):
+        if not value and kind != "default" and getattr(node, "required", False):
             missing.append({"input": key, "type": kind, "label": node.label or key})
         elif value:
             overrides.append({"nodeId": node.node_id, "fieldName": node.field_name, "fieldValue": value})

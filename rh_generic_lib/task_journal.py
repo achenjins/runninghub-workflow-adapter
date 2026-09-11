@@ -35,7 +35,7 @@ _RECORD_FIELDS = (
     "updated_at",
     "message",
     "remote_task_id", "request_key", "request", "submitted_at", "outputs", "delivery_status",
-    "delivered_indexes", "cancel_requested",
+    "delivered_indexes", "cancel_requested", "notifications", "anchor_id",
 )
 
 
@@ -81,13 +81,14 @@ class TaskJournal:
             self._trim_locked()
             self.loaded = True
 
-    async def mark_success(self, task_id: str, coins: Any, outputs: list | None = None) -> None:
+    async def mark_success(self, task_id: str, coins: Any, outputs: list | None = None, *, expected_statuses=None) -> bool:
         updates = {"coins": str(coins if coins is not None else "0").strip(), "status": STATUS_SUCCESS, "message": ""}
         if outputs is not None:
             updates.update(outputs=outputs, delivery_status="pending")
-        await self._upsert(
+        return await self._upsert(
             task_id,
             updates,
+            expected_statuses=expected_statuses,
         )
 
     async def mark_failed(self, task_id: str, message: str = "") -> None:
@@ -103,12 +104,19 @@ class TaskJournal:
         return copy.deepcopy(self._records)
 
     def get(self, task_id: str) -> dict[str, Any] | None:
-        return next((r for r in self.records() if r["task_id"] == task_id), None)
+        return copy.deepcopy(next((r for r in self._records if r["task_id"] == task_id), None))
 
     def find_request(self, request_key: str) -> dict[str, Any] | None:
         if not request_key:
             return None
-        return next((r for r in self.records() if r.get("request_key") == request_key), None)
+        return copy.deepcopy(next((r for r in self._records if r.get("request_key") == request_key), None))
+
+    def find_anchor_request(self, user_id: str, stream_id: str, anchor_id: str, workflow_id: str, region: str):
+        if not anchor_id:
+            return None
+        return copy.deepcopy(next((r for r in self._records
+            if r["user_id"] == user_id and r["stream_id"] == stream_id and r.get("anchor_id") == anchor_id
+            and r["region"] == region and r["request"].get("workflow", {}).get("workflow_id") == workflow_id), None))
 
     def recoverable_records(self) -> list[dict[str, Any]]:
         return [r for r in self.records() if r["status"] in ACTIVE_STATUSES
@@ -119,8 +127,12 @@ class TaskJournal:
             r["status"] == "queued" or
             (float(r.get("submitted_at") or 0) > now - 3600)))
 
-    async def update(self, task_id: str, **updates: Any) -> None:
-        await self._upsert(task_id, updates)
+    async def update(self, task_id: str, *, expected_statuses=None, **updates: Any) -> bool:
+        return await self._upsert(task_id, updates, expected_statuses=expected_statuses)
+
+    async def claim_notification(self, task_id: str, key: str) -> bool:
+        # 先落盘再通知；响应丢失或进程重启也不自动发第二次。
+        return await self._upsert(task_id, {}, notification_key=key)
 
     def _normalize_record(self, raw: dict[str, Any]) -> dict[str, Any]:
         record: dict[str, Any] = {}
@@ -132,6 +144,7 @@ class TaskJournal:
         record["request"] = copy.deepcopy(raw.get("request")) if isinstance(raw.get("request"), dict) else {}
         record["outputs"] = copy.deepcopy(raw.get("outputs")) if isinstance(raw.get("outputs"), list) else []
         record["delivered_indexes"] = list(raw.get("delivered_indexes") or [])
+        record["notifications"] = list(raw.get("notifications") or [])
         # Version 1.1 records used the remote ID as the primary key.
         if not record["remote_task_id"] and not record["task_id"].startswith("rh-"):
             record["remote_task_id"] = record["task_id"]
@@ -141,14 +154,20 @@ class TaskJournal:
             record["submitted_at"] = raw.get("created_at", 0)
         return record
 
-    async def _upsert(self, task_id: str, updates: dict[str, Any]) -> None:
+    async def _upsert(self, task_id: str, updates: dict[str, Any], *, expected_statuses=None, notification_key="") -> bool:
         now = time.time()
         async with self._lock:
             previous = copy.deepcopy(self._records)
             for index, record in enumerate(self._records):
                 if str(record.get("task_id") or "") == task_id:
+                    if expected_statuses is not None and record["status"] not in expected_statuses:
+                        return False
+                    if notification_key and notification_key in record["notifications"]:
+                        return False
                     merged = dict(record)
                     merged.update(updates)
+                    if notification_key:
+                        merged["notifications"] = [*record["notifications"], notification_key]
                     merged["updated_at"] = now
                     self._records[index] = self._normalize_record(merged)
                     try:
@@ -156,7 +175,9 @@ class TaskJournal:
                     except OSError:
                         self._records = previous
                         raise
-                    return
+                    return True
+            if expected_statuses is not None or notification_key:
+                return False
             record = self._normalize_record(
                 {
                     **updates,
@@ -180,6 +201,7 @@ class TaskJournal:
             except OSError:
                 self._records = previous
                 raise
+            return True
 
     def _trim_locked(self) -> None:
         """超量时裁掉最旧的已终结记录；pending 永不裁掉。"""

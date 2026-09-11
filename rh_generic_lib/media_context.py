@@ -60,10 +60,13 @@ def assets_from_message(message, stream, origin, id_ctx="", group_id=""):
         # Binary payloads are resolved from the host on demand, not retained in snapshots/journals.
         if str(source).startswith("base64://"):
             source = ""
+        file_id = str(fields.get("file_id") or fields.get("file") or "")
+        if file_id.startswith(("base64://", "http://", "https://")):
+            file_id = ""
         key = hashlib.sha256(f"{stream}:{mid}:{index}:{id_ctx}:{seg.get('binary_hash', '')}".encode()).hexdigest()[:20]
         asset = {"media_id": "m-" + key, "type": kind, "origin": origin, "message_id": mid,
                  "stream_id": stream, "index": index, "source": str(source),
-                 "file_id": str(fields.get("file_id") or fields.get("file") or ""),
+                 "file_id": file_id,
                  "description": str(seg.get("description") or (data if isinstance(data, str) and not source else ""))[:500]}
         if group_id:
             # 群文件段解析需要 group_id 才能走 get_group_file_url 链路
@@ -73,6 +76,71 @@ def assets_from_message(message, stream, origin, id_ctx="", group_id=""):
 
 
 class MediaContextMixin:
+    async def _load_image_memory(self):
+        from .image_memory import ImageMemory
+        try:
+            if self._image_memory is None:
+                self._image_memory = ImageMemory(self._ensure_task_journal().path.parent / "image_memory")
+                self._image_memory_limit = None
+            await self._image_memory.load()
+            limit = self.config.natural_language.recent_images
+            if self._image_memory_limit != limit:
+                await self._image_memory.trim(limit)
+                self._image_memory_limit = limit
+            return self._image_memory
+        except Exception as exc:
+            self.ctx.logger.warning("最近图片记录暂不可用，继续处理当前素材: %s", exc)
+            return None
+
+    async def _remember_image_usage(self, asset, data, user_id, stream_id, *, description=None):
+        """只保存实际读过或使用过的图片；识图与保存失败不阻断生成。"""
+        if asset.get("type") != "image" or not self.config.natural_language.recent_images:
+            return None
+        memory = await self._load_image_memory()
+        if memory is None:
+            return None
+        try:
+            if description is None:
+                if asset.get("memory_id") and asset.get("description"):
+                    description = asset["description"]
+                else:
+                    try:
+                        description = await self._describe_image(data)
+                    except Exception as exc:
+                        self.ctx.logger.warning("最近图片摘要未生成，保留原图供后续使用: %s", exc)
+                        description = ""
+            return await memory.remember(user_id, stream_id, asset, data, description,
+                                         self.config.natural_language.recent_images)
+        except Exception as exc:
+            self.ctx.logger.warning("保存最近图片失败，继续原任务: %s", exc)
+            return None
+
+    async def _apply_image_memory(self, snapshot):
+        memory = await self._load_image_memory()
+        records = memory.list_images(snapshot["user_id"], snapshot["stream_id"],
+                                     self.config.natural_language.recent_images) if memory else []
+        normal = [a for a in snapshot["assets"] if a.get("origin") != "memory"]
+        for asset in normal:
+            for key in ("memory_id", "memory_user_id", "recent_index"):
+                asset.pop(key, None)
+        recalled = []
+        for position, record in enumerate(records, 1):
+            # 当前或引用消息保持优先级；头像可能更新，新一轮仍允许读取当前头像。
+            aliases = {record["media_id"], record["memory_id"], *record.get("media_ids", [])}
+            matching = [a for a in normal if a["media_id"] in aliases
+                        and a.get("origin") != "avatar" and a.get("type") == "image"]
+            fields = {"memory_id": record["memory_id"], "memory_user_id": snapshot["user_id"],
+                      "description": record["description"], "recent_index": position}
+            if matching:
+                for asset in matching:
+                    asset.update(fields)
+            else:
+                recalled.append({"media_id": record["memory_id"], "type": "image", "origin": "memory",
+                                 "stream_id": snapshot["stream_id"], **fields})
+        # 最近图片独立于普通历史上限，调高保留数量后也能看到全部记录。
+        snapshot["assets"] = [*normal[:self.config.natural_language.max_candidates], *recalled]
+        return snapshot
+
     def _prune_context(self):
         cutoff = time.time() - self.config.natural_language.media_ttl_seconds
         for mapping in (self._anchors, self._contexts, self._drafts, self._vision_cache):
@@ -81,6 +149,9 @@ class MediaContextMixin:
                     mapping.pop(key, None)
             while len(mapping) > 128:
                 mapping.pop(next(iter(mapping)))
+        for key, lock in list(self._vision_locks.items()):
+            if not lock.locked() and key not in self._vision_cache:
+                self._vision_locks.pop(key, None)
         now = time.time()
         for key in [k for k, (_, seen) in self._stream_last_sender.items() if now - seen > 3600]:
             self._stream_last_sender.pop(key, None)
@@ -130,7 +201,9 @@ class MediaContextMixin:
             snapshot = self._contexts.get(context_id)
             if not snapshot or snapshot["user_id"] != uid or snapshot["stream_id"] != stream:
                 raise PlanError("素材上下文已过期或不属于当前用户会话，请重新调用 rh_context")
-            return snapshot
+            self._check_snapshot_access(kwargs, snapshot.get("group_id", ""), uid)
+            return await self._apply_image_memory(snapshot)
+        anchor = kwargs.get("message") or (self._anchors.get((uid, stream)) or {}).get("message")
         recent = []
         try:
             value = unwrap(await self.ctx.message.get_recent(stream, limit=self.config.natural_language.history_limit))
@@ -138,7 +211,6 @@ class MediaContextMixin:
         except Exception:
             pass
         recent = [m for m in recent if isinstance(m, dict) and identity(m)[1] in {"", stream}]
-        anchor = kwargs.get("message") or (self._anchors.get((uid, stream)) or {}).get("message")
         if anchor and (identity(anchor)[0] != uid or identity(anchor)[1] not in {"", stream}):
             raise PlanError("触发消息身份与宿主用户／会话不一致")
         if not anchor:
@@ -152,7 +224,8 @@ class MediaContextMixin:
         if not anchor or not anchor.get("message_id"):
             raise PlanError("暂时无法定位触发消息，请重新发送需求或使用 /rh运行")
         group_info = (anchor.get("message_info") or {}).get("group_info") or {}
-        gid = str(group_info.get("group_id") or kwargs.get("group_id") or "").strip()
+        gid = str(group_info.get("group_id") or anchor.get("group_id") or kwargs.get("group_id") or "").strip()
+        self._check_snapshot_access(kwargs, gid, uid)
         assets = assets_from_message(anchor, stream, "current", group_id=gid)
         reply_ids = [(d := s.get("data", {})).get("target_message_id") or d.get("message_id")
                      for s in segments(anchor) if s.get("type") == "reply" and isinstance(s.get("data"), dict)]
@@ -215,11 +288,31 @@ class MediaContextMixin:
             unique.setdefault(asset["media_id"], asset)
         token = uuid.uuid4().hex
         snapshot = {"context_id": token, "created_at": time.time(), "user_id": uid, "stream_id": stream,
-                    "anchor_id": str(anchor["message_id"]), "assets": list(unique.values())[:self.config.natural_language.max_candidates]}
+                    "group_id": gid, "anchor_id": str(anchor["message_id"]),
+                    "assets": list(unique.values())[:self.config.natural_language.max_candidates]}
         self._contexts[token] = snapshot
-        return snapshot
+        return await self._apply_image_memory(snapshot)
+
+    def _check_snapshot_access(self, kwargs, group_id, user_id):
+        injected = str(kwargs.get("group_id") or "").strip()
+        if injected and injected != group_id:
+            raise PlanError("触发消息与宿主群聊身份不一致")
+        allowed, reason = self._check_access(user_id, group_id)
+        if not allowed:
+            raise PlanError(reason)
 
     async def _resolve_asset(self, asset, client):
+        if asset.get("memory_id") and asset.get("memory_user_id"):
+            memory = await self._load_image_memory()
+            if memory is not None:
+                try:
+                    data = await memory.read(asset["memory_user_id"], asset["stream_id"], asset["memory_id"])
+                    if data:
+                        return data
+                except Exception as exc:
+                    self.ctx.logger.warning("已保存图片暂不可读: %s", exc)
+            if asset.get("origin") == "memory":
+                raise PlanError("这张图片已不在最近图片记录中，请重新发送")
         media_id = str(asset.get("media_id") or "")
         if media_id.startswith("avatar:") or media_id.startswith("avatar-group:"):
             from .avatar_source import fetch_avatar_bytes

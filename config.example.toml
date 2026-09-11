@@ -1,5 +1,6 @@
 # 复制本文件为 config.toml 后填写你的配置
-# 注意：config.toml 已被 .gitignore 排除，不会提交到仓库
+# 配置页使用中文标题和下拉选项，保存后选项值也是中文；旧英文取值仍可读取。
+# 配置键名保留兼容。实际配置文件已排除在版本控制之外。
 
 [plugin]
 config_version = "1.2.0"
@@ -26,9 +27,9 @@ enable = false
 recall_seconds = 90
 # 节点识别
 use_llm = true
-model = "utils"
+model = "通用模型"
 # 提示词扩写
-enhance_model = "utils"
+enhance_model = "通用模型"
 
 [access]
 # 访问控制（留空=不限制；max_per_user_per_hour = 0 表示不限频）
@@ -45,10 +46,12 @@ enabled = true
 history_limit = 20
 media_ttl_seconds = 3600
 max_candidates = 12
-planner_model = "utils"
-# 留空由主对话模型使用 rh_inspect_media 看图；或填宿主支持图片的模型任务名（不是模型 ID）
-# 视觉摘要只是扩写辅助，失败会记录日志并继续上传原图
-vision_model = ""
+planner_model = "通用模型"
+# 在配置页下拉选择：通用模型、回复模型、规划模型、视觉模型。
+# 视觉模型默认对应宿主的 vlm；旧空值也改用此项。识图失败仍上传原图。
+vision_model = "视觉模型"
+# 每人每个会话保留最近使用的原图与约五十字简介；填零关闭并清空。
+recent_images = 5
 # 把用户头像（群聊含群头像）作为可选素材，支持「画我」类请求；不需要可设 false
 avatar_candidates = true
 llm_timeout = 45
@@ -65,33 +68,33 @@ llm_timeout = 45
 # [[workflows.items]]
 # name = "动漫生图"
 # workflow_id = "2087492768787685378"
-# instance_type = "Standard"      # Standard / Plus / Ultra
-# region = "overseas"             # overseas=海外(runninghub.ai) / domestic=国内(runninghub.cn)
-# llm_enhance = false             # LLM 扩写开关
+# instance_type = "标准"         # 标准 / 增强 / 旗舰
+# region = "国外"               # 国外 / 国内
+# llm_enhance = false             # 扩写提示词
 # llm_template_path = ""          # 扩写模板路径（相对插件目录）
 # description = "动漫角色文生图"
-# capability = "text_to_image"   # 或 image_to_image / text_to_video / image_to_video / multi_reference
-# output_type = "image"          # image / video / audio / file
+# capability = "文字生图"       # 也可选图片编辑、文字生视频、图片生视频、多素材生成
+# output_type = "图片"          # 图片 / 视频 / 音频 / 文件
 # natural_language = true
-# prompt_profile = "auto"        # auto / image / edit / video / raw；模板优先
+# prompt_profile = "自动选择"   # 自动选择 / 图片生成 / 图片编辑 / 视频生成 / 保留原文
 #
 # [[workflows.items.input_nodes]]
 # node_id = "353"
 # field_name = "prompt"
 # field_value = ""                # 留空：由用户提供；填写：作为默认值
-# value_type = "prompt"           # prompt=主提示词 / text=可编辑配置 / default=固定默认值 / image=图片 / audio=语音 / 空=自动推断
+# value_type = "主提示词"        # 自动判断 / 主提示词 / 可编辑参数 / 固定默认值 / 图片 / 音频 / 视频
 # label = "提示词"
 # input_key = "prompt"           # 留空时使用 节点ID.字段名
-# role = ""                      # 图片可填 subject/style/background/first_frame/last_frame
-# required = true                # 没有默认值时必须提供；可选素材才设为 false
-# parameter_type = "string"      # text 参数可设置 integer/number/boolean
+# role = ""                      # 可填主体、风格、背景、首帧、尾帧
+# required = false               # 默认关闭；开启后，无默认值时必须补齐内容
+# parameter_type = "文字"        # 文字 / 整数 / 小数 / 开关，仅用于可编辑参数
 # choices = []                   # text 参数枚举，如 ["16:9", "1:1"]
 # minimum = 64                   # 数字参数下界；不限制时省略
 # maximum = 2048                 # 数字参数上界；不限制时省略
 #
 # 节点规则：
 # - prompt：主提示词，优先使用 /rh运行 后的描述或 LLM 扩写文本；
-#   没有输入时回退 field_value 默认值；无默认值且没输入时会先询问描述
+#   没有输入时回退默认值；仅开启必填且没有默认值时才追问描述
 #   （整个工作流仅一个，多了报错）
 # - text：自然语言保留默认值，只覆盖明确指定参数；命令路径保留配置确认
 # - default：固定默认值，直接使用、不询问；无默认值时跳过
