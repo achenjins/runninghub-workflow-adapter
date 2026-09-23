@@ -9,6 +9,8 @@
 
 平台入口：[RunningHub 国外](https://www.runninghub.ai?inviteCode=bvhsaqdr) / [RunningHub 国内](https://www.runninghub.cn?inviteCode=8cq8uhl8)
 
+配置页面重构，自然语言调用功能大更新。插件页面配置好工作流，打开工作流的自然语言调用功能后，让bot直接帮你调用工作流，不需复杂的命令流程。支持上下文 文件/视频/图片输入
+
 > [!WARNING]
 > 本插件目前**仅适配 NapCat 的 QQ**，其余平台 / 适配器未经测试，可能无法正常使用。
 
