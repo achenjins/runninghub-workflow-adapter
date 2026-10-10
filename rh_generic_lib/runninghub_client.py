@@ -32,7 +32,7 @@ _TASK_GONE_CODES = {"423", "807", "1004"}
 # 提交时平台并发/机器/频率已满，任务未创建，可以排队后重新提交
 _SUBMIT_RETRY_CODES = {"415", "421", "1003", "1011", "1520"}
 # 提交时平台内部错误：任务可能已经创建，和 HTTP 5xx 一样视为状态不确定
-_SUBMIT_UNKNOWN_CODES = {"500", "1005", "1010", "1012"}
+_SUBMIT_UNKNOWN_CODES = {"500", "1000", "1005", "1010", "1012"}
 
 
 class RunningHubError(RuntimeError):
