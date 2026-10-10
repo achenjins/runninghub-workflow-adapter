@@ -326,6 +326,17 @@ class MediaContextMixin:
         if media_id.startswith("avatar:") or media_id.startswith("avatar-group:"):
             from .avatar_source import fetch_avatar_bytes
             return await fetch_avatar_bytes(media_id, api=self.ctx.api, client=client, logger=self.ctx.logger)
+        file_id = asset.get("file_id")
+        if asset["type"] == "audio" and file_id:
+            # QQ 语音的 url 指向原始 silk，平台不收；先让 NapCat 转成 mp3，拿不到再按原链路读取。
+            try:
+                result = await self.ctx.api.call("adapter.napcat.action.call", action_name="get_record",
+                                                 params={"file": file_id, "file_id": file_id, "out_format": "mp3"})
+                data = await extract_bytes_from_napcat_result(result, client)
+                if data:
+                    return data
+            except Exception:
+                pass
         if asset.get("platform_message_id"):
             try:
                 message = unwrap(await self.ctx.api.call("adapter.napcat.action.call", action_name="get_msg", params={"message_id": asset["platform_message_id"]}))
@@ -349,20 +360,17 @@ class MediaContextMixin:
                             return await fetch_file_bytes(files[0][1], client)
             except Exception:
                 pass
-        file_id = asset.get("file_id")
         if file_id and not file_id.startswith(("http://", "https://", "base64://")):
-            try:
-                # QQ 语音原始文件是 silk；NapCat 的 get_record 可以直接转出 mp3。
-                action = {"image": "get_image", "audio": "get_record"}.get(asset["type"], "get_file")
-                params = {"file": file_id, "file_id": file_id}
-                if action == "get_record":
-                    params["out_format"] = "mp3"
-                result = await self.ctx.api.call("adapter.napcat.action.call", action_name=action, params=params)
-                data = await extract_bytes_from_napcat_result(result, client)
-                if data:
-                    return data
-            except Exception:
-                pass
+            if asset["type"] != "audio":
+                try:
+                    action = "get_image" if asset["type"] == "image" else "get_file"
+                    result = await self.ctx.api.call("adapter.napcat.action.call", action_name=action,
+                                                     params={"file": file_id, "file_id": file_id})
+                    data = await extract_bytes_from_napcat_result(result, client)
+                    if data:
+                        return data
+                except Exception:
+                    pass
             if asset.get("group_id"):
                 # 群文件：gzc-download 直链常是坏 ZIP，改走 get_group_file_url 候选链
                 for call in (

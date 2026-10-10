@@ -309,30 +309,49 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.client.upload_file.assert_not_awaited()
         self.client.submit.assert_not_awaited()
 
-    async def test_qq_voice_is_fetched_as_mp3(self):
+    def voice_setup(self):
         mp3 = b"ID3\x04" + b"\x00" * 16
         wf = WorkflowItemSection(name="draw", workflow_id="12345", input_nodes=[
             InputNodeSection(node_id="1", field_name="prompt", value_type="prompt"),
             InputNodeSection(node_id="2", field_name="audio", value_type="audio", input_key="voice", required=True)])
         self.set_config(wf)
-        anchor = message(text="用这段语音")
-        anchor["raw_message"].append({"type": "record", "data": {"file": "voice.amr"}})
-        self.messages["m1"] = anchor
-        self.p._remember_anchor(anchor)
+        # NapCat 的 record 段带 url，指向原始 silk
+        self.client.download_bytes.return_value = b"\x02#!SILK_V3" + b"\x00" * 16
         default = self.ctx.api.call.return_value
         async def napcat(api, action_name="", params=None):
             if action_name == "get_record":
                 return {"success": True, "result": {"retcode": 0, "data": {"base64": base64.b64encode(mp3).decode()}}}
             return default
         self.ctx.api.call = AsyncMock(side_effect=napcat)
-        result = await self.p.handle_run_workflow("draw", "配上这段语音", use_reference=True, user_id="11", stream_id="s1")
-        self.assertTrue(result["success"], result)
-        await self.settled()
+        return mp3, {"type": "record", "data": {"file": "voice.amr", "url": "https://multimedia.nt.qq.com.cn/download?fileid=voice"}}
+
+    def assert_uploaded_mp3(self, mp3):
         self.ctx.api.call.assert_any_await("adapter.napcat.action.call", action_name="get_record",
                                            params={"file": "voice.amr", "file_id": "voice.amr", "out_format": "mp3"})
         data, name = self.client.upload_file.await_args.args
         self.assertEqual(data, mp3)
         self.assertTrue(name.endswith(".mp3"), name)
+
+    async def test_qq_voice_is_fetched_as_mp3(self):
+        mp3, record = self.voice_setup()
+        anchor = message(text="用这段语音")
+        anchor["raw_message"].append(record)
+        self.messages["m1"] = anchor
+        self.p._remember_anchor(anchor)
+        result = await self.p.handle_run_workflow("draw", "配上这段语音", use_reference=True, user_id="11", stream_id="s1")
+        self.assertTrue(result["success"], result)
+        await self.settled()
+        self.assert_uploaded_mp3(mp3)
+
+    async def test_qq_voice_in_command_collection_is_fetched_as_mp3(self):
+        mp3, record = self.voice_setup()
+        await self.p.handle_pao_tu(user_id="11", stream_id="s1", raw_message="/rh运行 draw 配音")
+        voice = message(mid="v1", text="")
+        voice["raw_message"] = [record]
+        self.messages["v1"] = voice
+        await self.p._handle_incoming_files("11", "s1", voice)
+        await self.settled()
+        self.assert_uploaded_mp3(mp3)
 
     async def test_multireference_missing_only_then_explicit_roles(self):
         self.set_config(workflow(media=True, two=True, parameter=True))
