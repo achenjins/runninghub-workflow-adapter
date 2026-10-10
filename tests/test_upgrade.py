@@ -131,6 +131,15 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(stale["success"])
         self.client.submit.assert_awaited_once()
 
+    async def test_group_tool_identity_ignores_earlier_speakers(self):
+        # 别人几分钟前说过话，不影响当前发言人用自然语言提交
+        self.p._stream_senders["s1"]["77"] = time.time() - 200
+        result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
+        self.assertTrue(result["success"], result.get("message"))
+        await self.settled()
+        self.assertEqual(self.p._task_journal.get(result["task_id"])["user_id"], "11")
+        self.client.submit.assert_awaited_once()
+
     async def test_group_tool_identity_fails_closed_when_speakers_interleave(self):
         self.set_config(workflow(), access={"allow_users": ["77"]})
         self.p._remember_anchor(message(mid="a1", uid="11", text="帮我画一只猫"))

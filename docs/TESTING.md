@@ -11,7 +11,7 @@
 5. 重载插件，核对新工具 `rh_context`、`rh_inspect_media`、`run_workflow`、`rh_task` 已启用，并允许新增的 `message.get_recent`、`message.get_by_id` 能力。
 6. 在「聊天生成 → 视觉模型」下拉选择模型，选项依次为 `replyer`、`planner`、`utils`、`vlm`，默认是 `vlm`，旧配置的空值也使用此默认项。图像摘要缓存按模型和内容区分。视频／音频支持上传和角色绑定，目前不自动分析帧或转写音轨。
 7. 头像素材：`natural_language.avatar_candidates`（默认开启）把当前用户 QQ 头像（群聊还有群头像）注入素材候选，media_id 形如 `avatar:群内QQ`/`avatar-group:群号`，支持「画我/用我头像」；目标只取宿主可信身份，经 NapCat `get_avatar` 解析，失败自动回退 qlogo 公开直链，响应做图片魔数与大小校验。本地文件直读收紧为白名单（系统临时目录 + 插件缓存目录），UNC/file:// 与符号链接逃逸一律拒绝。
-8. 群聊中 MaiBot 工具上下文不注入 `user_id`（上游群聊会话固定清空，见 chat_manager），插件回退使用「入站消息的宿主注入发言人身份」（约 5 分钟内有效）计费与限流；这段时间内有两人以上发言时无法确定归属，直接拒绝并提示用 /rh运行 或引用消息。私聊由宿主直接注入，不走回退。
+8. 群聊中 MaiBot 工具上下文不注入 `user_id`（上游群聊会话固定清空，见 chat_manager），插件回退使用「入站消息的宿主注入发言人身份」（约 5 分钟内有效）计费与限流；一次模型调用的时长（`natural_language.llm_timeout`）内有两人以上发言时无法确定归属，直接拒绝并提示用 /rh运行。私聊由宿主直接注入，不走回退。
 
 ### 升级时提示缺少 `plugin.config_version`
 
