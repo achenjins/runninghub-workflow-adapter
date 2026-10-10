@@ -153,8 +153,11 @@ class MediaContextMixin:
             if not lock.locked() and key not in self._vision_cache:
                 self._vision_locks.pop(key, None)
         now = time.time()
-        for key in [k for k, (_, seen) in self._stream_last_sender.items() if now - seen > 3600]:
-            self._stream_last_sender.pop(key, None)
+        for stream, senders in list(self._stream_senders.items()):
+            for uid in [u for u, seen in senders.items() if now - seen > _FALLBACK_SENDER_TTL]:
+                senders.pop(uid)
+            if not senders:
+                self._stream_senders.pop(stream)
 
     def _remember_anchor(self, message):
         uid, stream = identity(message)
@@ -162,8 +165,8 @@ class MediaContextMixin:
             return
         self._prune_context()
         # 钩子消息由宿主序列化产生，发言人身份与命令 kwargs 同级可信；
-        # 记录为"该会话最近发言人"，供群聊工具上下文缺少 user_id 时限时回退。
-        self._stream_last_sender[stream] = (uid, time.time())
+        # 记录会话内近期发言人，供群聊工具上下文缺少 user_id 时限时回退。
+        self._stream_senders.setdefault(stream, {})[uid] = time.time()
         # Keep bounded metadata; obtain binary payload from message.get_by_id only when selected.
         stripped = {k: message[k] for k in ("message_id", "timestamp", "session_id", "stream_id", "chat_id", "message_info", "reply_to") if k in message}
         stripped["raw_message"] = [{k: v for k, v in s.items() if k in {"type", "data", "binary_hash", "description"}} for s in segments(message)[:64]]
@@ -186,10 +189,14 @@ class MediaContextMixin:
         if not uid and stream:
             # MaiBot 对群聊会话固定清空 user_id（chat_manager："群聊不保存最近发言人的用户信息"），
             # 工具上下文因此只注入 stream 不注入 user_id。回退到 before_process 钩子记录的
-            # 最近发言人——同为宿主注入的可信字段，LLM 无法伪造；超时限则保持 fail-closed。
-            last_uid, seen = self._stream_last_sender.get(stream, ("", 0.0))
-            if last_uid and time.time() - seen <= _FALLBACK_SENDER_TTL:
-                uid = last_uid
+            # 发言人——同为宿主注入的可信字段，LLM 无法伪造。时限内只有一人发言才回退，
+            # 多人交错时无法确定任务归属，保持 fail-closed。
+            now = time.time()
+            senders = [u for u, seen in self._stream_senders.get(stream, {}).items() if now - seen <= _FALLBACK_SENDER_TTL]
+            if len(senders) > 1:
+                raise PlanError("群里刚才有多人发言，无法确认是谁的请求，请用 /rh运行 或引用消息")
+            if senders:
+                uid = senders[0]
         if not uid or not stream:
             raise PlanError("宿主没有提供可信用户／会话身份，请使用 /rh运行 命令")
         return uid, stream

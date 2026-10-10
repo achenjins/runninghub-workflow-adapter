@@ -108,7 +108,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_identity_and_cross_context_fail(self):
         # 完全未知身份（无 user_id、钩子也没记录过该会话）时保持 fail-closed
-        self.p._stream_last_sender.pop("s1", None)
+        self.p._stream_senders.pop("s1", None)
         self.assertFalse((await self.p.handle_run_workflow("draw", "cat", stream_id="s1"))["success"])
         ctx = await self.p.handle_rh_context(user_id="11", stream_id="s1")
         bad = await self.p.handle_run_workflow("draw", "cat", context_id=ctx["context_id"], user_id="66", stream_id="s1")
@@ -126,10 +126,21 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((record["status"], record["delivery_status"]), ("success", "sent"))
         self.client.submit.assert_awaited_once()
         # 超时限的发言人记录不得冒用（后台主动回复等无新消息场景保持 fail-closed）
-        self.p._stream_last_sender["s1"] = ("11", time.time() - 400)
+        self.p._stream_senders["s1"] = {"11": time.time() - 400}
         stale = await self.p.handle_run_workflow("draw", "another cat", chat_id="s1", group_id="22")
         self.assertFalse(stale["success"])
         self.client.submit.assert_awaited_once()
+
+    async def test_group_tool_identity_fails_closed_when_speakers_interleave(self):
+        self.set_config(workflow(), access={"allow_users": ["77"]})
+        self.p._remember_anchor(message(mid="a1", uid="11", text="帮我画一只猫"))
+        self.p._remember_anchor(message(mid="b1", uid="77", text="哈哈"))
+        result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
+        await self.settled()
+        self.assertFalse(result["success"])
+        self.assertIn("/rh运行", result["message"])
+        self.assertEqual(self.p._task_journal.records(), [])
+        self.client.submit.assert_not_awaited()
 
     async def test_definite_query_error_pauses_for_manual_recovery(self):
         # 查询被拒绝时停止自动轮询，保留远端任务；修复后恢复且不重复提交。

@@ -184,8 +184,8 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         self._request_lock = asyncio.Lock()
         self._background_tasks = set()
         self._anchors = {}
-        # stream -> (最近一次 before_process 宿主消息的 user_id, 记录时间)；群聊工具身份回退用
-        self._stream_last_sender = {}
+        # stream -> {user_id: 最近发言时间}；群聊工具身份回退用
+        self._stream_senders = {}
         self._contexts = {}
         self._drafts = {}
         self._vision_cache = {}
