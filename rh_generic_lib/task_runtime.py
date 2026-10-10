@@ -214,8 +214,11 @@ class TaskRuntimeMixin:
                             return
                         await self._notify_job(record, f"{task_id}：{exc}", notify_model=True)
                         return
-                    except (RunningHubTransportError, TimeoutError):
-                        # 瞬态故障（断网/慢任务）：保留远端编号，占住名额继续后台跟踪，绝不重提
+                    except TimeoutError:
+                        # 慢任务超过单轮查询时长：远端仍在运行，直接开始下一轮
+                        continue
+                    except RunningHubTransportError:
+                        # 瞬态故障（断网/限流）：保留远端编号，占住名额继续后台跟踪，绝不重提
                         if not await journal.update(task_id, status="tracking_paused", message="查询暂不可用，后台稍后继续查询",
                                                     expected_statuses={"pending", "tracking_paused"}):
                             return

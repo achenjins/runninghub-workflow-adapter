@@ -133,7 +133,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_definite_query_error_pauses_for_manual_recovery(self):
         # 查询被拒绝时停止自动轮询，保留远端任务；修复后恢复且不重复提交。
-        self.client.wait_for_result.side_effect = RunningHubError("请求被拒绝（HTTP 401）")
+        self.client.wait_for_result.side_effect = RunningHubError("APIKEY_USER_NOT_FOUND（806）")
         result = await self.enqueue()
         for _ in range(50):
             if self.p._task_journal.get(result["task_id"])["status"] == "needs_attention":
@@ -152,13 +152,13 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_refused_by_dead_key_preserves_remote_task(self):
         # 取消被拒不能当作远端已停止；保留任务，恢复凭据后继续查询。
-        self.client.wait_for_result.side_effect = RunningHubError("请求被拒绝（HTTP 401）")
+        self.client.wait_for_result.side_effect = RunningHubError("APIKEY_USER_NOT_FOUND（806）")
         result = await self.enqueue()
         for _ in range(50):
             if self.p._task_journal.get(result["task_id"])["status"] == "needs_attention":
                 break
             await asyncio.sleep(0.005)
-        self.client.cancel.side_effect = RunningHubError("请求被拒绝（HTTP 401）")
+        self.client.cancel.return_value = {"code": 806, "msg": "APIKEY_USER_NOT_FOUND"}
         await self.p._cancel_task(result["task_id"], "s1")
         record = self.p._task_journal.get(result["task_id"])
         self.assertEqual(record["status"], "needs_attention")
@@ -379,6 +379,16 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         await self.settled()
         self.client.submit.assert_awaited_once()
         self.assertEqual(self.p._task_journal.get(result["task_id"])["delivery_status"], "sent")
+
+    async def test_slow_task_timeout_keeps_polling_without_outage_notice(self):
+        self.client.wait_for_result.side_effect = [TimeoutError("slow"), self.client.wait_for_result.return_value]
+        result = await self.enqueue()
+        await self.settled()
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual((record["status"], record["delivery_status"]), ("success", "sent"))
+        self.assertEqual(self.client.wait_for_result.await_count, 2)
+        sent = [call.args[0] for call in self.ctx.send.text.await_args_list]
+        self.assertFalse(any("查询暂不可用" in text for text in sent), sent)
 
     async def test_partial_delivery_retry_sends_only_unsent(self):
         self.client.wait_for_result.return_value["results"].append({"url": "https://example.test/out2.png", "outputType": "image"})

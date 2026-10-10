@@ -25,6 +25,9 @@ __all__ = ["RunningHubError", "RunningHubClient"]
 # 下载结果/上传文件的最大字节数（512MB），防止异常或恶意超大文件一次性读入内存
 _MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
 
+# 官方错误码中“限流/繁忙/稍后重试”一类，见接口错误码说明
+_BUSY_CODES = {"1003", "1005", "1010", "1011"}
+
 
 class RunningHubError(RuntimeError):
     """RunningHub API 调用失败时抛出的异常。"""
@@ -136,9 +139,9 @@ class RunningHubClient:
             raise RunningHubTransportError("提交响应格式异常，无法确认任务是否创建")
         task_id = result.get("taskId")
         if not task_id:
-            error_message = result.get("errorMessage") or ""
-            if error_message or result.get("code") not in (None, 0, 200, "0", "200"):
-                raise RunningHubError(f"提交任务被拒绝: {error_message or result.get('code')}")
+            code = str(result.get("errorCode") or result.get("code") or "")
+            if result.get("errorMessage") or code not in ("", "0", "200"):
+                raise RunningHubError(f"提交任务被拒绝: {result.get('errorMessage') or code}")
             raise RunningHubTransportError("提交响应缺少 taskId，无法确认是否已创建任务")
         return str(task_id)
 
@@ -149,8 +152,19 @@ class RunningHubClient:
             dict: 原始响应，``status`` 字段取值为
                 ``QUEUED`` / ``RUNNING`` / ``SUCCESS`` / ``FAILED`` / ``ERROR`` /
                 ``CANCEL`` 等，SUCCESS 时 ``results`` 列表包含 ``url`` 等结果字段。
+
+        Raises:
+            RunningHubTransportError: 平台返回限流/繁忙错误码，可稍后重试。
+            RunningHubError: 平台以 HTTP 200 + errorCode 拒绝查询（如 Key 无效）。
         """
-        return await self._post("/openapi/v2/query", {"taskId": str(task_id)})
+        result = await self._post("/openapi/v2/query", {"taskId": str(task_id)})
+        if isinstance(result, dict) and not result.get("status") and result.get("errorCode"):
+            code = str(result["errorCode"])
+            message = f"{result.get('errorMessage') or '查询被拒绝'}（{code}）"
+            if code in _BUSY_CODES:
+                raise RunningHubTransportError(message)
+            raise RunningHubError(message)
+        return result
 
     async def cancel(self, task_id: str) -> dict[str, Any]:
         """取消任务（POST /task/openapi/cancel）。
