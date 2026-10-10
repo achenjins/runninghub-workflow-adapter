@@ -12,6 +12,8 @@ from .media_plan import PlanError
 # 群聊工具上下文缺少 user_id 时，钩子记录的发言人身份可回退使用的时限（秒）；
 # 超时后后台主动回复等无新消息场景不会冒用旧身份。
 _FALLBACK_SENDER_TTL = 300.0
+# 宿主一轮对话从收到消息到调用工具的时长量级（秒）；这段时间内有两人以上发言时无法确定是谁的请求。
+_AMBIGUOUS_SENDER_WINDOW = 120.0
 
 
 def unwrap(value):
@@ -189,13 +191,12 @@ class MediaContextMixin:
         if not uid and stream:
             # MaiBot 对群聊会话固定清空 user_id（chat_manager："群聊不保存最近发言人的用户信息"），
             # 工具上下文因此只注入 stream 不注入 user_id。回退到 before_process 钩子记录的
-            # 最近发言人——同为宿主注入的可信字段，LLM 无法伪造。一次模型调用的时长内
+            # 最近发言人——同为宿主注入的可信字段，LLM 无法伪造。一轮对话的时长内
             # 还有别人发言时无法确定任务归属，保持 fail-closed。
             now = time.time()
             senders = sorted(((seen, u) for u, seen in self._stream_senders.get(stream, {}).items()
                               if now - seen <= _FALLBACK_SENDER_TTL), reverse=True)
-            window = self.config.natural_language.llm_timeout
-            if len(senders) > 1 and now - senders[1][0] <= window:
+            if len(senders) > 1 and now - senders[1][0] <= _AMBIGUOUS_SENDER_WINDOW:
                 raise PlanError("群里刚才有多人发言，无法确认是谁的请求，请用 /rh运行")
             if senders:
                 uid = senders[0][1]

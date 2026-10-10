@@ -142,6 +142,21 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.p._task_journal.get(result["task_id"])["user_id"], "11")
         self.client.submit.assert_awaited_once()
 
+    async def test_group_tool_identity_rejects_later_speaker_during_slow_turn(self):
+        # 宿主一轮处理可能超过一次模型调用的超时；请求人 60 秒前发言、别人 10 秒前插话时不能记到后者头上
+        now = time.time()
+        for mid, uid, text, age in (("a1", "11", "帮我画一只猫", 60), ("b1", "77", "哈哈", 10)):
+            self.messages[mid] = message(mid=mid, uid=uid, text=text)
+            with patch("rh_generic_lib.media_context.time.time", return_value=now - age):
+                self.p._remember_anchor(self.messages[mid])
+        self.recent = [self.messages["a1"], self.messages["b1"]]
+        result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
+        await self.settled()
+        self.assertFalse(result["success"])
+        self.assertIn("多人发言", result["message"])
+        self.assertEqual(self.p._task_journal.records(), [])
+        self.client.submit.assert_not_awaited()
+
     async def test_group_tool_identity_fails_closed_when_speakers_interleave(self):
         self.set_config(workflow(), access={"allow_users": ["77"]})
         self.p._remember_anchor(message(mid="a1", uid="11", text="帮我画一只猫"))

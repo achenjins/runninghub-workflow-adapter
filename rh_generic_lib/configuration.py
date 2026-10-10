@@ -138,7 +138,7 @@ class NaturalLanguageSection(PluginConfigBase):
     history_limit: int = _setting(20, "参考消息数", "从当前会话读取最近多少条消息。", ge=1, le=100)
     max_candidates: int = _setting(12, "素材候选上限", "普通素材的候选数量，已保存的最近图片另计。", ge=1, le=32)
     media_ttl_seconds: int = _setting(3600, "素材保留时间（秒）", "普通素材、待补需求和临时识图缓存的保留时间，不影响已保存图片。", ge=60, le=86400)
-    llm_timeout: int = _setting(45, "模型超时（秒）", "工作流选择、识图和扩写的等待上限；群聊里这段时间内有多人发言时，不确定是谁的请求，会请用户改用命令。", ge=5, le=180)
+    llm_timeout: int = _setting(45, "模型超时（秒）", "工作流选择、识图和扩写的等待上限。", ge=5, le=180)
 
     @field_validator("vision_model", mode="before")
     @classmethod
