@@ -7,7 +7,7 @@
 - ``query``：查询任务状态，SUCCESS 时返回结果列表
 - ``download_base64``：下载图片并以 base64 字符串返回
 
-所有 HTTP 请求通过 ``asyncio.to_thread`` 执行，避免阻塞插件事件循环。
+所有 HTTP 请求通过 ``asyncio.to_thread`` 执行，避免阻塞插件事件循环；同一客户端复用一个 Session。
 """
 
 from __future__ import annotations
@@ -25,6 +25,15 @@ __all__ = ["RunningHubError", "RunningHubClient"]
 # 下载结果/上传文件的最大字节数（512MB），防止异常或恶意超大文件一次性读入内存
 _MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
 
+# 官方错误码中“限流/繁忙/稍后重试”一类，见接口错误码说明
+_BUSY_CODES = {"1003", "1005", "1010", "1011"}
+# 任务不存在或已被清理
+_TASK_GONE_CODES = {"423", "807", "1004"}
+# 提交时平台并发/机器/频率已满，任务未创建，可以排队后重新提交
+_SUBMIT_RETRY_CODES = {"415", "421", "1003", "1011", "1520"}
+# 提交时平台内部错误：任务可能已经创建，和 HTTP 5xx 一样视为状态不确定
+_SUBMIT_UNKNOWN_CODES = {"500", "1000", "1005", "1010", "1012"}
+
 
 class RunningHubError(RuntimeError):
     """RunningHub API 调用失败时抛出的异常。"""
@@ -32,6 +41,10 @@ class RunningHubError(RuntimeError):
 
 class RunningHubTransportError(RunningHubError):
     """The server outcome is unknown. Never automatically retry a paid POST."""
+
+
+class RunningHubBusyError(RunningHubError):
+    """The platform refused to create the task because it is at capacity; resubmitting later is safe."""
 
 
 class RunningHubTaskError(RunningHubError):
@@ -65,6 +78,11 @@ class RunningHubClient:
         self.max_wait = int(max_wait)
         self.max_file_bytes = max(1, int(max_file_bytes))
         self.query_retries = max(0, int(query_retries))
+        # 轮询、上传和下载复用同一组 TLS 连接
+        self._session = requests.Session()
+
+    def close(self) -> None:
+        self._session.close()
 
     @staticmethod
     def _headers(api_key: str) -> dict[str, str]:
@@ -82,7 +100,7 @@ class RunningHubClient:
 
         def _do() -> dict[str, Any]:
             try:
-                response = requests.post(
+                response = self._session.post(
                     f"{self.base_url}{path}",
                     json=payload,
                     headers=self._headers(self.api_key) if use_api_key_header else {"Content-Type": "application/json"},
@@ -110,13 +128,15 @@ class RunningHubClient:
         Args:
             node_info_list: 需要覆盖的节点输入列表，如
                 ``[{"nodeId": "353", "fieldName": "prompt", "fieldValue": "..."}]``。
-            instance_type: 设备类型，``Standard`` / ``Plus`` / ``Ultra``。
+            instance_type: 设备类型，``Standard``（平台默认 24G）/ ``Plus`` / ``Ultra``。
             workflow_id: 目标工作流 ID；缺省使用客户端配置的工作流。
 
         Returns:
             str: 任务 ID。
 
         Raises:
+            RunningHubBusyError: 平台并发或限流已满，任务未创建。
+            RunningHubTransportError: 响应丢失或平台内部错误，无法确认任务是否创建。
             RunningHubError: 提交失败或未返回 taskId 时抛出。
         """
         target_workflow = str(workflow_id or self.workflow_id or "")
@@ -125,20 +145,23 @@ class RunningHubClient:
         if not self.api_key:
             raise RunningHubError("未配置 api_key，请检查插件配置")
 
-        payload = {
-            "nodeInfoList": node_info_list or [],
-            # RunningHub 的 instanceType 期望小写（standard/plus/ultra）
-            "instanceType": str(instance_type or "Standard").lower(),
-            "usePersonalQueue": "false",
-        }
+        # 参数含义见官方「发起ComfyUI任务2-高级」：instanceType 不传即默认 24G，
+        # addMetadata 默认会把提示词写进图片，这里关掉。
+        payload = {"nodeInfoList": node_info_list or [], "usePersonalQueue": False, "addMetadata": False}
+        if instance_type != "Standard":
+            payload["instanceType"] = instance_type.lower()
         result = await self._post(f"/openapi/v2/run/workflow/{target_workflow}", payload)
         if not isinstance(result, dict):
             raise RunningHubTransportError("提交响应格式异常，无法确认任务是否创建")
         task_id = result.get("taskId")
         if not task_id:
-            error_message = result.get("errorMessage") or ""
-            if error_message or result.get("code") not in (None, 0, 200, "0", "200"):
-                raise RunningHubError(f"提交任务被拒绝: {error_message or result.get('code')}")
+            code = str(result.get("errorCode") or result.get("code") or "")
+            if code in _SUBMIT_RETRY_CODES:
+                raise RunningHubBusyError(f"{result.get('errorMessage') or result.get('msg') or '平台繁忙'}（{code}）")
+            if code in _SUBMIT_UNKNOWN_CODES:
+                raise RunningHubTransportError(f"提交时平台内部错误，无法确认任务是否创建（{code}）")
+            if result.get("errorMessage") or code not in ("", "0", "200"):
+                raise RunningHubError(f"提交任务被拒绝: {result.get('errorMessage') or code}")
             raise RunningHubTransportError("提交响应缺少 taskId，无法确认是否已创建任务")
         return str(task_id)
 
@@ -149,8 +172,22 @@ class RunningHubClient:
             dict: 原始响应，``status`` 字段取值为
                 ``QUEUED`` / ``RUNNING`` / ``SUCCESS`` / ``FAILED`` / ``ERROR`` /
                 ``CANCEL`` 等，SUCCESS 时 ``results`` 列表包含 ``url`` 等结果字段。
+
+        Raises:
+            RunningHubTransportError: 平台返回限流/繁忙错误码，可稍后重试。
+            RunningHubTaskError: 平台报告任务不存在或已过期。
+            RunningHubError: 平台以 HTTP 200 + errorCode 拒绝查询（如 Key 无效）。
         """
-        return await self._post("/openapi/v2/query", {"taskId": str(task_id)})
+        result = await self._post("/openapi/v2/query", {"taskId": str(task_id)})
+        if isinstance(result, dict) and not result.get("status") and result.get("errorCode"):
+            code = str(result["errorCode"])
+            message = f"{result.get('errorMessage') or '查询被拒绝'}（{code}）"
+            if code in _BUSY_CODES:
+                raise RunningHubTransportError(message)
+            if code in _TASK_GONE_CODES:
+                raise RunningHubTaskError(message)
+            raise RunningHubError(message)
+        return result
 
     async def cancel(self, task_id: str) -> dict[str, Any]:
         """取消任务（POST /task/openapi/cancel）。
@@ -183,9 +220,8 @@ class RunningHubClient:
                         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
                     ),
                 }
-                response = requests.get(url, timeout=self.timeout, stream=True, headers=headers)
-                response.raise_for_status()
-                with response:
+                with self._session.get(url, timeout=self.timeout, stream=True, headers=headers) as response:
+                    response.raise_for_status()
                     chunks: list[bytes] = []
                     total = 0
                     for chunk in response.iter_content(chunk_size=1024 * 1024):
@@ -225,7 +261,7 @@ class RunningHubClient:
 
         def _do() -> dict[str, Any]:
             try:
-                response = requests.post(
+                response = self._session.post(
                     f"{self.base_url}/openapi/v2/media/upload/binary",
                     headers={"Authorization": f"Bearer {self.api_key}"},
                     files={"file": (filename, file_data)},
@@ -280,7 +316,7 @@ class RunningHubClient:
 
         def _do() -> dict[str, Any]:
             try:
-                response = requests.post(
+                response = self._session.post(
                     f"{self.base_url}/api/openapi/getJsonApiFormat",
                     json=payload,
                     headers=headers,
@@ -304,10 +340,8 @@ class RunningHubClient:
         prompt = data.get("prompt")
         if prompt is None:
             raise RunningHubError(f"获取工作流失败: 响应缺少 data.prompt: {json.dumps(result, ensure_ascii=False)[:500]}")
-        import json as _json
-
         try:
-            workflow = _json.loads(prompt) if isinstance(prompt, str) else prompt
+            workflow = json.loads(prompt) if isinstance(prompt, str) else prompt
         except Exception as exc:
             raise RunningHubError(f"工作流 JSON 解析失败: {exc}") from exc
         if not isinstance(workflow, dict):

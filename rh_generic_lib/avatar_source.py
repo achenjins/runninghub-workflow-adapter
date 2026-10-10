@@ -25,11 +25,6 @@ _GROUP_AVATAR_URLS = (
 )
 
 
-def is_avatar_media(media_id: Any) -> bool:
-    text = str(media_id or "")
-    return text.startswith("avatar:") or text.startswith("avatar-group:")
-
-
 def avatar_target(media_id: Any) -> tuple[str, str]:
     """返回 ('user'|'group', 数字 ID)；格式非法抛 PlanError。"""
     text = str(media_id or "")

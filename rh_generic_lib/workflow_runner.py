@@ -186,17 +186,6 @@ def describe_file_inputs(workflow: Any) -> str:
     return "；".join(parts) if parts else ""
 
 
-def format_file_counts(images: int, audios: int, videos: int = 0) -> str:
-    parts: list[str] = []
-    if images:
-        parts.append(f"参考图片 {images} 张")
-    if audios:
-        parts.append(f"参考音频 {audios} 段")
-    if videos:
-        parts.append(f"参考视频 {videos} 段")
-    return "；".join(parts)
-
-
 def consume_coins_from_result(result: Any) -> str:
     """从 RunningHub 任务查询响应里提取消耗的 RH 币。"""
     if isinstance(result, dict):
