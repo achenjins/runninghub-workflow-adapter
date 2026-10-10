@@ -101,7 +101,8 @@ class TaskJournal:
         await self._upsert(task_id, {"status": STATUS_CANCELLED, "message": "用户取消"})
 
     def records(self) -> list[dict[str, Any]]:
-        return copy.deepcopy(self._records)
+        """只读快照：更新时整条记录被替换，不会原地修改，调用方也不要修改。"""
+        return list(self._records)
 
     def get(self, task_id: str) -> dict[str, Any] | None:
         return copy.deepcopy(next((r for r in self._records if r["task_id"] == task_id), None))
@@ -157,7 +158,7 @@ class TaskJournal:
     async def _upsert(self, task_id: str, updates: dict[str, Any], *, expected_statuses=None, notification_key="") -> bool:
         now = time.time()
         async with self._lock:
-            previous = copy.deepcopy(self._records)
+            previous = list(self._records)
             for index, record in enumerate(self._records):
                 if str(record.get("task_id") or "") == task_id:
                     if expected_statuses is not None and record["status"] not in expected_statuses:
@@ -220,14 +221,14 @@ class TaskJournal:
     async def _write_locked(self) -> None:
         """调用方必须持有 self._lock。
 
-        使用同步小文件写入：日志只有几十 KB，阻塞时间可忽略；这样取消任务时
-        不会在文件写入中间留下半截状态，也不会把 CancelledError 传播给调用方。
+        同步写入紧凑 JSON：取消任务时不会在文件写入中间留下半截状态，也不会把
+        CancelledError 传播给调用方。
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp = self.path.with_suffix(self.path.suffix + ".tmp")
         try:
             temp.write_text(
-                json.dumps(self._records, ensure_ascii=False, indent=2),
+                json.dumps(self._records, ensure_ascii=False, separators=(",", ":")),
                 encoding="utf-8",
             )
             temp.replace(self.path)

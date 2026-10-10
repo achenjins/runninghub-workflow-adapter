@@ -856,6 +856,33 @@ class PureTests(unittest.IsolatedAsyncioTestCase):
                     await journal.update("rh-a", status="queued", submitted_at=0)
             self.assertEqual(journal.records(), [])
 
+    async def test_large_journal_update_does_not_stall_event_loop(self):
+        # 500 records shaped like real tasks; before the fix one update took ~65 ms and records() ~27 ms.
+        snapshot = workflow(media=True, two=True, parameter=True).model_dump()
+        plan = {"prompt": "x" * 300, "references": [], "parameters": {},
+                "assets": [{"media_id": f"m-{i}", "type": "image", "description": "d" * 200,
+                            "source": "https://multimedia.nt.qq.com.cn/download?fileid=" + "a" * 200} for i in range(3)]}
+        with tempfile.TemporaryDirectory() as directory:
+            journal = TaskJournal(Path(directory) / "journal.json")
+            await journal.load()
+            journal._records = [journal._normalize_record({
+                "task_id": f"rh-{i:016x}", "status": "success", "delivery_status": "sent", "submitted_at": 1,
+                "request": {"workflow": snapshot, "nodes": [], "plan": plan},
+                "outputs": [{"url": "https://rh-images.example/" + "b" * 80 + ".png", "type": "png"}]}) for i in range(500)]
+            start = time.perf_counter()
+            for _ in range(10):
+                await journal.update("rh-0000000000000000", message="stage")
+            update_ms = (time.perf_counter() - start) * 100
+            start = time.perf_counter()
+            for _ in range(10):
+                journal.records()
+            records_ms = (time.perf_counter() - start) * 100
+            self.assertLess(update_ms, 30)
+            self.assertLess(records_ms, 5)
+            restored = TaskJournal(journal.path)
+            await restored.load()
+            self.assertEqual(restored.get("rh-0000000000000000")["message"], "stage")
+
     async def test_restart_does_not_resend_inflight_delivery(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "journal.json"
