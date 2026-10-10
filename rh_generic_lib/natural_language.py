@@ -346,7 +346,7 @@ class NaturalLanguageMixin:
         await self.ctx.send.text(result["message"], str(kwargs.get("stream_id") or kwargs.get("chat_id") or ""))
         return True, "", 1
 
-    @Command("rh核对", description="管理员核对不确定提交：填写远端任务编号，或确认未创建后释放保留名额", pattern=r"^/rh核对\s+(?P<task_id>\S+)\s+(?P<remote_id>\S+)\s*$")
+    @Command("rh核对", description="管理员核对不确定提交或需处理的任务：关联远端编号、确认未创建或放弃跟踪以释放名额", pattern=r"^/rh核对\s+(?P<task_id>\S+)\s+(?P<remote_id>\S+)\s*$")
     async def handle_rh_reconcile(self, **kwargs):
         try:
             uid, stream = self._trusted_scope(kwargs)
@@ -355,12 +355,17 @@ class NaturalLanguageMixin:
             matched = kwargs.get("matched_groups") or {}
             task_id, remote_id = str(matched.get("task_id") or ""), str(matched.get("remote_id") or "")
             if not task_id or not remote_id:
-                raise PlanError("用法：/rh核对 本地任务ID 远端任务ID（确认远端未创建时，最后一项填写 未创建）")
+                raise PlanError("用法：/rh核对 本地任务ID 远端任务ID|未创建|放弃")
             journal = await self._load_task_journal()
             record = journal.get(task_id)
-            if not record or record["stream_id"] != stream or record["status"] != "unknown_submission":
-                raise PlanError("只能核对当前会话中提交状态不确定的任务")
-            if remote_id == "未创建":
+            if not record or record["stream_id"] != stream or record["status"] not in {"unknown_submission", "needs_attention"}:
+                raise PlanError("只能核对当前会话中提交状态不确定或需要处理的任务")
+            if record["status"] == "needs_attention":
+                if remote_id != "放弃":
+                    raise PlanError("该任务已有远端编号；确认不再需要时用 /rh核对 本地任务ID 放弃")
+                await journal.update(task_id, status="failed", message="管理员已放弃跟踪，释放名额")
+                message = "已放弃跟踪并释放名额；远端如已生成不会再发送"
+            elif remote_id == "未创建":
                 await journal.update(task_id, status="failed", submitted_at=0, message="管理员确认远端未创建，已释放保留名额")
                 message = "已释放名额；没有重新生成"
             else:

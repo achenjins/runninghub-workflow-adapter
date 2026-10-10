@@ -181,6 +181,41 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.client.submit.assert_awaited_once()
         self.assertEqual(self.p._task_journal.get(result["task_id"])["delivery_status"], "sent")
 
+    async def test_admin_abandons_needs_attention_and_queue_moves(self):
+        self.set_config(workflow(), access={"admin_users": ["11"]})
+        self.client.wait_for_result.side_effect = RunningHubError("APIKEY_USER_NOT_FOUND（806）")
+        first = await self.enqueue()
+        await self.settled()
+        self.assertEqual(self.p._task_journal.get(first["task_id"])["status"], "needs_attention")
+        self.client.cancel.return_value = {"code": 807, "msg": "APIKEY_TASK_NOT_FOUND"}
+        await self.p._cancel_task(first["task_id"], "s1", announce=False)
+        self.client.wait_for_result.side_effect = None
+        second = await self.enqueue(anchor_id="m2")
+        await asyncio.sleep(0.02)
+        self.assertEqual(self.p._task_journal.get(second["task_id"])["status"], "queued")
+        await self.p.handle_rh_reconcile(user_id="11", stream_id="s1", matched_groups={"task_id": first["task_id"], "remote_id": "放弃"})
+        await self.settled()
+        self.assertEqual(self.p._task_journal.get(first["task_id"])["status"], "failed")
+        self.assertEqual(self.p._task_journal.get(second["task_id"])["status"], "success")
+        self.assertEqual(self.client.submit.await_count, 2)
+
+    async def test_refused_cancel_keeps_polling_and_delivers_result(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        done = self.client.wait_for_result.return_value
+        async def polling(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return done
+        self.client.wait_for_result.side_effect = polling
+        result = await self.enqueue()
+        await asyncio.wait_for(entered.wait(), .5)
+        self.client.cancel.return_value = {"code": 805, "msg": "APIKEY_TASK_STATUS_ERROR"}
+        await self.p._cancel_task(result["task_id"], "s1", announce=False)
+        release.set()
+        await self.settled()
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual((record["status"], record["delivery_status"]), ("success", "sent"))
+
     async def test_avatar_asset_binds_via_adapter_then_cdn_fallback(self):
         # 「画我」：头像候选由宿主可信 uid/群号生成，绑定后现场解析字节并上传
         self.set_config(workflow(media=True))

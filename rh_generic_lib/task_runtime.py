@@ -198,6 +198,7 @@ class TaskRuntimeMixin:
                         outcome = await self._cancel_remote(record, client)
                         if outcome in {"confirmed", "refused"}:
                             await self._notify_job(record, f"任务 {task_id}：{journal.get(task_id)['message']}", notify_model=True)
+                        if outcome == "confirmed":
                             return
                 # Keep the worker slot while the remote job is unresolved, including outages.
                 notified = False
@@ -347,8 +348,8 @@ class TaskRuntimeMixin:
         except RunningHubTransportError:
             return "uncertain"
         except RunningHubError as exc:
-            changed = await self._task_journal.update(record["task_id"], status="needs_attention",
-                message=f"远端拒绝取消：{exc}；保留任务，修复配置后可恢复查询",
+            # 拒绝取消不代表远端已停止，由查询结果决定最终状态。
+            changed = await self._task_journal.update(record["task_id"], message=f"远端拒绝取消：{exc}；任务保留",
                 expected_statuses={"pending", "tracking_paused", "needs_attention"})
             return "refused" if changed else "completed"
         except Exception:
@@ -382,11 +383,12 @@ class TaskRuntimeMixin:
                     message = "任务已经结束，保留已有结果"
             elif outcome == "completed":
                 message = "任务已经结束，保留已有结果"
+            elif outcome == "refused":
+                message = journal.get(task_id)["message"]
             else:
                 if task := self._pending.get(task_id):
                     task.cancel()
-                message = ("任务已取消" if outcome == "confirmed"
-                           else "远端拒绝取消，已暂停查询并保留任务；远端可能仍在运行，修复配置后可用 /rh状态 恢复")
+                message = "任务已取消"
         elif status == "unknown_submission":
             message = "提交状态未知，无法安全取消；请管理员核对 RunningHub 任务记录"
         else:

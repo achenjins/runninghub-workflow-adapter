@@ -27,6 +27,8 @@ _MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
 
 # 官方错误码中“限流/繁忙/稍后重试”一类，见接口错误码说明
 _BUSY_CODES = {"1003", "1005", "1010", "1011"}
+# 任务不存在或已被清理
+_TASK_GONE_CODES = {"423", "807", "1004"}
 
 
 class RunningHubError(RuntimeError):
@@ -155,6 +157,7 @@ class RunningHubClient:
 
         Raises:
             RunningHubTransportError: 平台返回限流/繁忙错误码，可稍后重试。
+            RunningHubTaskError: 平台报告任务不存在或已过期。
             RunningHubError: 平台以 HTTP 200 + errorCode 拒绝查询（如 Key 无效）。
         """
         result = await self._post("/openapi/v2/query", {"taskId": str(task_id)})
@@ -163,6 +166,8 @@ class RunningHubClient:
             message = f"{result.get('errorMessage') or '查询被拒绝'}（{code}）"
             if code in _BUSY_CODES:
                 raise RunningHubTransportError(message)
+            if code in _TASK_GONE_CODES:
+                raise RunningHubTaskError(message)
             raise RunningHubError(message)
         return result
 
