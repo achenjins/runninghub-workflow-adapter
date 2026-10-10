@@ -1,6 +1,8 @@
 """RunningHubClient contract tests against response bodies taken from the platform and its docs."""
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
+
+import requests
 
 from rh_generic_lib.runninghub_client import (
     RunningHubBusyError, RunningHubClient, RunningHubError, RunningHubTaskError, RunningHubTransportError)
@@ -33,7 +35,7 @@ def client(**kwargs):
 class QueryContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_error_code_body_is_a_definite_refusal(self):
         for body in (QUERY_806, QUERY_1007):
-            with patch("rh_generic_lib.runninghub_client.requests.post", return_value=response(body)) as post:
+            with patch.object(requests.Session, "post", return_value=response(body)) as post:
                 with self.assertRaises(RunningHubError) as caught:
                     await client().wait_for_result("1904152026220003329")
             self.assertNotIsInstance(caught.exception, RunningHubTransportError)
@@ -42,21 +44,21 @@ class QueryContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_task_is_terminal(self):
         for body in (QUERY_807, QUERY_1004):
-            with patch("rh_generic_lib.runninghub_client.requests.post", return_value=response(body)):
+            with patch.object(requests.Session, "post", return_value=response(body)):
                 with self.assertRaises(RunningHubTaskError) as caught:
                     await client().wait_for_result("1")
             self.assertEqual(caught.exception.status, "FAILED")
 
     async def test_rate_limit_is_retried(self):
         replies = [response(QUERY_1003), response(QUERY_SUCCESS)]
-        with patch("rh_generic_lib.runninghub_client.requests.post", side_effect=replies), \
+        with patch.object(requests.Session, "post", side_effect=replies), \
                 patch("rh_generic_lib.runninghub_client.asyncio.sleep"):
             result = await client().wait_for_result("1")
         self.assertEqual(result["status"], "SUCCESS")
 
     async def test_running_then_success(self):
         replies = [response(QUERY_RUNNING), response(QUERY_SUCCESS)]
-        with patch("rh_generic_lib.runninghub_client.requests.post", side_effect=replies), \
+        with patch.object(requests.Session, "post", side_effect=replies), \
                 patch("rh_generic_lib.runninghub_client.asyncio.sleep"):
             result = await client().wait_for_result("1")
         self.assertEqual(result["results"][0]["url"], "https://rh-images.example/out.jpg")
@@ -66,7 +68,7 @@ class SubmitContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_capacity_codes_are_retryable(self):
         for code, message in (("421", "TASK_QUEUE_MAXED"), ("415", "TASK_INSTANCE_MAXED"), ("1520", "Concurrency limit reached")):
             body = {"taskId": "", "status": "", "errorCode": code, "errorMessage": message, "results": None}
-            with patch("rh_generic_lib.runninghub_client.requests.post", return_value=response(body)):
+            with patch.object(requests.Session, "post", return_value=response(body)):
                 with self.assertRaises(RunningHubBusyError):
                     await client().submit([])
 
@@ -74,7 +76,7 @@ class SubmitContractTests(unittest.IsolatedAsyncioTestCase):
         accepted = {"taskId": "2009191190196789249", "status": "QUEUED", "errorCode": "", "errorMessage": ""}
         expected = {"Standard": None, "Plus": "plus", "Ultra": "ultra"}
         for instance_type, documented in expected.items():
-            with patch("rh_generic_lib.runninghub_client.requests.post", return_value=response(accepted)) as post:
+            with patch.object(requests.Session, "post", return_value=response(accepted)) as post:
                 task_id = await client().submit([{"nodeId": "6", "fieldName": "text", "fieldValue": "cat"}], instance_type=instance_type)
             self.assertEqual(task_id, "2009191190196789249")
             payload = post.call_args.kwargs["json"]
@@ -86,10 +88,30 @@ class SubmitContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejections_are_not_retryable(self):
         for code, message in (("806", "APIKEY_USER_NOT_FOUND"), ("380", "WORKFLOW_NOT_EXISTS")):
             body = {"taskId": "", "status": "", "errorCode": code, "errorMessage": message, "results": None}
-            with patch("rh_generic_lib.runninghub_client.requests.post", return_value=response(body)):
+            with patch.object(requests.Session, "post", return_value=response(body)):
                 with self.assertRaises(RunningHubError) as caught:
                     await client().submit([])
             self.assertNotIsInstance(caught.exception, (RunningHubBusyError, RunningHubTransportError))
+
+
+class TransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_requests_reuse_one_session(self):
+        rh = client()
+        with patch.object(requests.Session, "post", return_value=response(QUERY_RUNNING)) as session_post, \
+                patch("requests.post") as module_post:
+            await rh.query("1")
+            await rh.query("1")
+        self.assertEqual(session_post.call_count, 2)
+        module_post.assert_not_called()
+
+    async def test_failed_download_closes_streamed_response(self):
+        streamed = MagicMock(status_code=404)
+        streamed.__enter__.return_value = streamed
+        streamed.raise_for_status.side_effect = requests.HTTPError("404")
+        with patch.object(requests.Session, "get", return_value=streamed), patch("requests.get", return_value=streamed):
+            with self.assertRaises(RunningHubError):
+                await client().download_bytes("https://rh-images.example/missing.png")
+        streamed.__exit__.assert_called_once()
 
 
 if __name__ == "__main__":

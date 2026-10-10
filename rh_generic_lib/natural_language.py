@@ -322,7 +322,7 @@ class NaturalLanguageMixin:
             else:
                 raise PlanError("未知操作")
             records = [latest for latest in (journal.get(r["task_id"]) for r in records) if latest]
-            payload = {"success": True, "tasks": [{k: r[k] for k in ("task_id", "workflow", "status", "delivery_status", "message")} for r in records[:10]],
+            payload = {"success": True, "tasks": [{k: r[k] for k in ("task_id", "workflow", "status", "delivery_status")} for r in records[:10]],
                        "next_action": "用当前聊天语气简短说明，不报编号、不轮询。"}
             if message:
                 payload["message"] = message
@@ -334,7 +334,8 @@ class NaturalLanguageMixin:
     async def handle_rh_status(self, task_id="", **kwargs):
         task_id = task_id or str((kwargs.get("matched_groups") or {}).get("task_id") or "")
         result = await self.handle_rh_task(task_id=task_id, **kwargs)
-        tasks = result.get("tasks", [])
+        # 详细说明只给命令用户看，工具返回给模型的只有状态。
+        tasks = [self._task_journal.get(r["task_id"]) for r in result.get("tasks", [])]
         text = "\n".join(f"{r['task_id']} {r['workflow']}：{r['status']} / 发送 {r['delivery_status'] or '-'} {r['message']}" for r in tasks)
         await self.ctx.send.text(text or result.get("message", "暂无任务"), str(kwargs.get("stream_id") or kwargs.get("chat_id") or ""))
         return True, "", 1

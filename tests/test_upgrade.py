@@ -507,6 +507,18 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.client.submit.assert_awaited_once()
         self.assertEqual(self.p._task_journal.get(result["task_id"])["delivery_status"], "sent")
 
+    async def test_task_tool_returns_status_without_internal_message(self):
+        self.client.wait_for_result.side_effect = RunningHubError("APIKEY_USER_NOT_FOUND（806）")
+        result = await self.enqueue()
+        await self.settled()
+        reply = await self.p.handle_rh_task("status", result["task_id"], user_id="11", stream_id="s1")
+        self.assertEqual(reply["tasks"], [{"task_id": result["task_id"], "workflow": "draw",
+                                           "status": "needs_attention", "delivery_status": ""}])
+        self.assertNotIn("API Key", reply["content"])
+        self.ctx.send.text.reset_mock()
+        await self.p.handle_rh_status(user_id="11", stream_id="s1", matched_groups={"task_id": result["task_id"]})
+        self.assertIn("/rh状态", self.ctx.send.text.await_args.args[0])
+
     async def test_cancel_controls_bypass_collector_when_quota_exhausted(self):
         self.set_config(workflow(), access={"max_per_user_per_hour": 1})
         result = await self.p._start_workflow("draw", "", user_id="11", stream_id="s1")

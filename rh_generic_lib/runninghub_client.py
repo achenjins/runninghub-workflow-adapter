@@ -7,7 +7,7 @@
 - ``query``：查询任务状态，SUCCESS 时返回结果列表
 - ``download_base64``：下载图片并以 base64 字符串返回
 
-所有 HTTP 请求通过 ``asyncio.to_thread`` 执行，避免阻塞插件事件循环。
+所有 HTTP 请求通过 ``asyncio.to_thread`` 执行，避免阻塞插件事件循环；同一客户端复用一个 Session。
 """
 
 from __future__ import annotations
@@ -76,6 +76,8 @@ class RunningHubClient:
         self.max_wait = int(max_wait)
         self.max_file_bytes = max(1, int(max_file_bytes))
         self.query_retries = max(0, int(query_retries))
+        # 轮询、上传和下载复用同一组 TLS 连接
+        self._session = requests.Session()
 
     @staticmethod
     def _headers(api_key: str) -> dict[str, str]:
@@ -93,7 +95,7 @@ class RunningHubClient:
 
         def _do() -> dict[str, Any]:
             try:
-                response = requests.post(
+                response = self._session.post(
                     f"{self.base_url}{path}",
                     json=payload,
                     headers=self._headers(self.api_key) if use_api_key_header else {"Content-Type": "application/json"},
@@ -210,9 +212,8 @@ class RunningHubClient:
                         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
                     ),
                 }
-                response = requests.get(url, timeout=self.timeout, stream=True, headers=headers)
-                response.raise_for_status()
-                with response:
+                with self._session.get(url, timeout=self.timeout, stream=True, headers=headers) as response:
+                    response.raise_for_status()
                     chunks: list[bytes] = []
                     total = 0
                     for chunk in response.iter_content(chunk_size=1024 * 1024):
@@ -252,7 +253,7 @@ class RunningHubClient:
 
         def _do() -> dict[str, Any]:
             try:
-                response = requests.post(
+                response = self._session.post(
                     f"{self.base_url}/openapi/v2/media/upload/binary",
                     headers={"Authorization": f"Bearer {self.api_key}"},
                     files={"file": (filename, file_data)},
@@ -307,7 +308,7 @@ class RunningHubClient:
 
         def _do() -> dict[str, Any]:
             try:
-                response = requests.post(
+                response = self._session.post(
                     f"{self.base_url}/api/openapi/getJsonApiFormat",
                     json=payload,
                     headers=headers,
