@@ -97,9 +97,6 @@ class TaskJournal:
             {"status": STATUS_FAILED, "message": str(message or "")[:500]},
         )
 
-    async def mark_cancelled(self, task_id: str) -> None:
-        await self._upsert(task_id, {"status": STATUS_CANCELLED, "message": "用户取消"})
-
     def records(self) -> list[dict[str, Any]]:
         """只读快照：更新时整条记录被替换，不会原地修改，调用方也不要修改。"""
         return list(self._records)

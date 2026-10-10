@@ -72,8 +72,6 @@ from rh_generic_lib.runninghub_client import RunningHubClient, RunningHubError  
 from rh_generic_lib.session_machine import (  # noqa: E402
     InputSession,
     find_input_session,
-    latest_session_for_keys,
-    remove_session_from_indexes,
     session_key,
 )
 from rh_generic_lib.task_runtime import TaskRuntimeMixin
@@ -196,13 +194,10 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         self._pending: dict[str, asyncio.Task] = {}
         self._recall_tasks: set[asyncio.Task] = set()
         self._input_sessions: dict[str, InputSession] = {}
-        self._input_session_keys_by_stream: dict[str, set[str]] = {}
-        self._input_session_keys_by_user: dict[str, set[str]] = {}
         self._config_write_lock: asyncio.Lock = asyncio.Lock()
         self._cleanup_task: asyncio.Task | None = None
         self._cache_dir: Path | None = None
         self._workflows: list[WorkflowItemSection] = []
-        self._task_meta: dict[str, dict[str, str]] = {}
         self._cancel_choices: dict[str, tuple[float, list[str]]] = {}
         self._delivery: NapcatDelivery | None = None
         self._task_journal: TaskJournal | None = None
@@ -310,9 +305,6 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         self._pending.clear()
         self._recall_tasks.clear()
         self._input_sessions.clear()
-        self._input_session_keys_by_stream.clear()
-        self._input_session_keys_by_user.clear()
-        self._task_meta.clear()
         self._cancel_choices.clear()
         self._client = None
         self._client_cn = None
@@ -531,11 +523,6 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
     def _describe_file_inputs(self, workflow: WorkflowItemSection) -> str:
         """汇总该工作流需要用户上传的文件输入（委托 workflow_runner）。"""
         return workflow_runner.describe_file_inputs(workflow)
-
-    @staticmethod
-    def _format_file_counts(images: int, audios: int, videos: int = 0) -> str:
-        """按实际上传数量生成简短描述（0 的类别省略）。"""
-        return workflow_runner.format_file_counts(images, audios, videos)
 
     def _prompt_nodes(self, workflow: WorkflowItemSection) -> list[InputNodeSection]:
         """返回所有主提示词节点（prompt 类型，最多允许一个）。"""
@@ -842,7 +829,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         return session_key(user_id, stream_id)
 
     def _register_input_session(self, session: InputSession) -> str:
-        """把会话写入主表与 user/stream 索引，返回会话键。"""
+        """把会话写入会话表，返回会话键。"""
         key = self._session_key(session.user_id, session.stream_id)
         old_session = self._input_sessions.get(key)
         if old_session is not None and old_session is not session:
@@ -850,39 +837,15 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         # 重新插入以更新注册顺序，保证“最近会话”回退按最新触发优先
         self._input_sessions.pop(key, None)
         self._input_sessions[key] = session
-        if session.stream_id:
-            self._input_session_keys_by_stream.setdefault(session.stream_id, set()).add(key)
-        if session.user_id:
-            self._input_session_keys_by_user.setdefault(session.user_id, set()).add(key)
         return key
 
     def _remove_input_session(self, key: str) -> InputSession | None:
-        """从主表与索引中删除会话（委托 session_machine）。"""
-        session = self._input_sessions.get(key)
-        if session is None:
-            return None
-        remove_session_from_indexes(
-            session,
-            key,
-            self._input_sessions,
-            self._input_session_keys_by_stream,
-            self._input_session_keys_by_user,
-        )
-        return session
-
-    def _latest_session_for_keys(self, keys: set[str]) -> InputSession | None:
-        """从会话键集合中返回最近注册的会话（委托 session_machine）。"""
-        return latest_session_for_keys(self._input_sessions, keys)
+        """从会话表中删除会话。"""
+        return self._input_sessions.pop(key, None)
 
     def _find_input_session(self, user_id: str, stream_id: str) -> InputSession | None:
         """按 user_id + stream_id 精确查找；降级时不得跨用户取同群其他人的会话。"""
-        return find_input_session(
-            self._input_sessions,
-            self._input_session_keys_by_stream,
-            self._input_session_keys_by_user,
-            user_id,
-            stream_id,
-        )
+        return find_input_session(self._input_sessions, user_id, stream_id)
 
     async def _handle_incoming_files(self, user_id: str, stream_id: str, message: dict) -> bool:
         """处理交互式收集中的文件消息，返回是否已消费该消息。"""
@@ -960,16 +923,11 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
                 }
             )
             if file_type == "image":
-                session.uploaded_images += 1
                 await self._remember_image_usage(
                     {"media_id": "input-" + hashlib.sha256(file_data).hexdigest(), "type": "image"},
                     file_data, session.user_id, stream_id)
                 if session.cancelled or self._input_sessions.get(key) is not session:
                     return True
-            elif file_type == "audio":
-                session.uploaded_audios += 1
-            elif file_type == "video":
-                session.uploaded_videos += 1
             self.ctx.logger.info("已接收输入 %s: %s", node["label"], file_name)
 
         if session.waiting_nodes:
@@ -1117,13 +1075,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         if not result["success"]:
             await self.ctx.send.text(result["message"], stream_id)
 
-    async def _finish_input_session(
-        self,
-        user_id: str,
-        stream_id: str,
-        *,
-        skip_remaining: bool = True,
-    ) -> bool:
+    async def _finish_input_session(self, user_id: str, stream_id: str) -> bool:
         """跳过剩余文件节点，用已收集的输入直接提交；返回是否已消费该消息。"""
         session = self._find_input_session(user_id, stream_id)
         if session is None:
@@ -1309,7 +1261,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             elif session.phase == "config":
                 await self._handle_config_edit(session, stream, message)
             elif self._is_finish_signal(text):
-                await self._finish_input_session(uid, stream, skip_remaining=True)
+                await self._finish_input_session(uid, stream)
             else:
                 await self._handle_incoming_files(uid, stream, message)
         self._queue_session_action(session, consume)

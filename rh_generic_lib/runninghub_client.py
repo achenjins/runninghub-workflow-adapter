@@ -332,10 +332,8 @@ class RunningHubClient:
         prompt = data.get("prompt")
         if prompt is None:
             raise RunningHubError(f"获取工作流失败: 响应缺少 data.prompt: {json.dumps(result, ensure_ascii=False)[:500]}")
-        import json as _json
-
         try:
-            workflow = _json.loads(prompt) if isinstance(prompt, str) else prompt
+            workflow = json.loads(prompt) if isinstance(prompt, str) else prompt
         except Exception as exc:
             raise RunningHubError(f"工作流 JSON 解析失败: {exc}") from exc
         if not isinstance(workflow, dict):

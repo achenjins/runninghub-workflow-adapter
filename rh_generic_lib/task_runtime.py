@@ -84,14 +84,11 @@ class TaskRuntimeMixin:
         existing = self._pending.get(task_id)
         if existing and not existing.done():
             return
-        self._task_meta[task_id] = {"name": record["workflow"], "stream_id": record["stream_id"],
-                                    "region": record["region"], "user_id": record["user_id"]}
         task = asyncio.create_task(self._run_job(task_id))
         self._pending[task_id] = task
         def done(finished):
             if self._pending.get(task_id) is finished:
                 self._pending.pop(task_id, None)
-                self._task_meta.pop(task_id, None)
             if not finished.cancelled() and finished.exception():
                 self.ctx.logger.error("任务后台处理异常 %s: %s", task_id, type(finished.exception()).__name__)
         task.add_done_callback(done)
