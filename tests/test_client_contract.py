@@ -2,7 +2,8 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from rh_generic_lib.runninghub_client import RunningHubClient, RunningHubError, RunningHubTaskError, RunningHubTransportError
+from rh_generic_lib.runninghub_client import (
+    RunningHubBusyError, RunningHubClient, RunningHubError, RunningHubTaskError, RunningHubTransportError)
 
 # POST https://www.runninghub.cn/openapi/v2/query with an invalid key, HTTP 200 (2026-10-09).
 QUERY_806 = {"taskId": "1904152026220003329", "status": "", "errorCode": "806",
@@ -59,6 +60,23 @@ class QueryContractTests(unittest.IsolatedAsyncioTestCase):
                 patch("rh_generic_lib.runninghub_client.asyncio.sleep"):
             result = await client().wait_for_result("1")
         self.assertEqual(result["results"][0]["url"], "https://rh-images.example/out.jpg")
+
+
+class SubmitContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_capacity_codes_are_retryable(self):
+        for code, message in (("421", "TASK_QUEUE_MAXED"), ("415", "TASK_INSTANCE_MAXED"), ("1520", "Concurrency limit reached")):
+            body = {"taskId": "", "status": "", "errorCode": code, "errorMessage": message, "results": None}
+            with patch("rh_generic_lib.runninghub_client.requests.post", return_value=response(body)):
+                with self.assertRaises(RunningHubBusyError):
+                    await client().submit([])
+
+    async def test_rejections_are_not_retryable(self):
+        for code, message in (("806", "APIKEY_USER_NOT_FOUND"), ("380", "WORKFLOW_NOT_EXISTS")):
+            body = {"taskId": "", "status": "", "errorCode": code, "errorMessage": message, "results": None}
+            with patch("rh_generic_lib.runninghub_client.requests.post", return_value=response(body)):
+                with self.assertRaises(RunningHubError) as caught:
+                    await client().submit([])
+            self.assertNotIsInstance(caught.exception, (RunningHubBusyError, RunningHubTransportError))
 
 
 if __name__ == "__main__":

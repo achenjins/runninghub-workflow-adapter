@@ -8,7 +8,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 from .media_plan import PlanError, request_fingerprint, validate_parameter, validate_workflow
-from .runninghub_client import RunningHubError, RunningHubTransportError, RunningHubTaskError
+from .runninghub_client import RunningHubBusyError, RunningHubError, RunningHubTransportError, RunningHubTaskError
 from .task_journal import ACTIVE_STATUSES
 from .workflow_runner import consume_coins_from_result, resolve_value_type
 
@@ -180,18 +180,32 @@ class TaskRuntimeMixin:
                     if not await journal.update(task_id, status="submitting", submitted_at=time.time(),
                                                 message="提交 RunningHub 任务", expected_statuses={"queued"}):
                         return
-                    try:
-                        remote = await client.submit(nodes, instance_type=request["workflow"]["instance_type"],
-                                                     workflow_id=request["workflow"]["workflow_id"])
-                    except RunningHubTransportError:
-                        await journal.update(task_id, status="unknown_submission",
-                                             message="提交响应丢失，请核对 RunningHub 记录；不会自动重复提交")
-                        await self._notify_job(record, f"{task_id} 提交状态不确定，请管理员核对 RunningHub 任务记录", notify_model=True)
-                        return
-                    except RunningHubError as exc:
-                        await journal.update(task_id, status="failed", submitted_at=0, message=str(exc))
-                        await self._notify_job(record, f"{task_id} 提交被拒绝：{exc}", notify_model=True)
-                        return
+                    attempt = 0
+                    while True:
+                        try:
+                            remote = await client.submit(nodes, instance_type=request["workflow"]["instance_type"],
+                                                         workflow_id=request["workflow"]["workflow_id"])
+                            break
+                        except RunningHubBusyError as exc:
+                            if journal.get(task_id)["cancel_requested"]:
+                                await journal.update(task_id, status="cancelled", submitted_at=0, message="用户取消")
+                                return
+                            # 平台按官方说明要求自行排队：任务未创建，回到排队后重新提交
+                            await journal.update(task_id, status="queued", submitted_at=0, message=f"平台繁忙，稍后重新提交：{exc}")
+                            attempt += 1
+                            await asyncio.sleep(min(120, 30 * attempt))
+                            if not await journal.update(task_id, status="submitting", submitted_at=time.time(),
+                                                        message="提交 RunningHub 任务", expected_statuses={"queued"}):
+                                return
+                        except RunningHubTransportError:
+                            await journal.update(task_id, status="unknown_submission",
+                                                 message="提交响应丢失，请核对 RunningHub 记录；不会自动重复提交")
+                            await self._notify_job(record, f"{task_id} 提交状态不确定，请管理员核对 RunningHub 任务记录", notify_model=True)
+                            return
+                        except RunningHubError as exc:
+                            await journal.update(task_id, status="failed", submitted_at=0, message=str(exc))
+                            await self._notify_job(record, f"{task_id} 提交被拒绝：{exc}", notify_model=True)
+                            return
                     await journal.update(task_id, status="pending", remote_task_id=remote, message="")
                     record = journal.get(task_id)
                     if record.get("cancel_requested"):

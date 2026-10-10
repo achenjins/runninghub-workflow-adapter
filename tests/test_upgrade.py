@@ -16,7 +16,7 @@ from rh_generic_lib.delivery import NapcatDelivery, DeliveryUncertain
 from rh_generic_lib.file_source import extract_files_from_message, extract_bytes_from_napcat_result
 from rh_generic_lib.media_plan import bind_plan, validate_parameter, validate_workflow, PlanError
 from rh_generic_lib.media_context import assets_from_message
-from rh_generic_lib.runninghub_client import RunningHubClient, RunningHubError, RunningHubTransportError
+from rh_generic_lib.runninghub_client import RunningHubBusyError, RunningHubClient, RunningHubError, RunningHubTransportError
 from rh_generic_lib.task_journal import TaskJournal
 from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF
 
@@ -406,6 +406,21 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         await self.settled()
         self.assertEqual(self.p._task_journal.get(result["task_id"])["status"], "failed")
         self.assertEqual(self.p._task_journal.quota_used("11", time.time()), 0)
+
+    async def test_platform_capacity_requeues_and_resubmits(self):
+        self.client.submit.side_effect = [RunningHubBusyError("TASK_QUEUE_MAXED（421）"), "remote-1"]
+        real_sleep = asyncio.sleep
+        async def no_wait(delay):
+            await real_sleep(0)
+        with patch("asyncio.sleep", side_effect=no_wait) as sleep:
+            result = await self.enqueue()
+            await self.settled()
+        sleep.assert_any_call(30)
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual((record["status"], record["delivery_status"], record["remote_task_id"]), ("success", "sent", "remote-1"))
+        self.assertEqual(self.client.submit.await_count, 2)
+        sent = [call.args[0] for call in self.ctx.send.text.await_args_list]
+        self.assertFalse(any("提交被拒绝" in text for text in sent), sent)
 
     async def test_timeout_preserves_remote_job_and_resume_does_not_submit(self):
         self.client.wait_for_result.side_effect = RunningHubTransportError("offline")

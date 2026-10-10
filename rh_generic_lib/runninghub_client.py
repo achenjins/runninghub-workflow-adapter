@@ -29,6 +29,8 @@ _MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
 _BUSY_CODES = {"1003", "1005", "1010", "1011"}
 # 任务不存在或已被清理
 _TASK_GONE_CODES = {"423", "807", "1004"}
+# 提交时平台并发/机器/频率已满，任务未创建，可以排队后重新提交
+_SUBMIT_RETRY_CODES = {"415", "421", "1003", "1011", "1520"}
 
 
 class RunningHubError(RuntimeError):
@@ -37,6 +39,10 @@ class RunningHubError(RuntimeError):
 
 class RunningHubTransportError(RunningHubError):
     """The server outcome is unknown. Never automatically retry a paid POST."""
+
+
+class RunningHubBusyError(RunningHubError):
+    """The platform refused to create the task because it is at capacity; resubmitting later is safe."""
 
 
 class RunningHubTaskError(RunningHubError):
@@ -122,6 +128,7 @@ class RunningHubClient:
             str: 任务 ID。
 
         Raises:
+            RunningHubBusyError: 平台并发或限流已满，任务未创建。
             RunningHubError: 提交失败或未返回 taskId 时抛出。
         """
         target_workflow = str(workflow_id or self.workflow_id or "")
@@ -142,6 +149,8 @@ class RunningHubClient:
         task_id = result.get("taskId")
         if not task_id:
             code = str(result.get("errorCode") or result.get("code") or "")
+            if code in _SUBMIT_RETRY_CODES:
+                raise RunningHubBusyError(f"{result.get('errorMessage') or result.get('msg') or '平台繁忙'}（{code}）")
             if result.get("errorMessage") or code not in ("", "0", "200"):
                 raise RunningHubError(f"提交任务被拒绝: {result.get('errorMessage') or code}")
             raise RunningHubTransportError("提交响应缺少 taskId，无法确认是否已创建任务")
