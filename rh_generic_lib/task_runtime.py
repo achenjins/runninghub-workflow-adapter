@@ -188,7 +188,11 @@ class TaskRuntimeMixin:
                                 await journal.update(task_id, status="cancelled", submitted_at=0, message="用户取消")
                                 return
                             # 平台按官方说明要求自行排队：任务未创建，回到排队后重新提交
-                            await journal.update(task_id, status="queued", submitted_at=0, message=f"平台繁忙，稍后重新提交：{exc}")
+                            if not await journal.update(task_id, status="queued", submitted_at=0,
+                                                        message=f"平台繁忙，稍后重新提交：{exc}", expected_statuses={"submitting"}):
+                                return
+                            if not attempt:
+                                await self._notify_job(record, f"{task_id} 平台排队中，轮到后会自动提交")
                             attempt += 1
                             await asyncio.sleep(min(120, 30 * attempt))
                             if not await journal.update(task_id, status="submitting", submitted_at=time.time(),

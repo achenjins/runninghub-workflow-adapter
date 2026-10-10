@@ -364,7 +364,9 @@ class NaturalLanguageMixin:
             if record["status"] == "needs_attention":
                 if remote_id != "放弃":
                     raise PlanError("该任务已有远端编号；确认不再需要时用 /rh核对 本地任务ID 放弃")
-                await journal.update(task_id, status="failed", message="管理员已放弃跟踪，释放名额")
+                if not await journal.update(task_id, status="failed", message="管理员已放弃跟踪，释放名额",
+                                            expected_statuses={"needs_attention"}):
+                    raise PlanError("任务状态已变化，请用 /rh状态 查看")
                 message = "已放弃跟踪并释放名额；远端如已生成不会再发送"
             elif remote_id == "未创建":
                 await journal.update(task_id, status="failed", submitted_at=0, message="管理员确认远端未创建，已释放保留名额")
