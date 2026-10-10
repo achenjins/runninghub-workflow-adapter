@@ -31,6 +31,8 @@ _BUSY_CODES = {"1003", "1005", "1010", "1011"}
 _TASK_GONE_CODES = {"423", "807", "1004"}
 # 提交时平台并发/机器/频率已满，任务未创建，可以排队后重新提交
 _SUBMIT_RETRY_CODES = {"415", "421", "1003", "1011", "1520"}
+# 提交时平台内部错误：任务可能已经创建，和 HTTP 5xx 一样视为状态不确定
+_SUBMIT_UNKNOWN_CODES = {"500", "1005", "1010", "1012"}
 
 
 class RunningHubError(RuntimeError):
@@ -131,6 +133,7 @@ class RunningHubClient:
 
         Raises:
             RunningHubBusyError: 平台并发或限流已满，任务未创建。
+            RunningHubTransportError: 响应丢失或平台内部错误，无法确认任务是否创建。
             RunningHubError: 提交失败或未返回 taskId 时抛出。
         """
         target_workflow = str(workflow_id or self.workflow_id or "")
@@ -152,6 +155,8 @@ class RunningHubClient:
             code = str(result.get("errorCode") or result.get("code") or "")
             if code in _SUBMIT_RETRY_CODES:
                 raise RunningHubBusyError(f"{result.get('errorMessage') or result.get('msg') or '平台繁忙'}（{code}）")
+            if code in _SUBMIT_UNKNOWN_CODES:
+                raise RunningHubTransportError(f"提交时平台内部错误，无法确认任务是否创建（{code}）")
             if result.get("errorMessage") or code not in ("", "0", "200"):
                 raise RunningHubError(f"提交任务被拒绝: {result.get('errorMessage') or code}")
             raise RunningHubTransportError("提交响应缺少 taskId，无法确认是否已创建任务")

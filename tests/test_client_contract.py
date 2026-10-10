@@ -110,6 +110,14 @@ class SubmitContractTests(unittest.IsolatedAsyncioTestCase):
                     await client().submit([])
             self.assertNotIsInstance(caught.exception, (RunningHubBusyError, RunningHubTransportError))
 
+    async def test_server_errors_are_unknown(self):
+        # 内部错误时任务可能已创建，和 HTTP 5xx 一样按“状态不确定”处理，不能当作明确拒绝
+        for code in ("500", "1005", "1010", "1012"):
+            body = {"taskId": "", "status": "", "errorCode": code, "errorMessage": "Internal error", "results": None}
+            with patch.object(requests.Session, "post", return_value=response(body)):
+                with self.assertRaises(RunningHubTransportError):
+                    await client().submit([])
+
     async def test_unconfirmed_submission_is_unknown(self):
         with patch.object(requests.Session, "post", return_value=response({"code": 200})):
             with self.assertRaises(RunningHubTransportError):

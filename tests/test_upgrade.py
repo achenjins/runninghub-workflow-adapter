@@ -467,6 +467,19 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.client.submit.assert_awaited_once()
         self.assertEqual(self.p._task_journal.quota_used("11", time.time()), 1)
 
+    async def test_server_error_on_submit_keeps_quota_reserved(self):
+        # HTTP 200 + 1005 时任务可能已在平台创建，和 5xx 一样等管理员核对，不能退额度让用户重付一次
+        real = RunningHubClient(base_url="https://www.runninghub.cn", api_key="test-key", workflow_id="12345")
+        self.client.submit.side_effect = real.submit
+        body = {"taskId": "", "status": "", "errorCode": "1005", "errorMessage": "Internal error", "results": None}
+        reply = Mock(status_code=200)
+        reply.json.return_value = body
+        with patch.object(real._session, "post", return_value=reply):
+            result = await self.enqueue()
+            await self.settled()
+        self.assertEqual(self.p._task_journal.get(result["task_id"])["status"], "unknown_submission")
+        self.assertEqual(self.p._task_journal.quota_used("11", time.time()), 1)
+
     async def test_definite_rejection_refunds_quota(self):
         self.client.submit.side_effect = RunningHubError("rejected")
         result = await self.enqueue()
