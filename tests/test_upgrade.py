@@ -556,6 +556,16 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(schema["required"]["type"], "boolean")
         self.assertEqual(schema["choices"]["type"], "array")
 
+    async def test_config_rewrite_keeps_file_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.toml"
+            config_path.write_text("[plugin]\n", encoding="utf-8")
+            config_path.chmod(0o600)
+            with patch("plugin._PLUGIN_DIR", Path(directory)):
+                self.p._write_config_file([workflow().model_dump()])
+            self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
+            self.assertIn("12345", config_path.read_text(encoding="utf-8"))
+
     async def test_matched_groups_and_raw_command_text(self):
         await self.p.handle_pao_tu(user_id="11", stream_id="s1", raw_message="/rh运行 draw cat")
         await self.settled()

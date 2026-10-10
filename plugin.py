@@ -26,6 +26,7 @@ import hashlib
 import json
 import logging
 import re
+import shutil
 import sys
 import time
 from collections.abc import Mapping
@@ -1782,6 +1783,9 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         content = self._serialize_config_file(items)
         tmp_path.write_text(content, encoding="utf-8")
         try:
+            if config_path.exists():
+                # 文件里有 API Key，沿用管理员设置的权限
+                shutil.copymode(config_path, tmp_path)
             tmp_path.replace(config_path)
         except Exception:
             tmp_path.unlink(missing_ok=True)
