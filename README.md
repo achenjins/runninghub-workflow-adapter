@@ -301,6 +301,8 @@
 
 改设备类型：在 MaiBot 插件配置页「工作流列表」里，找到对应工作流的「设备类型」下拉改一下即可。
 
+提交走的是 RunningHub 工作流页面「API 调用」示例里的 `POST /openapi/v2/run/workflow/{工作流ID}`（官方 API 文档目录里没有单独列出这个端点）。参数按文档「发起ComfyUI任务2-高级」填写：Standard 不传 `instanceType`，使用平台默认的 24G 机器；Plus、Ultra 分别传 `plus`、`ultra`；`addMetadata` 固定为 `false`，成品图里不写入提示词等元信息。
+
 ### 4. 节点类型是什么？
 
 导入后，每个工作流会有一串「输入节点」，代表这个工作流要喂给它什么。常见几种：

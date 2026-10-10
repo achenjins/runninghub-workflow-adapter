@@ -121,7 +121,7 @@ class RunningHubClient:
         Args:
             node_info_list: 需要覆盖的节点输入列表，如
                 ``[{"nodeId": "353", "fieldName": "prompt", "fieldValue": "..."}]``。
-            instance_type: 设备类型，``Standard`` / ``Plus`` / ``Ultra``。
+            instance_type: 设备类型，``Standard``（平台默认 24G）/ ``Plus`` / ``Ultra``。
             workflow_id: 目标工作流 ID；缺省使用客户端配置的工作流。
 
         Returns:
@@ -137,12 +137,11 @@ class RunningHubClient:
         if not self.api_key:
             raise RunningHubError("未配置 api_key，请检查插件配置")
 
-        payload = {
-            "nodeInfoList": node_info_list or [],
-            # RunningHub 的 instanceType 期望小写（standard/plus/ultra）
-            "instanceType": str(instance_type or "Standard").lower(),
-            "usePersonalQueue": "false",
-        }
+        # 参数含义见官方「发起ComfyUI任务2-高级」：instanceType 不传即默认 24G，
+        # addMetadata 默认会把提示词写进图片，这里关掉。
+        payload = {"nodeInfoList": node_info_list or [], "usePersonalQueue": False, "addMetadata": False}
+        if instance_type != "Standard":
+            payload["instanceType"] = instance_type.lower()
         result = await self._post(f"/openapi/v2/run/workflow/{target_workflow}", payload)
         if not isinstance(result, dict):
             raise RunningHubTransportError("提交响应格式异常，无法确认任务是否创建")

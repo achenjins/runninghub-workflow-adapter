@@ -70,6 +70,19 @@ class SubmitContractTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(RunningHubBusyError):
                     await client().submit([])
 
+    async def test_payload_follows_documented_parameters(self):
+        accepted = {"taskId": "2009191190196789249", "status": "QUEUED", "errorCode": "", "errorMessage": ""}
+        expected = {"Standard": None, "Plus": "plus", "Ultra": "ultra"}
+        for instance_type, documented in expected.items():
+            with patch("rh_generic_lib.runninghub_client.requests.post", return_value=response(accepted)) as post:
+                task_id = await client().submit([{"nodeId": "6", "fieldName": "text", "fieldValue": "cat"}], instance_type=instance_type)
+            self.assertEqual(task_id, "2009191190196789249")
+            payload = post.call_args.kwargs["json"]
+            self.assertIs(payload["usePersonalQueue"], False)
+            self.assertIs(payload["addMetadata"], False)
+            self.assertEqual(payload.get("instanceType"), documented)
+            self.assertTrue(post.call_args.args[0].endswith("/openapi/v2/run/workflow/1"))
+
     async def test_rejections_are_not_retryable(self):
         for code, message in (("806", "APIKEY_USER_NOT_FOUND"), ("380", "WORKFLOW_NOT_EXISTS")):
             body = {"taskId": "", "status": "", "errorCode": code, "errorMessage": message, "results": None}
