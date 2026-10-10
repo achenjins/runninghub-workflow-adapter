@@ -20,6 +20,13 @@ QUERY_SUCCESS = {"taskId": "1", "status": "SUCCESS", "errorCode": "", "errorMess
                  "results": [{"url": "https://rh-images.example/out.jpg", "outputType": "jpg"}]}
 
 
+def setUpModule():
+    # 任何没被 mock 住的请求都在这里失败，保证这些用例不会真的连到平台
+    guard = patch("requests.adapters.HTTPAdapter.send", side_effect=AssertionError("unexpected network request"))
+    guard.start()
+    unittest.addModuleCleanup(guard.stop)
+
+
 def response(body, status=200):
     resp = Mock(status_code=status)
     resp.json.return_value = body

@@ -1,6 +1,7 @@
 """Offline integration tests. No network, API keys, or MaiBot deployment required."""
 import asyncio
 import base64
+import copy
 import json
 import logging
 from pathlib import Path
@@ -922,7 +923,7 @@ class PureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(journal.records(), [])
 
     async def test_large_journal_update_does_not_stall_event_loop(self):
-        # 500 records shaped like real tasks; before the fix one update took ~65 ms and records() ~27 ms.
+        # 500 records shaped like real tasks; a full deepcopy per update/records() and indented JSON stalled the loop.
         snapshot = workflow(media=True, two=True, parameter=True).model_dump()
         plan = {"prompt": "x" * 300, "references": [], "parameters": {},
                 "assets": [{"media_id": f"m-{i}", "type": "image", "description": "d" * 200,
@@ -934,16 +935,12 @@ class PureTests(unittest.IsolatedAsyncioTestCase):
                 "task_id": f"rh-{i:016x}", "status": "success", "delivery_status": "sent", "submitted_at": 1,
                 "request": {"workflow": snapshot, "nodes": [], "plan": plan},
                 "outputs": [{"url": "https://rh-images.example/" + "b" * 80 + ".png", "type": "png"}]}) for i in range(500)]
-            start = time.perf_counter()
-            for _ in range(10):
+            with patch("rh_generic_lib.task_journal.copy.deepcopy", wraps=copy.deepcopy) as deep:
                 await journal.update("rh-0000000000000000", message="stage")
-            update_ms = (time.perf_counter() - start) * 100
-            start = time.perf_counter()
-            for _ in range(10):
                 journal.records()
-            records_ms = (time.perf_counter() - start) * 100
-            self.assertLess(update_ms, 30)
-            self.assertLess(records_ms, 5)
+            copied = [c.args[0] for c in deep.call_args_list]
+            self.assertFalse(any(isinstance(value, list) and len(value) == 500 for value in copied))
+            self.assertNotIn("\n", journal.path.read_text(encoding="utf-8"))
             restored = TaskJournal(journal.path)
             await restored.load()
             self.assertEqual(restored.get("rh-0000000000000000")["message"], "stage")
