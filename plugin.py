@@ -64,8 +64,8 @@ from rh_generic_lib.file_source import (  # noqa: E402
     extract_files_from_message,
     extract_text_from_message,
     fetch_file_bytes,
-    guess_filename,
     is_finish_signal,
+    upload_filename,
 )
 from rh_generic_lib.runninghub_client import RunningHubClient, RunningHubError  # noqa: E402
 from rh_generic_lib.session_machine import (  # noqa: E402
@@ -942,7 +942,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             node = session.waiting_nodes.pop(index)
             try:
                 file_data = await self._fetch_file_bytes(source)
-                filename = self._guess_filename(source, file_type, file_data)
+                filename = upload_filename(file_type, file_data)
                 file_name = await client.upload_file(file_data, filename)
             except Exception as exc:
                 self.ctx.logger.error("上传文件到 RunningHub 失败: %s", exc)
@@ -1187,10 +1187,6 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         """从 base64 数据、URL 或本地路径获取文件字节（委托 file_source）。"""
         return await fetch_file_bytes(source, self._client)
 
-    @staticmethod
-    def _guess_filename(source: str, file_type: str, file_data: bytes | None = None) -> str:
-        """根据来源/字节猜测文件名（委托 file_source）。"""
-        return guess_filename(source, file_type, file_data)
 
 
 

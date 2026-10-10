@@ -286,6 +286,45 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         nodes = self.client.submit.await_args.args[0]
         self.assertIn({"nodeId": "2", "fieldName": "image", "fieldValue": "openapi/input.png"}, nodes)
 
+    async def test_gif_reference_is_rejected_before_upload(self):
+        self.set_config(workflow(media=True))
+        anchor = message(images=1)
+        anchor["raw_message"][-1]["binary_data_base64"] = base64.b64encode(b"GIF89a" + b"\x00" * 16).decode()
+        self.messages["m1"] = anchor
+        self.p._remember_anchor(anchor)
+        result = await self.p.handle_run_workflow("draw", "make the cat blue", user_id="11", stream_id="s1")
+        await self.settled()
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual(record["status"], "failed")
+        self.assertIn("PNG", record["message"])
+        self.client.upload_file.assert_not_awaited()
+        self.client.submit.assert_not_awaited()
+
+    async def test_qq_voice_is_fetched_as_mp3(self):
+        mp3 = b"ID3\x04" + b"\x00" * 16
+        wf = WorkflowItemSection(name="draw", workflow_id="12345", input_nodes=[
+            InputNodeSection(node_id="1", field_name="prompt", value_type="prompt"),
+            InputNodeSection(node_id="2", field_name="audio", value_type="audio", input_key="voice", required=True)])
+        self.set_config(wf)
+        anchor = message(text="用这段语音")
+        anchor["raw_message"].append({"type": "record", "data": {"file": "voice.amr"}})
+        self.messages["m1"] = anchor
+        self.p._remember_anchor(anchor)
+        default = self.ctx.api.call.return_value
+        async def napcat(api, action_name="", params=None):
+            if action_name == "get_record":
+                return {"success": True, "result": {"retcode": 0, "data": {"base64": base64.b64encode(mp3).decode()}}}
+            return default
+        self.ctx.api.call = AsyncMock(side_effect=napcat)
+        result = await self.p.handle_run_workflow("draw", "配上这段语音", use_reference=True, user_id="11", stream_id="s1")
+        self.assertTrue(result["success"], result)
+        await self.settled()
+        self.ctx.api.call.assert_any_await("adapter.napcat.action.call", action_name="get_record",
+                                           params={"file": "voice.amr", "file_id": "voice.amr", "out_format": "mp3"})
+        data, name = self.client.upload_file.await_args.args
+        self.assertEqual(data, mp3)
+        self.assertTrue(name.endswith(".mp3"), name)
+
     async def test_multireference_missing_only_then_explicit_roles(self):
         self.set_config(workflow(media=True, two=True, parameter=True))
         self.messages["m1"] = message(images=2)
@@ -735,6 +774,15 @@ class PureTests(unittest.IsolatedAsyncioTestCase):
         msg = {"message_id": "e1", "raw_message": [{"type": "emoji", "data": {"url": "https://gchat.qpic.cn/emoji/x.gif"}}]}
         assets = assets_from_message(msg, "s1", "current", group_id="22")
         self.assertEqual([(a["type"], a.get("group_id")) for a in assets], [("image", "22")])
+
+    async def test_upload_name_follows_content_and_rejects_unsupported_formats(self):
+        from rh_generic_lib.file_source import upload_filename
+        self.assertTrue(upload_filename("image", PNG).endswith(".png"))
+        self.assertTrue(upload_filename("audio", b"\xff\xfb\x90\x00").endswith(".mp3"))
+        self.assertTrue(upload_filename("video", b"\x00\x00\x00\x18ftypmp42").endswith(".mp4"))
+        for file_type, data in (("audio", b"\x02#!SILK_V3"), ("audio", b"#!AMR\n"), ("image", b"GIF89a")):
+            with self.assertRaises(RunningHubError):
+                upload_filename(file_type, data)
 
     async def test_video_and_unknown_file_segments(self):
         files = extract_files_from_message({"message": [{"type": "video", "data": {"file": "https://example.test/clip.mp4"}}, {"type": "file", "data": {"name": "x.zip", "url": "https://example.test/x.zip"}}]})

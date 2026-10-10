@@ -350,8 +350,12 @@ class MediaContextMixin:
         file_id = asset.get("file_id")
         if file_id and not file_id.startswith(("http://", "https://", "base64://")):
             try:
-                action = "get_image" if asset["type"] == "image" else "get_file"
-                result = await self.ctx.api.call("adapter.napcat.action.call", action_name=action, params={"file": file_id, "file_id": file_id})
+                # QQ 语音原始文件是 silk；NapCat 的 get_record 可以直接转出 mp3。
+                action = {"image": "get_image", "audio": "get_record"}.get(asset["type"], "get_file")
+                params = {"file": file_id, "file_id": file_id}
+                if action == "get_record":
+                    params["out_format"] = "mp3"
+                result = await self.ctx.api.call("adapter.napcat.action.call", action_name=action, params=params)
                 data = await extract_bytes_from_napcat_result(result, client)
                 if data:
                     return data

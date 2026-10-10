@@ -442,7 +442,7 @@
 
 - `workflow_runner.py`：节点类型解析、nodeInfoList 构建、结果 URL 分类、消耗解析
 - `session_machine.py`：交互式收集会话数据结构与查找规则
-- `file_source.py`：消息文件提取、base64 / URL / 本地路径读取
+- `file_source.py`：消息文件提取、base64 / URL / 本地路径读取；上传前按文件内容检查格式，只放行 RunningHub 支持的 JPG/PNG/WEBP、MP3/WAV/FLAC、MP4/AVI/MOV/MKV，GIF 和 QQ 原始语音（silk/amr）会提示用户换格式
 - `delivery.py`：NapCat 直发、回退发送、定时撤回
 - `task_journal.py`：任务日志持久化
 - `task_runtime.py` / `task_queue.py`：持久化排队、额度预约、并发限制、恢复与补发
