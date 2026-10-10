@@ -494,7 +494,9 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(real._session, "post", return_value=reply):
             result = await self.enqueue()
             await self.settled()
-        self.assertEqual(self.p._task_journal.get(result["task_id"])["status"], "unknown_submission")
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual(record["status"], "unknown_submission")
+        self.assertIn("1005", record["message"])
         self.assertEqual(self.p._task_journal.quota_used("11", time.time()), 1)
 
     async def test_definite_rejection_refunds_quota(self):

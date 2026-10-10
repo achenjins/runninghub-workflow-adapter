@@ -198,9 +198,9 @@ class TaskRuntimeMixin:
                             if not await journal.update(task_id, status="submitting", submitted_at=time.time(),
                                                         message="提交 RunningHub 任务", expected_statuses={"queued"}):
                                 return
-                        except RunningHubTransportError:
+                        except RunningHubTransportError as exc:
                             await journal.update(task_id, status="unknown_submission",
-                                                 message="提交响应丢失，请核对 RunningHub 记录；不会自动重复提交")
+                                                 message=f"提交响应丢失：{exc}；请核对 RunningHub 记录，不会自动重复提交")
                             await self._notify_job(record, f"{task_id} 提交状态不确定，请管理员核对 RunningHub 任务记录", notify_model=True)
                             return
                         except RunningHubError as exc:
