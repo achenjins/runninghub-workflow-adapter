@@ -306,6 +306,9 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         self._recall_tasks.clear()
         self._input_sessions.clear()
         self._cancel_choices.clear()
+        for client in (self._client, self._client_cn):
+            if client is not None:
+                client.close()
         self._client = None
         self._client_cn = None
         self.ctx.logger.info("麦麦画师插件已卸载")
@@ -406,6 +409,9 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             "max_file_bytes": cfg.generation.max_file_mb * 1024 * 1024,
             "query_retries": cfg.generation.query_retries,
         }
+        for old in (self._client, self._client_cn):
+            if old is not None:
+                old.close()
         self._client = RunningHubClient(
             base_url=cfg.server.base_url, api_key=cfg.server.api_key, **kwargs
         )
@@ -1140,12 +1146,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         """从 base64 数据、URL 或本地路径获取文件字节（委托 file_source）。"""
         return await fetch_file_bytes(source, self._client)
 
-
-
-
-
     # ── 轮询发送 / 撤回 ──────────────────────────────────────────
-
 
     async def _trigger_llm_result_reply(self, stream_id: str, *, status_message: str = "") -> bool | None:
         """返回 True=已接受、False=明确不可用、None=响应未知，不重复触发。"""

@@ -81,6 +81,9 @@ class RunningHubClient:
         # 轮询、上传和下载复用同一组 TLS 连接
         self._session = requests.Session()
 
+    def close(self) -> None:
+        self._session.close()
+
     @staticmethod
     def _headers(api_key: str) -> dict[str, str]:
         return {

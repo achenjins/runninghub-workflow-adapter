@@ -68,7 +68,8 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             submit=AsyncMock(return_value="remote-1"),
             wait_for_result=AsyncMock(return_value={"status": "SUCCESS", "results": [{"url": "https://example.test/out.png", "outputType": "image"}], "usage": {"consumeCoins": 2}}),
             upload_file=AsyncMock(return_value="openapi/input.png"), download_bytes=AsyncMock(return_value=PNG),
-            download_base64=AsyncMock(return_value=base64.b64encode(PNG).decode()), cancel=AsyncMock(return_value={"code": 0}))
+            download_base64=AsyncMock(return_value=base64.b64encode(PNG).decode()), cancel=AsyncMock(return_value={"code": 0}),
+            close=Mock())
         self.p._client = self.p._client_cn = self.client
         self.p._task_journal = TaskJournal(Path(self.tmp.name) / "tasks.json")
         self.p._trigger_llm_result_reply = AsyncMock(return_value=True)

@@ -248,10 +248,10 @@ class TaskRuntimeMixin:
                         # 查询被服务端明确拒绝（如 Key 失效/无权限）：与瞬断不同，无限轮询只会占死并发槽；
                         # 保留远端编号与名额，转需人工恢复状态并让出工作槽
                         if not await journal.update(task_id, status="needs_attention",
-                                message=f"查询被拒绝：{str(exc)[:200]}；修复 API Key 后用 /rh状态 恢复，或 /rh中断 取消",
+                                message=f"查询被拒绝：{str(exc)[:200]}；排查原因后用 /rh状态 恢复，或 /rh中断 取消",
                                 expected_statuses={"pending", "tracking_paused", "needs_attention"}):
                             return
-                        await self._notify_job(record, f"{task_id} 查询被服务端拒绝（常见于 API Key 失效），已停止自动轮询；修复配置后发 /rh状态 {task_id} 恢复", notify_model=True)
+                        await self._notify_job(record, f"{task_id} 查询被服务端拒绝（{str(exc)[:200]}），已停止自动轮询；排查原因后发 /rh状态 {task_id} 恢复", notify_model=True)
                         return
                     outputs = []
                     for item in result.get("results") or []:
