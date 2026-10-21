@@ -1,6 +1,7 @@
 """Offline integration tests. No network, API keys, or MaiBot deployment required."""
 import asyncio
 import base64
+import copy
 import json
 import logging
 from pathlib import Path
@@ -16,7 +17,7 @@ from rh_generic_lib.delivery import NapcatDelivery, DeliveryUncertain
 from rh_generic_lib.file_source import extract_files_from_message, extract_bytes_from_napcat_result
 from rh_generic_lib.media_plan import bind_plan, validate_parameter, validate_workflow, PlanError
 from rh_generic_lib.media_context import assets_from_message
-from rh_generic_lib.runninghub_client import RunningHubClient, RunningHubError, RunningHubTransportError
+from rh_generic_lib.runninghub_client import RunningHubBusyError, RunningHubClient, RunningHubError, RunningHubTransportError
 from rh_generic_lib.task_journal import TaskJournal
 from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF
 
@@ -67,7 +68,8 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             submit=AsyncMock(return_value="remote-1"),
             wait_for_result=AsyncMock(return_value={"status": "SUCCESS", "results": [{"url": "https://example.test/out.png", "outputType": "image"}], "usage": {"consumeCoins": 2}}),
             upload_file=AsyncMock(return_value="openapi/input.png"), download_bytes=AsyncMock(return_value=PNG),
-            download_base64=AsyncMock(return_value=base64.b64encode(PNG).decode()), cancel=AsyncMock(return_value={"code": 0}))
+            download_base64=AsyncMock(return_value=base64.b64encode(PNG).decode()), cancel=AsyncMock(return_value={"code": 0}),
+            close=Mock())
         self.p._client = self.p._client_cn = self.client
         self.p._task_journal = TaskJournal(Path(self.tmp.name) / "tasks.json")
         self.p._trigger_llm_result_reply = AsyncMock(return_value=True)
@@ -108,7 +110,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_identity_and_cross_context_fail(self):
         # 完全未知身份（无 user_id、钩子也没记录过该会话）时保持 fail-closed
-        self.p._stream_last_sender.pop("s1", None)
+        self.p._stream_senders.pop("s1", None)
         self.assertFalse((await self.p.handle_run_workflow("draw", "cat", stream_id="s1"))["success"])
         ctx = await self.p.handle_rh_context(user_id="11", stream_id="s1")
         bad = await self.p.handle_run_workflow("draw", "cat", context_id=ctx["context_id"], user_id="66", stream_id="s1")
@@ -126,14 +128,49 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((record["status"], record["delivery_status"]), ("success", "sent"))
         self.client.submit.assert_awaited_once()
         # 超时限的发言人记录不得冒用（后台主动回复等无新消息场景保持 fail-closed）
-        self.p._stream_last_sender["s1"] = ("11", time.time() - 400)
+        self.p._stream_senders["s1"] = {"11": time.time() - 400}
         stale = await self.p.handle_run_workflow("draw", "another cat", chat_id="s1", group_id="22")
         self.assertFalse(stale["success"])
         self.client.submit.assert_awaited_once()
 
+    async def test_group_tool_identity_ignores_earlier_speakers(self):
+        # 别人几分钟前说过话，不影响当前发言人用自然语言提交
+        self.p._stream_senders["s1"]["77"] = time.time() - 200
+        result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
+        self.assertTrue(result["success"], result.get("message"))
+        await self.settled()
+        self.assertEqual(self.p._task_journal.get(result["task_id"])["user_id"], "11")
+        self.client.submit.assert_awaited_once()
+
+    async def test_group_tool_identity_rejects_later_speaker_during_slow_turn(self):
+        # 宿主一轮处理可能超过一次模型调用的超时；请求人 60 秒前发言、别人 10 秒前插话时不能记到后者头上
+        now = time.time()
+        for mid, uid, text, age in (("a1", "11", "帮我画一只猫", 60), ("b1", "77", "哈哈", 10)):
+            self.messages[mid] = message(mid=mid, uid=uid, text=text)
+            with patch("rh_generic_lib.media_context.time.time", return_value=now - age):
+                self.p._remember_anchor(self.messages[mid])
+        self.recent = [self.messages["a1"], self.messages["b1"]]
+        result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
+        await self.settled()
+        self.assertFalse(result["success"])
+        self.assertIn("多人发言", result["message"])
+        self.assertEqual(self.p._task_journal.records(), [])
+        self.client.submit.assert_not_awaited()
+
+    async def test_group_tool_identity_fails_closed_when_speakers_interleave(self):
+        self.set_config(workflow(), access={"allow_users": ["77"]})
+        self.p._remember_anchor(message(mid="a1", uid="11", text="帮我画一只猫"))
+        self.p._remember_anchor(message(mid="b1", uid="77", text="哈哈"))
+        result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
+        await self.settled()
+        self.assertFalse(result["success"])
+        self.assertIn("/rh运行", result["message"])
+        self.assertEqual(self.p._task_journal.records(), [])
+        self.client.submit.assert_not_awaited()
+
     async def test_definite_query_error_pauses_for_manual_recovery(self):
         # 查询被拒绝时停止自动轮询，保留远端任务；修复后恢复且不重复提交。
-        self.client.wait_for_result.side_effect = RunningHubError("请求被拒绝（HTTP 401）")
+        self.client.wait_for_result.side_effect = RunningHubError("APIKEY_USER_NOT_FOUND（806）")
         result = await self.enqueue()
         for _ in range(50):
             if self.p._task_journal.get(result["task_id"])["status"] == "needs_attention":
@@ -152,13 +189,13 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_refused_by_dead_key_preserves_remote_task(self):
         # 取消被拒不能当作远端已停止；保留任务，恢复凭据后继续查询。
-        self.client.wait_for_result.side_effect = RunningHubError("请求被拒绝（HTTP 401）")
+        self.client.wait_for_result.side_effect = RunningHubError("APIKEY_USER_NOT_FOUND（806）")
         result = await self.enqueue()
         for _ in range(50):
             if self.p._task_journal.get(result["task_id"])["status"] == "needs_attention":
                 break
             await asyncio.sleep(0.005)
-        self.client.cancel.side_effect = RunningHubError("请求被拒绝（HTTP 401）")
+        self.client.cancel.return_value = {"code": 806, "msg": "APIKEY_USER_NOT_FOUND"}
         await self.p._cancel_task(result["task_id"], "s1")
         record = self.p._task_journal.get(result["task_id"])
         self.assertEqual(record["status"], "needs_attention")
@@ -169,6 +206,41 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         await self.settled()
         self.client.submit.assert_awaited_once()
         self.assertEqual(self.p._task_journal.get(result["task_id"])["delivery_status"], "sent")
+
+    async def test_admin_abandons_needs_attention_and_queue_moves(self):
+        self.set_config(workflow(), access={"admin_users": ["11"]})
+        self.client.wait_for_result.side_effect = RunningHubError("APIKEY_USER_NOT_FOUND（806）")
+        first = await self.enqueue()
+        await self.settled()
+        self.assertEqual(self.p._task_journal.get(first["task_id"])["status"], "needs_attention")
+        self.client.cancel.return_value = {"code": 807, "msg": "APIKEY_TASK_NOT_FOUND"}
+        await self.p._cancel_task(first["task_id"], "s1", announce=False)
+        self.client.wait_for_result.side_effect = None
+        second = await self.enqueue(anchor_id="m2")
+        await asyncio.sleep(0.02)
+        self.assertEqual(self.p._task_journal.get(second["task_id"])["status"], "queued")
+        await self.p.handle_rh_reconcile(user_id="11", stream_id="s1", matched_groups={"task_id": first["task_id"], "remote_id": "放弃"})
+        await self.settled()
+        self.assertEqual(self.p._task_journal.get(first["task_id"])["status"], "failed")
+        self.assertEqual(self.p._task_journal.get(second["task_id"])["status"], "success")
+        self.assertEqual(self.client.submit.await_count, 2)
+
+    async def test_refused_cancel_keeps_polling_and_delivers_result(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        done = self.client.wait_for_result.return_value
+        async def polling(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return done
+        self.client.wait_for_result.side_effect = polling
+        result = await self.enqueue()
+        await asyncio.wait_for(entered.wait(), .5)
+        self.client.cancel.return_value = {"code": 805, "msg": "APIKEY_TASK_STATUS_ERROR"}
+        await self.p._cancel_task(result["task_id"], "s1", announce=False)
+        release.set()
+        await self.settled()
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual((record["status"], record["delivery_status"]), ("success", "sent"))
 
     async def test_avatar_asset_binds_via_adapter_then_cdn_fallback(self):
         # 「画我」：头像候选由宿主可信 uid/群号生成，绑定后现场解析字节并上传
@@ -239,6 +311,64 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.upload_file.await_args.args[0], PNG)
         nodes = self.client.submit.await_args.args[0]
         self.assertIn({"nodeId": "2", "fieldName": "image", "fieldValue": "openapi/input.png"}, nodes)
+
+    async def test_gif_reference_is_rejected_before_upload(self):
+        self.set_config(workflow(media=True))
+        anchor = message(images=1)
+        anchor["raw_message"][-1]["binary_data_base64"] = base64.b64encode(b"GIF89a" + b"\x00" * 16).decode()
+        self.messages["m1"] = anchor
+        self.p._remember_anchor(anchor)
+        result = await self.p.handle_run_workflow("draw", "make the cat blue", user_id="11", stream_id="s1")
+        await self.settled()
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual(record["status"], "failed")
+        self.assertIn("PNG", record["message"])
+        self.client.upload_file.assert_not_awaited()
+        self.client.submit.assert_not_awaited()
+
+    def voice_setup(self):
+        mp3 = b"ID3\x04" + b"\x00" * 16
+        wf = WorkflowItemSection(name="draw", workflow_id="12345", input_nodes=[
+            InputNodeSection(node_id="1", field_name="prompt", value_type="prompt"),
+            InputNodeSection(node_id="2", field_name="audio", value_type="audio", input_key="voice", required=True)])
+        self.set_config(wf)
+        # NapCat 的 record 段带 url，指向原始 silk
+        self.client.download_bytes.return_value = b"\x02#!SILK_V3" + b"\x00" * 16
+        default = self.ctx.api.call.return_value
+        async def napcat(api, action_name="", params=None):
+            if action_name == "get_record":
+                return {"success": True, "result": {"retcode": 0, "data": {"base64": base64.b64encode(mp3).decode()}}}
+            return default
+        self.ctx.api.call = AsyncMock(side_effect=napcat)
+        return mp3, {"type": "record", "data": {"file": "voice.amr", "url": "https://multimedia.nt.qq.com.cn/download?fileid=voice"}}
+
+    def assert_uploaded_mp3(self, mp3):
+        self.ctx.api.call.assert_any_await("adapter.napcat.action.call", action_name="get_record",
+                                           params={"file": "voice.amr", "file_id": "voice.amr", "out_format": "mp3"})
+        data, name = self.client.upload_file.await_args.args
+        self.assertEqual(data, mp3)
+        self.assertTrue(name.endswith(".mp3"), name)
+
+    async def test_qq_voice_is_fetched_as_mp3(self):
+        mp3, record = self.voice_setup()
+        anchor = message(text="用这段语音")
+        anchor["raw_message"].append(record)
+        self.messages["m1"] = anchor
+        self.p._remember_anchor(anchor)
+        result = await self.p.handle_run_workflow("draw", "配上这段语音", use_reference=True, user_id="11", stream_id="s1")
+        self.assertTrue(result["success"], result)
+        await self.settled()
+        self.assert_uploaded_mp3(mp3)
+
+    async def test_qq_voice_in_command_collection_is_fetched_as_mp3(self):
+        mp3, record = self.voice_setup()
+        await self.p.handle_pao_tu(user_id="11", stream_id="s1", raw_message="/rh运行 draw 配音")
+        voice = message(mid="v1", text="")
+        voice["raw_message"] = [record]
+        self.messages["v1"] = voice
+        await self.p._handle_incoming_files("11", "s1", voice)
+        await self.settled()
+        self.assert_uploaded_mp3(mp3)
 
     async def test_multireference_missing_only_then_explicit_roles(self):
         self.set_config(workflow(media=True, two=True, parameter=True))
@@ -354,12 +484,44 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.client.submit.assert_awaited_once()
         self.assertEqual(self.p._task_journal.quota_used("11", time.time()), 1)
 
+    async def test_server_error_on_submit_keeps_quota_reserved(self):
+        # HTTP 200 + 1005 时任务可能已在平台创建，和 5xx 一样等管理员核对，不能退额度让用户重付一次
+        real = RunningHubClient(base_url="https://www.runninghub.cn", api_key="test-key", workflow_id="12345")
+        self.client.submit.side_effect = real.submit
+        body = {"taskId": "", "status": "", "errorCode": "1005", "errorMessage": "Internal error", "results": None}
+        reply = Mock(status_code=200)
+        reply.json.return_value = body
+        with patch.object(real._session, "post", return_value=reply):
+            result = await self.enqueue()
+            await self.settled()
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual(record["status"], "unknown_submission")
+        self.assertIn("1005", record["message"])
+        self.assertEqual(self.p._task_journal.quota_used("11", time.time()), 1)
+
     async def test_definite_rejection_refunds_quota(self):
         self.client.submit.side_effect = RunningHubError("rejected")
         result = await self.enqueue()
         await self.settled()
         self.assertEqual(self.p._task_journal.get(result["task_id"])["status"], "failed")
         self.assertEqual(self.p._task_journal.quota_used("11", time.time()), 0)
+
+    async def test_platform_capacity_requeues_and_resubmits(self):
+        busy = RunningHubBusyError("TASK_QUEUE_MAXED（421）")
+        self.client.submit.side_effect = [busy, busy, "remote-1"]
+        real_sleep = asyncio.sleep
+        async def no_wait(delay):
+            await real_sleep(0)
+        with patch("asyncio.sleep", side_effect=no_wait) as sleep:
+            result = await self.enqueue()
+            await self.settled()
+        sleep.assert_any_call(30)
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual((record["status"], record["delivery_status"], record["remote_task_id"]), ("success", "sent", "remote-1"))
+        self.assertEqual(self.client.submit.await_count, 3)
+        sent = [call.args[0] for call in self.ctx.send.text.await_args_list]
+        self.assertFalse(any("提交被拒绝" in text for text in sent), sent)
+        self.assertEqual(sum("排队" in text for text in sent), 1, sent)
 
     async def test_timeout_preserves_remote_job_and_resume_does_not_submit(self):
         self.client.wait_for_result.side_effect = RunningHubTransportError("offline")
@@ -380,6 +542,16 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.client.submit.assert_awaited_once()
         self.assertEqual(self.p._task_journal.get(result["task_id"])["delivery_status"], "sent")
 
+    async def test_slow_task_timeout_keeps_polling_without_outage_notice(self):
+        self.client.wait_for_result.side_effect = [TimeoutError("slow"), self.client.wait_for_result.return_value]
+        result = await self.enqueue()
+        await self.settled()
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual((record["status"], record["delivery_status"]), ("success", "sent"))
+        self.assertEqual(self.client.wait_for_result.await_count, 2)
+        sent = [call.args[0] for call in self.ctx.send.text.await_args_list]
+        self.assertFalse(any("查询暂不可用" in text for text in sent), sent)
+
     async def test_partial_delivery_retry_sends_only_unsent(self):
         self.client.wait_for_result.return_value["results"].append({"url": "https://example.test/out2.png", "outputType": "image"})
         self.p._send_image_with_id = AsyncMock(side_effect=["1", DeliveryUncertain("timeout")])
@@ -396,6 +568,18 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.p._send_image_with_id.await_count, 3)
         self.client.submit.assert_awaited_once()
         self.assertEqual(self.p._task_journal.get(result["task_id"])["delivery_status"], "sent")
+
+    async def test_task_tool_returns_status_without_internal_message(self):
+        self.client.wait_for_result.side_effect = RunningHubError("APIKEY_USER_NOT_FOUND（806）")
+        result = await self.enqueue()
+        await self.settled()
+        reply = await self.p.handle_rh_task("status", result["task_id"], user_id="11", stream_id="s1")
+        self.assertEqual(reply["tasks"], [{"task_id": result["task_id"], "workflow": "draw",
+                                           "status": "needs_attention", "delivery_status": ""}])
+        self.assertNotIn("API Key", reply["content"])
+        self.ctx.send.text.reset_mock()
+        await self.p.handle_rh_status(user_id="11", stream_id="s1", matched_groups={"task_id": result["task_id"]})
+        self.assertIn("/rh状态", self.ctx.send.text.await_args.args[0])
 
     async def test_cancel_controls_bypass_collector_when_quota_exhausted(self):
         self.set_config(workflow(), access={"max_per_user_per_hour": 1})
@@ -445,6 +629,16 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         schema = self.p._build_input_node_item_fields()
         self.assertEqual(schema["required"]["type"], "boolean")
         self.assertEqual(schema["choices"]["type"], "array")
+
+    async def test_config_rewrite_keeps_file_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.toml"
+            config_path.write_text("[plugin]\n", encoding="utf-8")
+            config_path.chmod(0o600)
+            with patch("plugin._PLUGIN_DIR", Path(directory)):
+                self.p._write_config_file([workflow().model_dump()])
+            self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
+            self.assertIn("12345", config_path.read_text(encoding="utf-8"))
 
     async def test_matched_groups_and_raw_command_text(self):
         await self.p.handle_pao_tu(user_id="11", stream_id="s1", raw_message="/rh运行 draw cat")
@@ -665,6 +859,15 @@ class PureTests(unittest.IsolatedAsyncioTestCase):
         assets = assets_from_message(msg, "s1", "current", group_id="22")
         self.assertEqual([(a["type"], a.get("group_id")) for a in assets], [("image", "22")])
 
+    async def test_upload_name_follows_content_and_rejects_unsupported_formats(self):
+        from rh_generic_lib.file_source import upload_filename
+        self.assertTrue(upload_filename("image", PNG).endswith(".png"))
+        self.assertTrue(upload_filename("audio", b"\xff\xfb\x90\x00").endswith(".mp3"))
+        self.assertTrue(upload_filename("video", b"\x00\x00\x00\x18ftypmp42").endswith(".mp4"))
+        for file_type, data in (("audio", b"\x02#!SILK_V3"), ("audio", b"#!AMR\n"), ("image", b"GIF89a")):
+            with self.assertRaises(RunningHubError):
+                upload_filename(file_type, data)
+
     async def test_video_and_unknown_file_segments(self):
         files = extract_files_from_message({"message": [{"type": "video", "data": {"file": "https://example.test/clip.mp4"}}, {"type": "file", "data": {"name": "x.zip", "url": "https://example.test/x.zip"}}]})
         self.assertEqual(files, [("video", "https://example.test/clip.mp4")])
@@ -736,6 +939,29 @@ class PureTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(OSError):
                     await journal.update("rh-a", status="queued", submitted_at=0)
             self.assertEqual(journal.records(), [])
+
+    async def test_large_journal_update_does_not_stall_event_loop(self):
+        # 500 records shaped like real tasks; a full deepcopy per update/records() and indented JSON stalled the loop.
+        snapshot = workflow(media=True, two=True, parameter=True).model_dump()
+        plan = {"prompt": "x" * 300, "references": [], "parameters": {},
+                "assets": [{"media_id": f"m-{i}", "type": "image", "description": "d" * 200,
+                            "source": "https://multimedia.nt.qq.com.cn/download?fileid=" + "a" * 200} for i in range(3)]}
+        with tempfile.TemporaryDirectory() as directory:
+            journal = TaskJournal(Path(directory) / "journal.json")
+            await journal.load()
+            journal._records = [journal._normalize_record({
+                "task_id": f"rh-{i:016x}", "status": "success", "delivery_status": "sent", "submitted_at": 1,
+                "request": {"workflow": snapshot, "nodes": [], "plan": plan},
+                "outputs": [{"url": "https://rh-images.example/" + "b" * 80 + ".png", "type": "png"}]}) for i in range(500)]
+            with patch("rh_generic_lib.task_journal.copy.deepcopy", wraps=copy.deepcopy) as deep:
+                await journal.update("rh-0000000000000000", message="stage")
+                journal.records()
+            copied = [c.args[0] for c in deep.call_args_list]
+            self.assertFalse(any(isinstance(value, list) and len(value) == 500 for value in copied))
+            self.assertNotIn("\n", journal.path.read_text(encoding="utf-8"))
+            restored = TaskJournal(journal.path)
+            await restored.load()
+            self.assertEqual(restored.get("rh-0000000000000000")["message"], "stage")
 
     async def test_restart_does_not_resend_inflight_delivery(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -11,7 +11,7 @@ import time
 from maibot_sdk import Command, Tool
 from maibot_sdk.types import ToolParameterInfo as Param, ToolParamType as Type
 
-from .file_source import guess_filename
+from .file_source import upload_filename
 from .image_memory import short_description
 from .media_plan import PlanError, bind_plan, workflow_card, parse_json_object
 from .workflow_runner import resolve_value_type
@@ -284,7 +284,7 @@ class NaturalLanguageMixin:
                 await self._remember_image_usage(item["asset"], data, record["user_id"], record["stream_id"], description=description)
             summaries.append(summary)
             await self._task_journal.update(record["task_id"], message=f"上传参考素材「{item['role']}」到 RunningHub")
-            name = await client.upload_file(data, guess_filename(item["asset"].get("source", ""), item["asset"]["type"], data))
+            name = await client.upload_file(data, upload_filename(item["asset"]["type"], data))
             nodes.append({"nodeId": item["node_id"], "fieldName": item["field_name"], "fieldValue": name})
         await self._task_journal.update(record["task_id"], message="整理生成提示词")
         prompt = await self._enhance_text(workflow, plan["prompt"], actual_file_desc="\n".join(summaries))
@@ -322,7 +322,7 @@ class NaturalLanguageMixin:
             else:
                 raise PlanError("未知操作")
             records = [latest for latest in (journal.get(r["task_id"]) for r in records) if latest]
-            payload = {"success": True, "tasks": [{k: r[k] for k in ("task_id", "workflow", "status", "delivery_status", "message")} for r in records[:10]],
+            payload = {"success": True, "tasks": [{k: r[k] for k in ("task_id", "workflow", "status", "delivery_status")} for r in records[:10]],
                        "next_action": "用当前聊天语气简短说明，不报编号、不轮询。"}
             if message:
                 payload["message"] = message
@@ -334,7 +334,8 @@ class NaturalLanguageMixin:
     async def handle_rh_status(self, task_id="", **kwargs):
         task_id = task_id or str((kwargs.get("matched_groups") or {}).get("task_id") or "")
         result = await self.handle_rh_task(task_id=task_id, **kwargs)
-        tasks = result.get("tasks", [])
+        # 详细说明只给命令用户看，工具返回给模型的只有状态。
+        tasks = [self._task_journal.get(r["task_id"]) for r in result.get("tasks", [])]
         text = "\n".join(f"{r['task_id']} {r['workflow']}：{r['status']} / 发送 {r['delivery_status'] or '-'} {r['message']}" for r in tasks)
         await self.ctx.send.text(text or result.get("message", "暂无任务"), str(kwargs.get("stream_id") or kwargs.get("chat_id") or ""))
         return True, "", 1
@@ -346,7 +347,7 @@ class NaturalLanguageMixin:
         await self.ctx.send.text(result["message"], str(kwargs.get("stream_id") or kwargs.get("chat_id") or ""))
         return True, "", 1
 
-    @Command("rh核对", description="管理员核对不确定提交：填写远端任务编号，或确认未创建后释放保留名额", pattern=r"^/rh核对\s+(?P<task_id>\S+)\s+(?P<remote_id>\S+)\s*$")
+    @Command("rh核对", description="管理员核对不确定提交或需处理的任务：关联远端编号、确认未创建或放弃跟踪以释放名额", pattern=r"^/rh核对\s+(?P<task_id>\S+)\s+(?P<remote_id>\S+)\s*$")
     async def handle_rh_reconcile(self, **kwargs):
         try:
             uid, stream = self._trusted_scope(kwargs)
@@ -355,12 +356,19 @@ class NaturalLanguageMixin:
             matched = kwargs.get("matched_groups") or {}
             task_id, remote_id = str(matched.get("task_id") or ""), str(matched.get("remote_id") or "")
             if not task_id or not remote_id:
-                raise PlanError("用法：/rh核对 本地任务ID 远端任务ID（确认远端未创建时，最后一项填写 未创建）")
+                raise PlanError("用法：/rh核对 本地任务ID 远端任务ID|未创建|放弃")
             journal = await self._load_task_journal()
             record = journal.get(task_id)
-            if not record or record["stream_id"] != stream or record["status"] != "unknown_submission":
-                raise PlanError("只能核对当前会话中提交状态不确定的任务")
-            if remote_id == "未创建":
+            if not record or record["stream_id"] != stream or record["status"] not in {"unknown_submission", "needs_attention"}:
+                raise PlanError("只能核对当前会话中提交状态不确定或需要处理的任务")
+            if record["status"] == "needs_attention":
+                if remote_id != "放弃":
+                    raise PlanError("该任务已有远端编号；确认不再需要时用 /rh核对 本地任务ID 放弃")
+                if not await journal.update(task_id, status="failed", message="管理员已放弃跟踪，释放名额",
+                                            expected_statuses={"needs_attention"}):
+                    raise PlanError("任务状态已变化，请用 /rh状态 查看")
+                message = "已放弃跟踪并释放名额；远端如已生成不会再发送"
+            elif remote_id == "未创建":
                 await journal.update(task_id, status="failed", submitted_at=0, message="管理员确认远端未创建，已释放保留名额")
                 message = "已释放名额；没有重新生成"
             else:

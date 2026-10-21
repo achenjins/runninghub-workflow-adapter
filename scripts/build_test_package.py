@@ -1,6 +1,7 @@
 """Build an allowlisted deployment archive without local configuration or runtime data."""
 from pathlib import Path
 import hashlib
+import json
 import zipfile
 
 
@@ -11,7 +12,8 @@ def main():
                              "docs": ["*.md", "*.png", "*.jpg"], "examples": ["*.toml"], "tests": ["*.py"], "scripts": ["build_test_package.py"]}.items():
         for pattern in patterns:
             paths.extend((root / folder).rglob(pattern))
-    output = root / "dist" / "runninghub-workflow-adapter-1.2.0-test.zip"
+    version = json.loads((root / "_manifest.json").read_text(encoding="utf-8"))["version"]
+    output = root / "dist" / f"runninghub-workflow-adapter-{version}.zip"
     output.parent.mkdir(exist_ok=True)
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(set(paths)):

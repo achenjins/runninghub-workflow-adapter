@@ -211,23 +211,45 @@ async def fetch_file_bytes(source: str, client: Any) -> bytes:
     raise RunningHubError("无法读取文件：本地路径仅限适配器缓存/系统临时目录，其他内容请通过 URL 或重发消息提供")
 
 
-def guess_filename(source: str, file_type: str, file_data: bytes | None = None) -> str:
-    """根据来源/字节猜测文件名（含扩展名，图片按魔数识别真实格式）。"""
-    base = source.split("?", 1)[0].rsplit("/", 1)[-1]
-    if base and "." in base and not base.startswith("base64:"):
-        return base
-    ext = ""
-    if file_type == "image" and file_data:
-        if file_data[:3] == b"\xff\xd8\xff":
-            ext = ".jpg"
-        elif file_data[:8] == b"\x89PNG\r\n\x1a\n":
-            ext = ".png"
-        elif len(file_data) >= 12 and file_data[:4] == b"RIFF" and file_data[8:12] == b"WEBP":
-            ext = ".webp"
-        elif file_data[:6] in (b"GIF87a", b"GIF89a"):
-            ext = ".gif"
+# RunningHub 文件上传支持的格式（官方文档「文件上传」）：
+# 图片 JPG/PNG/JPEG/WEBP，音频 MP3/WAV/FLAC，视频 MP4/AVI/MOV/MKV。
+_UNSUPPORTED_UPLOAD = {
+    "image": "图片只支持 JPG/PNG/WEBP，GIF 动图或表情请先转成 PNG/JPG 再发",
+    "audio": "音频只支持 MP3/WAV/FLAC，QQ 语音请改发 MP3 等音频文件",
+    "video": "视频只支持 MP4/AVI/MOV/MKV",
+}
+
+
+def _upload_extension(file_type: str, data: bytes) -> str:
+    if file_type == "image":
+        if data[:3] == b"\xff\xd8\xff":
+            return ".jpg"
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            return ".png"
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return ".webp"
+    elif file_type == "audio":
+        if data[:3] == b"ID3" or (data[:1] == b"\xff" and len(data) > 1 and data[1] & 0xE6 == 0xE2):
+            return ".mp3"
+        if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+            return ".wav"
+        if data[:4] == b"fLaC":
+            return ".flac"
+    elif file_type == "video":
+        if data[4:8] == b"ftyp":
+            return ".mov" if data[8:12] == b"qt  " else ".mp4"
+        if data[:4] == b"RIFF" and data[8:12] == b"AVI ":
+            return ".avi"
+        if data[:4] == b"\x1a\x45\xdf\xa3":
+            return ".mkv"
+    return ""
+
+
+def upload_filename(file_type: str, data: bytes) -> str:
+    """按文件内容生成上传文件名；不在平台支持列表内的格式直接拒绝，不提交付费任务。"""
+    ext = _upload_extension(file_type, data)
     if not ext:
-        ext = {"image": ".png", "audio": ".mp3", "video": ".mp4"}.get(file_type, ".bin")
+        raise RunningHubError(f"文件格式不受 RunningHub 支持：{_UNSUPPORTED_UPLOAD.get(file_type, '请换成常见图片、音频或视频格式')}")
     return f"input_{file_type}_{int(time.time())}{ext}"
 
 

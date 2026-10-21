@@ -182,12 +182,12 @@ class RuntimeSafetyTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(polling.wait(), 2)
         worker = self.p._pending[first["task_id"]]
         await self.p._cancel_task(first["task_id"], "s1", announce=False)
-        await asyncio.gather(worker, return_exceptions=True)
         preserved = self.p._task_journal.get(first["task_id"])
-        self.assertEqual(preserved["status"], "needs_attention")
+        self.assertEqual(preserved["status"], "pending")
         self.assertEqual(preserved["remote_task_id"], "remote-1")
+        self.assertFalse(worker.done())
 
-        # The process no longer has a live first worker, but its remote job
+        # A refused cancel leaves the first worker polling, so its remote job
         # still occupies the one configured slot until cancellation succeeds.
         second = await self.enqueue(anchor_id="m2")
         with self.assertRaises(TimeoutError):

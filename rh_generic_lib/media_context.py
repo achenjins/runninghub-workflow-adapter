@@ -9,9 +9,11 @@ import uuid
 from .file_source import detect_file_type_from_name, extract_files_from_message, fetch_file_bytes, extract_bytes_from_napcat_result
 from .media_plan import PlanError
 
-# 群聊工具上下文缺少 user_id 时，允许回退到"钩子记录的最近发言人"的时限（秒）。
-# 一次推理轮通常在数十秒内完成工具调用；后台主动回复等无新消息场景不会命中。
+# 群聊工具上下文缺少 user_id 时，钩子记录的发言人身份可回退使用的时限（秒）；
+# 超时后后台主动回复等无新消息场景不会冒用旧身份。
 _FALLBACK_SENDER_TTL = 300.0
+# 宿主一轮对话从收到消息到调用工具的时长量级（秒）；这段时间内有两人以上发言时无法确定是谁的请求。
+_AMBIGUOUS_SENDER_WINDOW = 120.0
 
 
 def unwrap(value):
@@ -153,8 +155,11 @@ class MediaContextMixin:
             if not lock.locked() and key not in self._vision_cache:
                 self._vision_locks.pop(key, None)
         now = time.time()
-        for key in [k for k, (_, seen) in self._stream_last_sender.items() if now - seen > 3600]:
-            self._stream_last_sender.pop(key, None)
+        for stream, senders in list(self._stream_senders.items()):
+            for uid in [u for u, seen in senders.items() if now - seen > _FALLBACK_SENDER_TTL]:
+                senders.pop(uid)
+            if not senders:
+                self._stream_senders.pop(stream)
 
     def _remember_anchor(self, message):
         uid, stream = identity(message)
@@ -162,8 +167,8 @@ class MediaContextMixin:
             return
         self._prune_context()
         # 钩子消息由宿主序列化产生，发言人身份与命令 kwargs 同级可信；
-        # 记录为"该会话最近发言人"，供群聊工具上下文缺少 user_id 时限时回退。
-        self._stream_last_sender[stream] = (uid, time.time())
+        # 记录会话内近期发言人，供群聊工具上下文缺少 user_id 时限时回退。
+        self._stream_senders.setdefault(stream, {})[uid] = time.time()
         # Keep bounded metadata; obtain binary payload from message.get_by_id only when selected.
         stripped = {k: message[k] for k in ("message_id", "timestamp", "session_id", "stream_id", "chat_id", "message_info", "reply_to") if k in message}
         stripped["raw_message"] = [{k: v for k, v in s.items() if k in {"type", "data", "binary_hash", "description"}} for s in segments(message)[:64]]
@@ -186,10 +191,15 @@ class MediaContextMixin:
         if not uid and stream:
             # MaiBot 对群聊会话固定清空 user_id（chat_manager："群聊不保存最近发言人的用户信息"），
             # 工具上下文因此只注入 stream 不注入 user_id。回退到 before_process 钩子记录的
-            # 最近发言人——同为宿主注入的可信字段，LLM 无法伪造；超时限则保持 fail-closed。
-            last_uid, seen = self._stream_last_sender.get(stream, ("", 0.0))
-            if last_uid and time.time() - seen <= _FALLBACK_SENDER_TTL:
-                uid = last_uid
+            # 最近发言人——同为宿主注入的可信字段，LLM 无法伪造。一轮对话的时长内
+            # 还有别人发言时无法确定任务归属，保持 fail-closed。
+            now = time.time()
+            senders = sorted(((seen, u) for u, seen in self._stream_senders.get(stream, {}).items()
+                              if now - seen <= _FALLBACK_SENDER_TTL), reverse=True)
+            if len(senders) > 1 and now - senders[1][0] <= _AMBIGUOUS_SENDER_WINDOW:
+                raise PlanError("群里刚才有多人发言，无法确认是谁的请求，请用 /rh运行")
+            if senders:
+                uid = senders[0][1]
         if not uid or not stream:
             raise PlanError("宿主没有提供可信用户／会话身份，请使用 /rh运行 命令")
         return uid, stream
@@ -317,6 +327,17 @@ class MediaContextMixin:
         if media_id.startswith("avatar:") or media_id.startswith("avatar-group:"):
             from .avatar_source import fetch_avatar_bytes
             return await fetch_avatar_bytes(media_id, api=self.ctx.api, client=client, logger=self.ctx.logger)
+        file_id = asset.get("file_id")
+        if asset["type"] == "audio" and file_id:
+            # QQ 语音的 url 指向原始 silk，平台不收；先让 NapCat 转成 mp3，拿不到再按原链路读取。
+            try:
+                result = await self.ctx.api.call("adapter.napcat.action.call", action_name="get_record",
+                                                 params={"file": file_id, "file_id": file_id, "out_format": "mp3"})
+                data = await extract_bytes_from_napcat_result(result, client)
+                if data:
+                    return data
+            except Exception:
+                pass
         if asset.get("platform_message_id"):
             try:
                 message = unwrap(await self.ctx.api.call("adapter.napcat.action.call", action_name="get_msg", params={"message_id": asset["platform_message_id"]}))
@@ -340,16 +361,17 @@ class MediaContextMixin:
                             return await fetch_file_bytes(files[0][1], client)
             except Exception:
                 pass
-        file_id = asset.get("file_id")
         if file_id and not file_id.startswith(("http://", "https://", "base64://")):
-            try:
-                action = "get_image" if asset["type"] == "image" else "get_file"
-                result = await self.ctx.api.call("adapter.napcat.action.call", action_name=action, params={"file": file_id, "file_id": file_id})
-                data = await extract_bytes_from_napcat_result(result, client)
-                if data:
-                    return data
-            except Exception:
-                pass
+            if asset["type"] != "audio":
+                try:
+                    action = "get_image" if asset["type"] == "image" else "get_file"
+                    result = await self.ctx.api.call("adapter.napcat.action.call", action_name=action,
+                                                     params={"file": file_id, "file_id": file_id})
+                    data = await extract_bytes_from_napcat_result(result, client)
+                    if data:
+                        return data
+                except Exception:
+                    pass
             if asset.get("group_id"):
                 # 群文件：gzc-download 直链常是坏 ZIP，改走 get_group_file_url 候选链
                 for call in (

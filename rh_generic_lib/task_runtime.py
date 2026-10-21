@@ -8,7 +8,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 from .media_plan import PlanError, request_fingerprint, validate_parameter, validate_workflow
-from .runninghub_client import RunningHubError, RunningHubTransportError, RunningHubTaskError
+from .runninghub_client import RunningHubBusyError, RunningHubError, RunningHubTransportError, RunningHubTaskError
 from .task_journal import ACTIVE_STATUSES
 from .workflow_runner import consume_coins_from_result, resolve_value_type
 
@@ -84,14 +84,11 @@ class TaskRuntimeMixin:
         existing = self._pending.get(task_id)
         if existing and not existing.done():
             return
-        self._task_meta[task_id] = {"name": record["workflow"], "stream_id": record["stream_id"],
-                                    "region": record["region"], "user_id": record["user_id"]}
         task = asyncio.create_task(self._run_job(task_id))
         self._pending[task_id] = task
         def done(finished):
             if self._pending.get(task_id) is finished:
                 self._pending.pop(task_id, None)
-                self._task_meta.pop(task_id, None)
             if not finished.cancelled() and finished.exception():
                 self.ctx.logger.error("任务后台处理异常 %s: %s", task_id, type(finished.exception()).__name__)
         task.add_done_callback(done)
@@ -180,24 +177,43 @@ class TaskRuntimeMixin:
                     if not await journal.update(task_id, status="submitting", submitted_at=time.time(),
                                                 message="提交 RunningHub 任务", expected_statuses={"queued"}):
                         return
-                    try:
-                        remote = await client.submit(nodes, instance_type=request["workflow"]["instance_type"],
-                                                     workflow_id=request["workflow"]["workflow_id"])
-                    except RunningHubTransportError:
-                        await journal.update(task_id, status="unknown_submission",
-                                             message="提交响应丢失，请核对 RunningHub 记录；不会自动重复提交")
-                        await self._notify_job(record, f"{task_id} 提交状态不确定，请管理员核对 RunningHub 任务记录", notify_model=True)
-                        return
-                    except RunningHubError as exc:
-                        await journal.update(task_id, status="failed", submitted_at=0, message=str(exc))
-                        await self._notify_job(record, f"{task_id} 提交被拒绝：{exc}", notify_model=True)
-                        return
+                    attempt = 0
+                    while True:
+                        try:
+                            remote = await client.submit(nodes, instance_type=request["workflow"]["instance_type"],
+                                                         workflow_id=request["workflow"]["workflow_id"])
+                            break
+                        except RunningHubBusyError as exc:
+                            if journal.get(task_id)["cancel_requested"]:
+                                await journal.update(task_id, status="cancelled", submitted_at=0, message="用户取消")
+                                return
+                            # 平台按官方说明要求自行排队：任务未创建，回到排队后重新提交
+                            if not await journal.update(task_id, status="queued", submitted_at=0,
+                                                        message=f"平台繁忙，稍后重新提交：{exc}", expected_statuses={"submitting"}):
+                                return
+                            if not attempt:
+                                await self._notify_job(record, f"{task_id} 平台排队中，轮到后会自动提交")
+                            attempt += 1
+                            await asyncio.sleep(min(120, 30 * attempt))
+                            if not await journal.update(task_id, status="submitting", submitted_at=time.time(),
+                                                        message="提交 RunningHub 任务", expected_statuses={"queued"}):
+                                return
+                        except RunningHubTransportError as exc:
+                            await journal.update(task_id, status="unknown_submission",
+                                                 message=f"提交响应丢失：{exc}；请核对 RunningHub 记录，不会自动重复提交")
+                            await self._notify_job(record, f"{task_id} 提交状态不确定，请管理员核对 RunningHub 任务记录", notify_model=True)
+                            return
+                        except RunningHubError as exc:
+                            await journal.update(task_id, status="failed", submitted_at=0, message=str(exc))
+                            await self._notify_job(record, f"{task_id} 提交被拒绝：{exc}", notify_model=True)
+                            return
                     await journal.update(task_id, status="pending", remote_task_id=remote, message="")
                     record = journal.get(task_id)
                     if record.get("cancel_requested"):
                         outcome = await self._cancel_remote(record, client)
                         if outcome in {"confirmed", "refused"}:
                             await self._notify_job(record, f"任务 {task_id}：{journal.get(task_id)['message']}", notify_model=True)
+                        if outcome == "confirmed":
                             return
                 # Keep the worker slot while the remote job is unresolved, including outages.
                 notified = False
@@ -214,8 +230,11 @@ class TaskRuntimeMixin:
                             return
                         await self._notify_job(record, f"{task_id}：{exc}", notify_model=True)
                         return
-                    except (RunningHubTransportError, TimeoutError):
-                        # 瞬态故障（断网/慢任务）：保留远端编号，占住名额继续后台跟踪，绝不重提
+                    except TimeoutError:
+                        # 慢任务超过单轮查询时长：远端仍在运行，直接开始下一轮
+                        continue
+                    except RunningHubTransportError:
+                        # 瞬态故障（断网/限流）：保留远端编号，占住名额继续后台跟踪，绝不重提
                         if not await journal.update(task_id, status="tracking_paused", message="查询暂不可用，后台稍后继续查询",
                                                     expected_statuses={"pending", "tracking_paused"}):
                             return
@@ -229,10 +248,10 @@ class TaskRuntimeMixin:
                         # 查询被服务端明确拒绝（如 Key 失效/无权限）：与瞬断不同，无限轮询只会占死并发槽；
                         # 保留远端编号与名额，转需人工恢复状态并让出工作槽
                         if not await journal.update(task_id, status="needs_attention",
-                                message=f"查询被拒绝：{str(exc)[:200]}；修复 API Key 后用 /rh状态 恢复，或 /rh中断 取消",
+                                message=f"查询被拒绝：{str(exc)[:200]}；排查原因后用 /rh状态 恢复，或 /rh中断 取消",
                                 expected_statuses={"pending", "tracking_paused", "needs_attention"}):
                             return
-                        await self._notify_job(record, f"{task_id} 查询被服务端拒绝（常见于 API Key 失效），已停止自动轮询；修复配置后发 /rh状态 {task_id} 恢复", notify_model=True)
+                        await self._notify_job(record, f"{task_id} 查询被服务端拒绝（{str(exc)[:200]}），已停止自动轮询；排查原因后发 /rh状态 {task_id} 恢复", notify_model=True)
                         return
                     outputs = []
                     for item in result.get("results") or []:
@@ -344,8 +363,8 @@ class TaskRuntimeMixin:
         except RunningHubTransportError:
             return "uncertain"
         except RunningHubError as exc:
-            changed = await self._task_journal.update(record["task_id"], status="needs_attention",
-                message=f"远端拒绝取消：{exc}；保留任务，修复配置后可恢复查询",
+            # 拒绝取消不代表远端已停止，由查询结果决定最终状态。
+            changed = await self._task_journal.update(record["task_id"], message=f"远端拒绝取消：{exc}；任务保留",
                 expected_statuses={"pending", "tracking_paused", "needs_attention"})
             return "refused" if changed else "completed"
         except Exception:
@@ -379,11 +398,12 @@ class TaskRuntimeMixin:
                     message = "任务已经结束，保留已有结果"
             elif outcome == "completed":
                 message = "任务已经结束，保留已有结果"
+            elif outcome == "refused":
+                message = journal.get(task_id)["message"]
             else:
                 if task := self._pending.get(task_id):
                     task.cancel()
-                message = ("任务已取消" if outcome == "confirmed"
-                           else "远端拒绝取消，已暂停查询并保留任务；远端可能仍在运行，修复配置后可用 /rh状态 恢复")
+                message = "任务已取消"
         elif status == "unknown_submission":
             message = "提交状态未知，无法安全取消；请管理员核对 RunningHub 任务记录"
         else:
