@@ -358,7 +358,7 @@ class TaskRuntimeMixin:
                 if data and self.config.natural_language.recent_images:
                     try:
                         await self._remember_image_usage(
-                            {"media_id": f"{record['task_id']}:{index}", "type": "image"},
+                            {"media_id": f"{record['task_id']}:{index}", "type": "image", "origin": "result"},
                             base64.b64decode(data, validate=True), record["user_id"], record["stream_id"])
                     except ValueError:
                         self.ctx.logger.warning("已发送的结果图片无法保存到最近图片记录: %s", record["task_id"])

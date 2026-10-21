@@ -13,7 +13,7 @@ from maibot_sdk.types import ToolParameterInfo as Param, ToolParamType as Type
 
 from .file_source import prepare_upload
 from .image_memory import short_description
-from .media_plan import PlanError, bind_plan, workflow_card, parse_json_object
+from .media_plan import PlanError, bind_plan, workflow_card, workflow_overview, parse_json_object
 from .task_runtime import ADMIN_REVIEW_STATUSES
 from .workflow_runner import resolve_value_type
 
@@ -26,41 +26,74 @@ def _tool_result(payload):
     return payload
 
 
-def _planning_context(snapshot, workflows):
-    return {"context_id": snapshot["context_id"], "workflows": [workflow_card(w) for w in workflows],
-            "media": [{k: a[k] for k in ("media_id", "type", "origin", "description", "task_id", "recent_index") if a.get(k)}
-                      for a in snapshot["assets"]]}
+def _public_media(snapshot):
+    return [{k: short_description(a[k]) if k == "description" else a[k]
+             for k in ("media_id", "type", "origin", "description", "task_id", "recent_index", "timestamp", "used_at", "expires_at")
+             if a.get(k)} for a in snapshot["assets"]]
+
+
+def _planning_context(snapshot, workflows, *, details=False):
+    return {"context_id": snapshot["context_id"],
+            "workflows": [(workflow_card if details else workflow_overview)(w) for w in workflows],
+            "media": _public_media(snapshot), "warnings": snapshot.get("warnings", [])}
 
 
 class NaturalLanguageMixin:
-    @Tool("rh_context", description="返回工作流、素材及最近用过的图片简介；先按简介选图，不重复观察。简单生成可直接 run_workflow。", parameters=[])
-    async def handle_rh_context(self, **kwargs):
+    @Tool("rh_workflows", description="查询可用工作流：不指定名称只返回用途概要；指定名称才展开该工作流输入与参数。简单生成可直接 run_workflow。", parameters=[
+        Param(name="workflow_name", description="留空列工作流概要；填写名称查看单个工作流详情", required=False, default="")])
+    async def handle_rh_workflows(self, workflow_name="", **kwargs):
         try:
             if not self.config.natural_language.enabled:
                 raise PlanError("自然语言生成已关闭")
             uid, stream = self._trusted_scope(kwargs)
-            allowed, reason = self._check_access(uid, str(kwargs.get("group_id") or ""))
-            if not allowed:
-                raise PlanError(reason)
-            kwargs.update(user_id=uid, stream_id=stream)
-            snapshot = await self._media_snapshot(kwargs)
+            self._trusted_group(kwargs, uid, stream)
             workflows = [w for w in self.config.workflows.items if self._is_llm_callable_workflow(w)]
+            if workflow_name:
+                workflow = next((w for w in workflows if w.name == workflow_name), None)
+                if not workflow:
+                    raise PlanError("工作流不存在或未启用聊天调用，请先查询工作流概要")
+                return _tool_result({"success": True, "workflows": [workflow_card(workflow)]})
+            return _tool_result({"success": True, "workflows": [workflow_overview(w) for w in workflows]})
+        except (PlanError, ValueError) as exc:
+            return _tool_result({"success": False, "message": str(exc)})
+
+    @Tool("rh_media", description="查询当前、引用、近期聊天素材或已保存图片，只返回素材ID与简短简介。可按来源/类型筛选；memory 不读取聊天历史。图片最多20张、24小时，先按简介选图。", parameters=[
+        Param(name="source", description="素材来源；memory 查询已保存图片", enum_values=["all", "current", "reply", "recent", "memory", "result", "avatar"], required=False, default="all"),
+        Param(name="media_type", description="留空不限类型", enum_values=["image", "video", "audio"], required=False, default="")])
+    async def handle_rh_media(self, source="all", media_type="", **kwargs):
+        try:
+            if not self.config.natural_language.enabled:
+                raise PlanError("自然语言生成已关闭")
+            if source not in {"all", "current", "reply", "recent", "memory", "result", "avatar"} or media_type not in {"", "image", "video", "audio"}:
+                raise PlanError("素材来源或类型无效")
+            uid, stream = self._trusted_scope(kwargs)
+            snapshot = await self._media_snapshot(kwargs, source=source, media_type=media_type)
             draft = (self._drafts.get((uid, stream)) or {}).get("plan")
-            payload = {"success": True, **_planning_context(snapshot, workflows)}
+            media = [a for a in _public_media(snapshot)
+                     if (source == "all" or a["origin"] == source or (source == "memory" and a.get("recent_index")))
+                     and (not media_type or a["type"] == media_type)]
+            payload = {"success": True, "context_id": snapshot["context_id"], "media": media,
+                       "count": len(media), "warnings": snapshot.get("warnings", [])}
             if draft:
                 payload["draft"] = {k: v for k, v in draft.items() if k != "assets" and v}
             return _tool_result(payload)
         except (PlanError, ValueError) as exc:
-            return {"success": False, "message": str(exc)}
+            return _tool_result({"success": False, "message": str(exc)})
+
+    async def handle_rh_context(self, **kwargs):
+        """Compatibility for Python callers; the combined tool is no longer registered."""
+        return await self.handle_rh_media(**kwargs)
 
     @Tool("rh_inspect_media", description="仅对没有简介且需辨认的候选图片使用；已存简介直接复用，不重复观察。视频/音频靠对话或询问用户。", parameters=[
-        Param(name="context_id", description="返回的 context_id"),
-        Param(name="media_id", description="候选 media_id")])
-    async def handle_rh_inspect_media(self, context_id, media_id, **kwargs):
+        Param(name="media_id", description="素材ID；已保存图片可直接使用稳定ID"),
+        Param(name="context_id", description="临时素材可填写查询返回的 context_id；已保存图片可省略", required=False, default="")])
+    async def handle_rh_inspect_media(self, context_id="", media_id="", **kwargs):
         try:
             if not self.config.natural_language.enabled:
                 raise PlanError("自然语言生成已关闭")
-            snapshot = await self._media_snapshot(kwargs, context_id)
+            if not media_id:
+                raise PlanError("请指定素材ID")
+            snapshot = await self._media_snapshot(kwargs, context_id, media_ids=[media_id])
             asset = next((a for a in snapshot["assets"] if a["media_id"] == media_id), None)
             if not asset:
                 raise PlanError("素材不属于该上下文")
@@ -86,13 +119,13 @@ class NaturalLanguageMixin:
             if self.config.natural_language.vision_model:
                 try:
                     summary = await self._describe_image(data)
-                    await self._remember_image_usage(asset, data, snapshot["user_id"], snapshot["stream_id"], description=summary)
-                    return _tool_result({"success": True, "media_id": media_id, "message": summary})
+                    saved = await self._remember_image_usage(asset, data, snapshot["user_id"], snapshot["stream_id"], description=summary)
+                    return _tool_result({"success": True, "media_id": saved["memory_id"] if saved else media_id, "message": summary})
                 except Exception as exc:
                     warning = f"视觉摘要不可用：{str(exc) or type(exc).__name__}。已返回原图，请直接查看。"
                     self.ctx.logger.warning("参考图视觉摘要失败: %s", exc)
-            await self._remember_image_usage(asset, data, snapshot["user_id"], snapshot["stream_id"], description="")
-            return _tool_result({"success": True, "media_id": media_id,
+            saved = await self._remember_image_usage(asset, data, snapshot["user_id"], snapshot["stream_id"], description="")
+            return _tool_result({"success": True, "media_id": saved["memory_id"] if saved else media_id,
                     "message": warning or "已返回所选参考图。",
                     "content_items": [{"type": "image", "data": encoded, "mime_type": mime,
                     "name": media_id, "description": asset["description"] or "本次参考图片"}]})
@@ -141,7 +174,7 @@ class NaturalLanguageMixin:
         Param(name="prompt", description="完整需求或本次修改，保留用户约束", required=False, default=""),
         Param(name="output_type", description="用户要求的成品类型", enum_values=["image", "video", "audio", "file"], required=False),
         Param(name="use_reference", param_type=Type.BOOLEAN, description="用户要使用参考素材或编辑时为 true", required=False, default=False),
-        Param(name="context_id", description="已有上下文时复用", required=False, default=""),
+        Param(name="context_id", description="临时素材可复用查询上下文；已保存图片ID不依赖此项", required=False, default=""),
         Param(name="references", param_type=Type.ARRAY, description="候选素材按角色绑定；ID 不得编造", required=False,
               items_schema={"type": "object", "properties": {
                   "input": {"type": "string", "description": "workflows[].inputs[].key"},
@@ -164,7 +197,8 @@ class NaturalLanguageMixin:
             kwargs.update(user_id=uid, stream_id=stream)
             trigger_message = kwargs.get("message") or (self._anchors.get((uid, stream)) or {}).get("message") or {}
             trigger_anchor = str(trigger_message.get("message_id") or "")
-            snapshot = await self._media_snapshot(kwargs, context_id)
+            requested_ids = [r.get("media_id", "") for r in (references or []) if isinstance(r, dict)] if isinstance(references, list) else []
+            snapshot = await self._media_snapshot(kwargs, context_id, media_ids=requested_ids)
             candidates = copy.deepcopy(snapshot["assets"])
             plan = {"workflow_name": workflow_name, "prompt": prompt,
                     "references": references if references is not None else [], "parameters": parameters if parameters is not None else {}}
@@ -211,7 +245,7 @@ class NaturalLanguageMixin:
                     try:
                         result = await asyncio.wait_for(self.ctx.llm.generate(model=self.config.natural_language.planner_model,
                             prompt='按需求选匹配工作流，只回 JSON {"workflow_name":"候选名"}；无法确定则回 {"question":"必要问题"}。\n'
-                            + json.dumps({"request": plan, "workflows": [workflow_card(w) for w in available]}, ensure_ascii=False, separators=(",", ":"))),
+                            + json.dumps({"request": plan, "workflows": [workflow_overview(w) for w in available]}, ensure_ascii=False, separators=(",", ":"))),
                             timeout=self.config.natural_language.llm_timeout)
                     except Exception as exc:
                         self.ctx.logger.warning("工作流自动选择失败: %s", exc)
@@ -240,7 +274,7 @@ class NaturalLanguageMixin:
             if missing:
                 self._drafts[(uid, stream)] = {"created_at": time.time(), "plan": plan}
                 return _tool_result({"success": False, "status": "needs_input", "missing": missing,
-                        **_planning_context(snapshot, [workflow]), "message": "补充后 continue_draft=true；仅询问缺项或素材用途"})
+                        **_planning_context(snapshot, [workflow], details=True), "message": "补充后 continue_draft=true；仅询问缺项或素材用途"})
             kwargs.update(group_id=snapshot["group_id"], anchor_id=trigger_anchor or snapshot["anchor_id"], natural_plan=plan,
                           trigger="natural_language", start_message=start_message)
             result = await self._submit_and_poll(self._get_client(workflow.region), workflow, nodes, stream, kwargs)
@@ -255,7 +289,7 @@ class NaturalLanguageMixin:
             payload = {"success": False, "message": str(exc) or "规划超时，请指定工作流后重试"}
             if snapshot:
                 payload.update(status="needs_input", **_planning_context(snapshot,
-                    [workflow] if workflow else [w for w in self.config.workflows.items if self._is_llm_callable_workflow(w)]))
+                    [workflow] if workflow else [w for w in self.config.workflows.items if self._is_llm_callable_workflow(w)], details=bool(workflow)))
             return _tool_result(payload)
 
     async def _prepare_natural_plan(self, request, client, record):
@@ -283,7 +317,7 @@ class NaturalLanguageMixin:
                     # 视觉摘要是扩写辅助，失败不应阻止原始参考图上传。
                     self.ctx.logger.warning("任务 %s 视觉摘要失败，继续上传原图（vision_model=%s）: %s",
                                             record["task_id"], self.config.natural_language.vision_model, exc)
-                await self._remember_image_usage(item["asset"], data, record["user_id"], record["stream_id"], description=description)
+                await self._remember_image_usage({**item["asset"], "origin": "reference"}, data, record["user_id"], record["stream_id"], description=description)
             summaries.append(summary)
             await self._task_journal.update(record["task_id"], message=f"上传参考素材「{item['role']}」到 RunningHub")
             filename, payload = prepare_upload(item["asset"]["type"], data)
