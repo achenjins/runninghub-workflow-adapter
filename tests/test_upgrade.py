@@ -908,6 +908,21 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.submit.await_args.args[0], [])
         self.assertIsNone(self.p._find_input_session("11", "s1"))
 
+    async def test_detect_with_two_prompts_suggests_retry_without_writing(self):
+        # 正负提示词都被识别成主提示词时不写配置，提示重试或手动配置
+        self.set_config(workflow(), feature={"use_llm": False})
+        self.client.get_workflow_json = AsyncMock(return_value={
+            "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "lowres", "clip": ["4", 1]}},
+            "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "1girl", "clip": ["4", 1]}},
+        })
+        with tempfile.TemporaryDirectory() as directory, patch("plugin._PLUGIN_DIR", Path(directory)):
+            await self.p._detect_and_write("999", "anima", "s1", detailed=False, region="overseas")
+            self.assertFalse((Path(directory) / "config.toml").exists())
+        reply = self.ctx.send.text.await_args.args[0]
+        self.assertIn("建议重新识别一次", reply)
+        self.assertNotIn("validation error", reply)
+        self.assertNotIn("anima", [w.name for w in self.p._workflows])
+
 
 class PureTests(unittest.IsolatedAsyncioTestCase):
     async def test_nested_adapter_response(self):

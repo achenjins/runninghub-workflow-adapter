@@ -1532,6 +1532,14 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             len(detected),
             ", ".join(f"{n['node_id']}/{n['field_name']}/{n['value_type']}" for n in detected),
         )
+        if sum(n["value_type"] == "prompt" for n in detected) > 1:
+            self.ctx.logger.warning("[识别] 识别出多个主提示词节点，未写入配置")
+            await self.ctx.send.text(
+                "识别出多个主提示词节点，未写入配置。识别结果有一定随机性，建议重新识别一次；"
+                "仍不行请到插件配置页手动配置输入节点",
+                stream_id,
+            )
+            return True, "", 1
 
         try:
             await self._append_workflow_to_config(
