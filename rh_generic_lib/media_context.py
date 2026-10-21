@@ -196,7 +196,12 @@ class MediaContextMixin:
             now = time.time()
             senders = sorted(((seen, u) for u, seen in self._stream_senders.get(stream, {}).items()
                               if now - seen <= _FALLBACK_SENDER_TTL), reverse=True)
-            if len(senders) > 1 and now - senders[1][0] <= _AMBIGUOUS_SENDER_WINDOW:
+            # 最近发言人不一定是请求人：请求人先说、别人后插话时，宿主可能在插话之后才调用工具。
+            # 开了白名单或限次，归属决定权限和计费，回退时限内只要有第二个人发言就不猜。
+            access = self.config.access
+            strict = bool(access.allow_users) or access.max_per_user_per_hour > 0
+            window = _FALLBACK_SENDER_TTL if strict else _AMBIGUOUS_SENDER_WINDOW
+            if len(senders) > 1 and now - senders[1][0] <= window:
                 raise PlanError("群里刚才有多人发言，无法确认是谁的请求，请用 /rh运行")
             if senders:
                 uid = senders[0][1]

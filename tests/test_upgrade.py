@@ -168,6 +168,30 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.p._task_journal.records(), [])
         self.client.submit.assert_not_awaited()
 
+    async def test_group_tool_identity_is_strict_when_access_is_limited(self):
+        # 请求人 130 秒前发言、别人 2 秒前插话：开启白名单或限频时不能把任务记到插话的人头上
+        for access in ({"allow_users": ["11", "77"]}, {"max_per_user_per_hour": 5}):
+            self.set_config(workflow(), access=access)
+            now = time.time()
+            self.p._stream_senders["s1"] = {"77": now - 130, "11": now - 2}
+            result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
+            await self.settled()
+            self.assertFalse(result["success"])
+            self.assertIn("多人发言", result["message"])
+        self.assertEqual(self.p._task_journal.records(), [])
+        self.client.submit.assert_not_awaited()
+
+    async def test_plugin_api_is_disabled_by_default(self):
+        args = {"stream_id": "s1", "user_id": "11", "group_id": "22"}
+        result = await self.p.handle_run_workflow_api("draw", "cat", **args)
+        self.assertFalse(result["success"])
+        self.assertIn("允许其他插件调用", result["message"])
+        self.set_config(workflow(), access={"allow_plugin_api": True})
+        result = await self.p.handle_run_workflow_api("draw", "cat", **args)
+        self.assertTrue(result["success"], result.get("message"))
+        await self.settled()
+        self.client.submit.assert_awaited_once()
+
     async def test_definite_query_error_pauses_for_manual_recovery(self):
         # 查询被拒绝时停止自动轮询，保留远端任务；修复后恢复且不重复提交。
         self.client.wait_for_result.side_effect = RunningHubError("APIKEY_USER_NOT_FOUND（806）")

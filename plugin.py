@@ -16,7 +16,7 @@
 - 命令：``/识别国内工作流 <工作流ID>`` / ``/识别国外工作流 <工作流ID>`` 识别关键节点（分别配置区域）
 - 命令：``/详细识别国内工作流 <工作流ID>`` / ``/详细识别国外工作流 <工作流ID>`` LLM 详细识别全部节点
 - 工具：``run_workflow``（供 LLM 调用）
-- API：``run_workflow_api``（public，供其他插件调用）
+- API：``run_workflow_api``（public，供其他插件调用；需开启 access.allow_plugin_api）
 """
 
 from __future__ import annotations
@@ -2157,6 +2157,9 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         stream_id: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
+        # 调用方自报 user_id / group_id / stream_id，宿主不做验证：默认关闭，避免绕过白名单扣费或往任意群发图
+        if not self.config.access.allow_plugin_api:
+            return {"success": False, "message": "插件 API 未开启，请在「使用权限」中打开「允许其他插件调用」"}
         kwargs["stream_id"] = stream_id
         return await self._start_workflow(workflow_name, prompt, **kwargs)
 
