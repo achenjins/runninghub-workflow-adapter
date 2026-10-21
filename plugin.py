@@ -180,6 +180,8 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         self._client_cn: RunningHubClient | None = None
         self._limiter = TaskLimiter(2)
         self._leased_jobs = set()
+        # 工作协程收尾期间收到的恢复/补发请求，结束后重新调度
+        self._reschedule_requested = set()
         self._request_lock = asyncio.Lock()
         self._background_tasks = set()
         self._anchors = {}
@@ -356,7 +358,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         while True:
             try:
                 await asyncio.sleep(5)
-                self._cleanup_cache_once(max_age_seconds=max_age)
+                await asyncio.to_thread(self._cleanup_cache_once, max_age_seconds=max_age)
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 raise
@@ -365,7 +367,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
                 await asyncio.sleep(interval)
 
     def _cleanup_cache_once(self, *, max_age_seconds: int) -> None:
-        """清理缓存目录中超过保留时间的文件（同步，经 to_thread 调用更佳）。"""
+        """清理缓存目录中超过保留时间的文件（同步实现，由 _cleanup_cache_loop 放到线程执行）。"""
         cache_dir = self._get_cache_dir()
         if cache_dir is None:
             return

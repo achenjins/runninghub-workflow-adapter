@@ -19,6 +19,7 @@ import tempfile
 import time
 from typing import Any
 
+from .background_io import finish_in_thread
 
 _MAX_SCOPES = 128
 _MAX_MEDIA_IDS = 16
@@ -36,8 +37,9 @@ class ImageMemory:
 
     One instance owns a directory. Async reads and mutations share a lock; a
     mutation publishes its in-memory snapshot only after replacing index.json.
-    The small file transaction runs without an await, so cancellation cannot
-    release the lock while a background writer is still replacing files.
+    File I/O runs in a worker thread so large images do not block the event loop;
+    ``finish_in_thread`` defers cancellation until the files are replaced, so the
+    lock is never released while a writer is still replacing files.
     """
 
     def __init__(self, path: Path) -> None:
@@ -53,7 +55,8 @@ class ImageMemory:
             if self.loaded:
                 return
             try:
-                raw = json.loads((self.path / "index.json").read_text(encoding="utf-8"))
+                text = await asyncio.to_thread((self.path / "index.json").read_text, encoding="utf-8")
+                raw = json.loads(text)
             except FileNotFoundError:
                 raw = {"version": 1, "images": []}
             if not isinstance(raw, dict) or raw.get("version") != 1 or not isinstance(raw.get("images"), list):
@@ -63,10 +66,10 @@ class ImageMemory:
             # Deduplicate a restored index and enforce the global scope bound.
             records = self._bounded(records, limit=None)
             if records != raw["images"]:
-                self._commit(records)
+                await self._commit(records)
             else:
                 self._records = records
-                self._cleanup_blobs(records)
+                await finish_in_thread(self._cleanup_blobs, records)
             self.loaded = True
 
     async def remember(self, user_id: str, stream_id: str, asset: dict[str, Any],
@@ -111,7 +114,7 @@ class ImageMemory:
                        if self._scope(item) != (user_id, stream_id)
                        or (item["_digest"] != digest and media_id not in item["media_ids"])]
             records = self._bounded([record, *records], limit)
-            self._commit(records, blob=(digest, data))
+            await self._commit(records, blob=(digest, data))
             return self._public(record)
 
     def list_images(self, user_id: str, stream_id: str, limit: int) -> list[dict[str, Any]]:
@@ -135,7 +138,8 @@ class ImageMemory:
             if record is None:
                 return None
             try:
-                data = self._blob_path(record["_digest"]).read_bytes()
+                # 只读：取消时线程读完即丢弃，不影响磁盘状态
+                data = await asyncio.to_thread(self._blob_path(record["_digest"]).read_bytes)
             except FileNotFoundError:
                 return None
             return data if hashlib.sha256(data).hexdigest() == record["_digest"] else None
@@ -153,7 +157,7 @@ class ImageMemory:
             if previous is None:
                 return None
             record = {**previous, "used_at": max(time.time(), self._records[0]["used_at"] + 0.000001)}
-            self._commit([record, *(item for item in self._records if item is not previous)])
+            await self._commit([record, *(item for item in self._records if item is not previous)])
             return self._public(record)
 
     async def trim(self, limit: int) -> None:
@@ -162,9 +166,9 @@ class ImageMemory:
         async with self._lock:
             records = self._bounded(self._records, max(0, int(limit)))
             if records != self._records:
-                self._commit(records)
+                await self._commit(records)
             else:
-                self._cleanup_blobs(records)
+                await finish_in_thread(self._cleanup_blobs, records)
 
     @staticmethod
     def _scope(record: dict[str, Any]) -> tuple[str, str]:
@@ -231,8 +235,19 @@ class ImageMemory:
             raise ValueError("无效的图片存储标识")
         return self.path / (digest + ".img")
 
-    def _commit(self, records: list[dict[str, Any]], blob: tuple[str, bytes] | None = None) -> None:
+    async def _commit(self, records: list[dict[str, Any]], blob: tuple[str, bytes] | None = None) -> None:
         """Write bytes before the index; never delete referenced bytes on failure."""
+        referenced = {item["_digest"] for item in self._records}
+        try:
+            await finish_in_thread(self._write_files, records, blob, referenced)
+        except asyncio.CancelledError:
+            # The files were fully replaced before the deferred cancellation surfaced.
+            self._records = records
+            raise
+        self._records = records
+
+    def _write_files(self, records: list[dict[str, Any]], blob: tuple[str, bytes] | None,
+                     referenced: set[str]) -> None:
         self.path.mkdir(parents=True, exist_ok=True)
         try:
             if blob is not None:
@@ -240,13 +255,12 @@ class ImageMemory:
             encoded = json.dumps({"version": 1, "images": records}, ensure_ascii=False, indent=2).encode("utf-8")
             self._atomic_write(self.path / "index.json", encoded)
         except OSError:
-            if blob is not None and not any(item["_digest"] == blob[0] for item in self._records):
+            if blob is not None and blob[0] not in referenced:
                 try:
                     self._blob_path(blob[0]).unlink(missing_ok=True)
                 except OSError:
                     pass
             raise
-        self._records = records
         self._cleanup_blobs(records)
 
     @staticmethod

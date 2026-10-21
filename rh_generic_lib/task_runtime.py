@@ -96,6 +96,8 @@ class TaskRuntimeMixin:
         task_id = record["task_id"]
         existing = self._pending.get(task_id)
         if existing and not existing.done():
+            # 旧工作协程可能正在收尾（如刚写完 needs_attention 还在发通知）；记下请求，结束后再按最新状态调度
+            self._reschedule_requested.add(task_id)
             return
         task = asyncio.create_task(self._run_job(task_id))
         self._pending[task_id] = task
@@ -104,6 +106,12 @@ class TaskRuntimeMixin:
                 self._pending.pop(task_id, None)
             if not finished.cancelled() and finished.exception():
                 self.ctx.logger.error("任务后台处理异常 %s: %s", task_id, type(finished.exception()).__name__)
+            if task_id in self._reschedule_requested and not finished.cancelled():
+                self._reschedule_requested.discard(task_id)
+                latest = self._task_journal.get(task_id) if self._task_journal else None
+                if latest and (latest["status"] in {"queued", "pending", "tracking_paused", "needs_attention"}
+                               or (latest["status"] == "success" and latest["delivery_status"] != "sent")):
+                    self._schedule_job(latest)
         task.add_done_callback(done)
 
     async def _resume_pending_tasks(self):

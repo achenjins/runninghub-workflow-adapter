@@ -203,7 +203,11 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         record = self.p._task_journal.get(result["task_id"])
         self.assertEqual(record["status"], "needs_attention")
         self.assertEqual(record["remote_task_id"], "remote-1")
-        await asyncio.sleep(0.02)
+        # 工作协程发完通知后退出、让出名额（写盘在线程里完成，收尾时间不固定）
+        for _ in range(200):
+            if result["task_id"] not in self.p._pending:
+                break
+            await asyncio.sleep(0.005)
         self.assertNotIn(result["task_id"], self.p._pending)
         self.client.wait_for_result.side_effect = None
         await self.p._resume_pending_tasks()
