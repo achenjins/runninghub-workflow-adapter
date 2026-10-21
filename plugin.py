@@ -58,7 +58,7 @@ from rh_generic_lib.configuration import (  # noqa: E402
     GenericConfig, InputNodeSection, PluginMetaSection, WorkflowItemSection, build_item_fields, localize_schema,
     migrate_legacy_feature_sections,
 )
-from rh_generic_lib.media_plan import validate_workflow, PlanError  # noqa: E402
+from rh_generic_lib.media_plan import validate_workflow, validate_parameter, short_choice, PlanError  # noqa: E402
 from rh_generic_lib.workflow_presets import match_workflow_preset  # noqa: E402
 from rh_generic_lib.delivery import NapcatDelivery  # noqa: E402
 from rh_generic_lib.file_source import (  # noqa: E402
@@ -952,7 +952,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
     async def _ask_config_edit(self, session: InputSession, stream_id: str, notice: str = "") -> None:
         """进入可编辑配置确认阶段并向用户发确认提示。"""
         session.phase = "config"
-        tips = self._build_config_edit_tips(session.editable_nodes)
+        tips = self._build_config_edit_tips(session.editable_nodes, session.workflow)
         prefix = f"{notice}。" if notice else ""
         await self.ctx.send.text(
             f"{prefix}可修改：\n{tips}\n（回复新值，如「512 16:9」，- 保持默认，「不变」全默认）",
@@ -981,11 +981,22 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         await self._submit_collected_session(session, key, stream_id, client, notice + "，开始运行")
 
     @staticmethod
-    def _build_config_edit_tips(editable_nodes: list[dict[str, str]]) -> str:
-        """构建可编辑配置的确认提示。"""
+    def _workflow_node(workflow: Any, item: dict[str, str]) -> Any | None:
+        """按节点编号和字段名找回可编辑项对应的配置节点（用于取可选值和校验规则）。"""
+        return next((n for n in getattr(workflow, "input_nodes", [])
+                     if str(n.node_id).strip() == item["node_id"]
+                     and (str(n.field_name).strip() or "prompt") == item["field_name"]), None)
+
+    @classmethod
+    def _build_config_edit_tips(cls, editable_nodes: list[dict[str, str]], workflow: Any = None) -> str:
+        """构建可编辑配置的确认提示；有可选值时列出简写。"""
         lines = []
-        for index, node in enumerate(editable_nodes, 1):
-            lines.append(f"{index}.{node['label']}：{node['field_value']}")
+        for index, item in enumerate(editable_nodes, 1):
+            line = f"{index}.{item['label']}：{item['field_value']}"
+            node = cls._workflow_node(workflow, item) if workflow is not None else None
+            if node is not None and node.choices:
+                line += f"（可选：{'、'.join(short_choice(c) for c in node.choices)}）"
+            lines.append(line)
         return "\n".join(lines)
 
     @staticmethod
@@ -997,7 +1008,14 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         normalized = str(text or "").strip()
         if normalized in ("", "不变", "跳过", "跳过剩余", "默认", "确认", "ok", "go", "好了", "不修改"):
             return []
-        tokens = re.split(r"[\s,，、]+", normalized)
+        tokens: list[str] = []
+        for part in re.split(r"[\s,，、]+", normalized):
+            # 「16:9 (Widescreen)」这类带括号的完整选项不拆开
+            unclosed = tokens and tokens[-1].count("(") + tokens[-1].count("（") > tokens[-1].count(")") + tokens[-1].count("）")
+            if tokens and (part[:1] in ("(", "（") or unclosed):
+                tokens[-1] += " " + part
+            elif part:
+                tokens.append(part)
         values: list[str | None] = []
         for token in tokens[:count]:
             if token in ("-", "不变", "默认", "保持", "跳过"):
@@ -1052,11 +1070,23 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             )
             return
         values = self._parse_config_edit(text, len(session.editable_nodes))
-        for index, node in enumerate(session.editable_nodes):
+        # 先全部校验并换成完整选项，有一项不对就整条重填，不留下改了一半的配置
+        updates: list[tuple[dict[str, str], str]] = []
+        for index, item in enumerate(session.editable_nodes):
             if index < len(values) and values[index] is not None:
-                self._patch_text_value(
-                    session.collected, node["node_id"], node["field_name"], values[index]
-                )
+                node = self._workflow_node(session.workflow, item)
+                try:
+                    value = validate_parameter(node, values[index]) if node is not None else values[index]
+                except PlanError as exc:
+                    await self.ctx.send.text(
+                        f"{item['label']}：{exc}。请重新回复（带括号的选项可以只写括号前的部分，如「16:9」），"
+                        "或回「不变」全部保持默认",
+                        stream_id,
+                    )
+                    return
+                updates.append((item, value))
+        for item, value in updates:
+            self._patch_text_value(session.collected, item["node_id"], item["field_name"], value)
         region = str(session.workflow.region or "overseas").strip()
         client = self._get_client(region)
         if client is None:
