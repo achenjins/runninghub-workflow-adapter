@@ -5,7 +5,9 @@ do not load the plugin lifecycle, contact the host, or submit media jobs.
 """
 
 import copy
+import json
 from pathlib import Path
+import re
 import tempfile
 import tomllib
 import unittest
@@ -281,6 +283,28 @@ class ConfigurationTests(unittest.TestCase):
         self.assertFalse(feature.enable)
         self.assertFalse(feature.use_llm)
         self.assertEqual(feature.recall_seconds, 0)
+
+
+class DocumentationTests(unittest.TestCase):
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def test_documented_commands_and_sections_exist(self):
+        commands = {c["name"] for c in RunningHubGenericPlugin().get_components() if c["type"] == "COMMAND"}
+        sections = {field.annotation.__ui_label__ for field in GenericConfig.model_fields.values()}
+        for name in ("README.md", "config.example.toml"):
+            text = (self.ROOT / name).read_text(encoding="utf-8")
+            used = set(re.findall(r"(?<![\w/.:<])/((?:rh)?[\u4e00-\u9fff]+)", text))
+            self.assertLessEqual(used, commands, name)
+            for retired in ("RunningHub 服务", "访问控制", "功能设置"):
+                self.assertNotIn(retired, text, name)
+        self.assertTrue({"平台连接", "使用权限", "辅助功能"} <= sections)
+
+    def test_quick_start_mentions_admin_and_badge_matches_manifest(self):
+        readme = (self.ROOT / "README.md").read_text(encoding="utf-8")
+        quick_start = readme.split("### 第 2 步")[0]
+        self.assertIn("「使用权限」→「管理员」", quick_start)
+        version = json.loads((self.ROOT / "_manifest.json").read_text(encoding="utf-8"))["version"]
+        self.assertIn(f"badge/version-{version.replace('-', '--')}-", readme)
 
 
 if __name__ == "__main__":

@@ -124,6 +124,7 @@ class AccessSection(PluginConfigBase):
     admin_users: list[str] = Field(default_factory=list, description="可导入工作流、管理当前会话任务。",
                                   json_schema_extra={"label": "管理员", "placeholder": "用户号码，每行一个"})
     manage_workflows_admin_only: bool = _setting(True, "仅管理员导入", "限制通过聊天识别并保存工作流。")
+    allow_plugin_api: bool = _setting(False, "允许其他插件调用", "开启后其他插件可代用户提交付费任务；调用方传入的用户和群不经宿主验证。")
 
 
 class NaturalLanguageSection(PluginConfigBase):

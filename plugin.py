@@ -16,16 +16,19 @@
 - 命令：``/识别国内工作流 <工作流ID>`` / ``/识别国外工作流 <工作流ID>`` 识别关键节点（分别配置区域）
 - 命令：``/详细识别国内工作流 <工作流ID>`` / ``/详细识别国外工作流 <工作流ID>`` LLM 详细识别全部节点
 - 工具：``run_workflow``（供 LLM 调用）
-- API：``run_workflow_api``（public，供其他插件调用）
+- API：``run_workflow_api``（public，供其他插件调用；需开启 access.allow_plugin_api）
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
+import os
 import re
+import shutil
 import sys
 import time
 from collections.abc import Mapping
@@ -55,7 +58,8 @@ from rh_generic_lib.configuration import (  # noqa: E402
     GenericConfig, InputNodeSection, PluginMetaSection, WorkflowItemSection, build_item_fields, localize_schema,
     migrate_legacy_feature_sections,
 )
-from rh_generic_lib.media_plan import validate_workflow, PlanError  # noqa: E402
+from rh_generic_lib.media_plan import validate_workflow, validate_parameter, PlanError  # noqa: E402
+from rh_generic_lib.workflow_presets import match_workflow_preset  # noqa: E402
 from rh_generic_lib.delivery import NapcatDelivery  # noqa: E402
 from rh_generic_lib.file_source import (  # noqa: E402
     add_trusted_root as file_source_add_trusted_root,
@@ -64,22 +68,20 @@ from rh_generic_lib.file_source import (  # noqa: E402
     extract_files_from_message,
     extract_text_from_message,
     fetch_file_bytes,
-    guess_filename,
     is_finish_signal,
+    prepare_upload,
 )
 from rh_generic_lib.runninghub_client import RunningHubClient, RunningHubError  # noqa: E402
 from rh_generic_lib.session_machine import (  # noqa: E402
     InputSession,
     find_input_session,
-    latest_session_for_keys,
-    remove_session_from_indexes,
     session_key,
 )
 from rh_generic_lib.task_runtime import TaskRuntimeMixin
 from rh_generic_lib.task_queue import TaskLimiter
-from rh_generic_lib.media_context import MediaContextMixin
+from rh_generic_lib.media_context import MediaContextMixin, assets_from_message, identity
 from rh_generic_lib.natural_language import NaturalLanguageMixin
-from rh_generic_lib.task_journal import TaskJournal  # noqa: E402
+from rh_generic_lib.task_journal import ACTIVE_STATUSES, TaskJournal  # noqa: E402
 
 __all__ = ["RunningHubGenericPlugin", "create_plugin"]
 
@@ -181,11 +183,13 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         self._client_cn: RunningHubClient | None = None
         self._limiter = TaskLimiter(2)
         self._leased_jobs = set()
+        # 工作协程收尾期间收到的恢复/补发请求，结束后重新调度
+        self._reschedule_requested = set()
         self._request_lock = asyncio.Lock()
         self._background_tasks = set()
         self._anchors = {}
-        # stream -> (最近一次 before_process 宿主消息的 user_id, 记录时间)；群聊工具身份回退用
-        self._stream_last_sender = {}
+        # stream -> {user_id: 最近发言时间}；群聊工具身份回退用
+        self._stream_senders = {}
         self._contexts = {}
         self._drafts = {}
         self._vision_cache = {}
@@ -195,13 +199,10 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         self._pending: dict[str, asyncio.Task] = {}
         self._recall_tasks: set[asyncio.Task] = set()
         self._input_sessions: dict[str, InputSession] = {}
-        self._input_session_keys_by_stream: dict[str, set[str]] = {}
-        self._input_session_keys_by_user: dict[str, set[str]] = {}
         self._config_write_lock: asyncio.Lock = asyncio.Lock()
         self._cleanup_task: asyncio.Task | None = None
         self._cache_dir: Path | None = None
         self._workflows: list[WorkflowItemSection] = []
-        self._task_meta: dict[str, dict[str, str]] = {}
         self._cancel_choices: dict[str, tuple[float, list[str]]] = {}
         self._delivery: NapcatDelivery | None = None
         self._task_journal: TaskJournal | None = None
@@ -309,10 +310,10 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         self._pending.clear()
         self._recall_tasks.clear()
         self._input_sessions.clear()
-        self._input_session_keys_by_stream.clear()
-        self._input_session_keys_by_user.clear()
-        self._task_meta.clear()
         self._cancel_choices.clear()
+        for client in (self._client, self._client_cn):
+            if client is not None:
+                client.close()
         self._client = None
         self._client_cn = None
         self.ctx.logger.info("麦麦画师插件已卸载")
@@ -360,7 +361,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         while True:
             try:
                 await asyncio.sleep(5)
-                self._cleanup_cache_once(max_age_seconds=max_age)
+                await asyncio.to_thread(self._cleanup_cache_once, max_age_seconds=max_age)
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 raise
@@ -369,7 +370,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
                 await asyncio.sleep(interval)
 
     def _cleanup_cache_once(self, *, max_age_seconds: int) -> None:
-        """清理缓存目录中超过保留时间的文件（同步，经 to_thread 调用更佳）。"""
+        """清理缓存目录中超过保留时间的文件（同步实现，由 _cleanup_cache_loop 放到线程执行）。"""
         cache_dir = self._get_cache_dir()
         if cache_dir is None:
             return
@@ -413,6 +414,9 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             "max_file_bytes": cfg.generation.max_file_mb * 1024 * 1024,
             "query_retries": cfg.generation.query_retries,
         }
+        for old in (self._client, self._client_cn):
+            if old is not None:
+                old.close()
         self._client = RunningHubClient(
             base_url=cfg.server.base_url, api_key=cfg.server.api_key, **kwargs
         )
@@ -530,11 +534,6 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
     def _describe_file_inputs(self, workflow: WorkflowItemSection) -> str:
         """汇总该工作流需要用户上传的文件输入（委托 workflow_runner）。"""
         return workflow_runner.describe_file_inputs(workflow)
-
-    @staticmethod
-    def _format_file_counts(images: int, audios: int, videos: int = 0) -> str:
-        """按实际上传数量生成简短描述（0 的类别省略）。"""
-        return workflow_runner.format_file_counts(images, audios, videos)
 
     def _prompt_nodes(self, workflow: WorkflowItemSection) -> list[InputNodeSection]:
         """返回所有主提示词节点（prompt 类型，最多允许一个）。"""
@@ -841,7 +840,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         return session_key(user_id, stream_id)
 
     def _register_input_session(self, session: InputSession) -> str:
-        """把会话写入主表与 user/stream 索引，返回会话键。"""
+        """把会话写入会话表，返回会话键。"""
         key = self._session_key(session.user_id, session.stream_id)
         old_session = self._input_sessions.get(key)
         if old_session is not None and old_session is not session:
@@ -849,39 +848,15 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         # 重新插入以更新注册顺序，保证“最近会话”回退按最新触发优先
         self._input_sessions.pop(key, None)
         self._input_sessions[key] = session
-        if session.stream_id:
-            self._input_session_keys_by_stream.setdefault(session.stream_id, set()).add(key)
-        if session.user_id:
-            self._input_session_keys_by_user.setdefault(session.user_id, set()).add(key)
         return key
 
     def _remove_input_session(self, key: str) -> InputSession | None:
-        """从主表与索引中删除会话（委托 session_machine）。"""
-        session = self._input_sessions.get(key)
-        if session is None:
-            return None
-        remove_session_from_indexes(
-            session,
-            key,
-            self._input_sessions,
-            self._input_session_keys_by_stream,
-            self._input_session_keys_by_user,
-        )
-        return session
-
-    def _latest_session_for_keys(self, keys: set[str]) -> InputSession | None:
-        """从会话键集合中返回最近注册的会话（委托 session_machine）。"""
-        return latest_session_for_keys(self._input_sessions, keys)
+        """从会话表中删除会话。"""
+        return self._input_sessions.pop(key, None)
 
     def _find_input_session(self, user_id: str, stream_id: str) -> InputSession | None:
         """按 user_id + stream_id 精确查找；降级时不得跨用户取同群其他人的会话。"""
-        return find_input_session(
-            self._input_sessions,
-            self._input_session_keys_by_stream,
-            self._input_session_keys_by_user,
-            user_id,
-            stream_id,
-        )
+        return find_input_session(self._input_sessions, user_id, stream_id)
 
     async def _handle_incoming_files(self, user_id: str, stream_id: str, message: dict) -> bool:
         """处理交互式收集中的文件消息，返回是否已消费该消息。"""
@@ -890,10 +865,8 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             return False
         key = self._session_key(session.user_id, session.stream_id)
 
-        from rh_generic_lib.media_context import assets_from_message
         assets = assets_from_message(message, stream_id, "current")
         if assets and message.get("message_id"):
-            import base64
             client = self._get_client(session.workflow.region)
             files = []
             for asset in assets:
@@ -942,7 +915,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             node = session.waiting_nodes.pop(index)
             try:
                 file_data = await self._fetch_file_bytes(source)
-                filename = self._guess_filename(source, file_type, file_data)
+                filename, file_data = prepare_upload(file_type, file_data)
                 file_name = await client.upload_file(file_data, filename)
             except Exception as exc:
                 self.ctx.logger.error("上传文件到 RunningHub 失败: %s", exc)
@@ -959,16 +932,11 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
                 }
             )
             if file_type == "image":
-                session.uploaded_images += 1
                 await self._remember_image_usage(
                     {"media_id": "input-" + hashlib.sha256(file_data).hexdigest(), "type": "image"},
                     file_data, session.user_id, stream_id)
                 if session.cancelled or self._input_sessions.get(key) is not session:
                     return True
-            elif file_type == "audio":
-                session.uploaded_audios += 1
-            elif file_type == "video":
-                session.uploaded_videos += 1
             self.ctx.logger.info("已接收输入 %s: %s", node["label"], file_name)
 
         if session.waiting_nodes:
@@ -984,10 +952,13 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
     async def _ask_config_edit(self, session: InputSession, stream_id: str, notice: str = "") -> None:
         """进入可编辑配置确认阶段并向用户发确认提示。"""
         session.phase = "config"
-        tips = self._build_config_edit_tips(session.editable_nodes)
+        tips = self._build_config_edit_tips(session.editable_nodes, session.workflow)
+        has_choices = any(getattr(self._workflow_node(session.workflow, item), "choices", None)
+                          for item in session.editable_nodes)
+        example = "有选项的回序号，如「2」" if has_choices else "如「512 16:9」"
         prefix = f"{notice}。" if notice else ""
         await self.ctx.send.text(
-            f"{prefix}可修改：\n{tips}\n（回复新值，如「512 16:9」，- 保持默认，「不变」全默认）",
+            f"{prefix}可修改：\n{tips}\n（按顺序回复新值，用空格分隔，{example}；- 保持默认，「不变」全默认）",
             stream_id,
         )
 
@@ -1013,12 +984,33 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         await self._submit_collected_session(session, key, stream_id, client, notice + "，开始运行")
 
     @staticmethod
-    def _build_config_edit_tips(editable_nodes: list[dict[str, str]]) -> str:
-        """构建可编辑配置的确认提示。"""
+    def _workflow_node(workflow: Any, item: dict[str, str]) -> Any | None:
+        """按节点编号和字段名找回可编辑项对应的配置节点（用于取可选值和校验规则）。"""
+        return next((n for n in getattr(workflow, "input_nodes", [])
+                     if str(n.node_id).strip() == item["node_id"]
+                     and (str(n.field_name).strip() or "prompt") == item["field_name"]), None)
+
+    @classmethod
+    def _build_config_edit_tips(cls, editable_nodes: list[dict[str, str]], workflow: Any = None) -> str:
+        """构建可编辑配置的确认提示；有可选值时逐行列出带序号的选项。"""
         lines = []
-        for index, node in enumerate(editable_nodes, 1):
-            lines.append(f"{index}.{node['label']}：{node['field_value']}")
+        for index, item in enumerate(editable_nodes, 1):
+            lines.append(f"{index}.{item['label']}：{item['field_value']}")
+            node = cls._workflow_node(workflow, item) if workflow is not None else None
+            if node is not None and node.choices:
+                lines.extend(f"   {number}) {choice}" for number, choice in enumerate(node.choices, 1))
         return "\n".join(lines)
+
+    @staticmethod
+    def _pick_choice(node: Any, value: str) -> str:
+        """有可选值时允许回序号：原值就是选项时照用，否则把数字当作 1 起的序号。"""
+        choices = [str(c) for c in getattr(node, "choices", None) or []]
+        if choices and value not in choices and value.isdigit():
+            number = int(value)
+            if not 1 <= number <= len(choices):
+                raise PlanError(f"请回复选项序号 1～{len(choices)}")
+            return choices[number - 1]
+        return value
 
     @staticmethod
     def _parse_config_edit(text: str, count: int) -> list[str | None]:
@@ -1029,7 +1021,14 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         normalized = str(text or "").strip()
         if normalized in ("", "不变", "跳过", "跳过剩余", "默认", "确认", "ok", "go", "好了", "不修改"):
             return []
-        tokens = re.split(r"[\s,，、]+", normalized)
+        tokens: list[str] = []
+        for part in re.split(r"[\s,，、]+", normalized):
+            # 「16:9 (Widescreen)」这类带括号的完整选项不拆开
+            unclosed = tokens and tokens[-1].count("(") + tokens[-1].count("（") > tokens[-1].count(")") + tokens[-1].count("）")
+            if tokens and (part[:1] in ("(", "（") or unclosed):
+                tokens[-1] += " " + part
+            elif part:
+                tokens.append(part)
         values: list[str | None] = []
         for token in tokens[:count]:
             if token in ("-", "不变", "默认", "保持", "跳过"):
@@ -1084,11 +1083,23 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             )
             return
         values = self._parse_config_edit(text, len(session.editable_nodes))
-        for index, node in enumerate(session.editable_nodes):
+        # 先全部校验并换成完整选项，有一项不对就整条重填，不留下改了一半的配置
+        updates: list[tuple[dict[str, str], str]] = []
+        for index, item in enumerate(session.editable_nodes):
             if index < len(values) and values[index] is not None:
-                self._patch_text_value(
-                    session.collected, node["node_id"], node["field_name"], values[index]
-                )
+                node = self._workflow_node(session.workflow, item)
+                try:
+                    value = (validate_parameter(node, self._pick_choice(node, values[index]))
+                             if node is not None else values[index])
+                except PlanError as exc:
+                    await self.ctx.send.text(
+                        f"{item['label']}：{exc}。请重新回复（有选项的参数回序号），或回「不变」全部保持默认",
+                        stream_id,
+                    )
+                    return
+                updates.append((item, value))
+        for item, value in updates:
+            self._patch_text_value(session.collected, item["node_id"], item["field_name"], value)
         region = str(session.workflow.region or "overseas").strip()
         client = self._get_client(region)
         if client is None:
@@ -1113,16 +1124,12 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             self._remove_input_session(key)
             if session.expire_task:
                 session.expire_task.cancel()
-        if not result["success"]:
+            if result.get("notice"):
+                await self.ctx.send.text(result["notice"], stream_id)
+        else:
             await self.ctx.send.text(result["message"], stream_id)
 
-    async def _finish_input_session(
-        self,
-        user_id: str,
-        stream_id: str,
-        *,
-        skip_remaining: bool = True,
-    ) -> bool:
+    async def _finish_input_session(self, user_id: str, stream_id: str) -> bool:
         """跳过剩余文件节点，用已收集的输入直接提交；返回是否已消费该消息。"""
         session = self._find_input_session(user_id, stream_id)
         if session is None:
@@ -1187,16 +1194,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         """从 base64 数据、URL 或本地路径获取文件字节（委托 file_source）。"""
         return await fetch_file_bytes(source, self._client)
 
-    @staticmethod
-    def _guess_filename(source: str, file_type: str, file_data: bytes | None = None) -> str:
-        """根据来源/字节猜测文件名（委托 file_source）。"""
-        return guess_filename(source, file_type, file_data)
-
-
-
-
     # ── 轮询发送 / 撤回 ──────────────────────────────────────────
-
 
     async def _trigger_llm_result_reply(self, stream_id: str, *, status_message: str = "") -> bool | None:
         """返回 True=已接受、False=明确不可用、None=响应未知，不重复触发。"""
@@ -1268,7 +1266,6 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
     async def handle_input_collector(self, message: dict | None = None, **kwargs: Any) -> dict | None:
         if not isinstance(message, dict):
             return None
-        from rh_generic_lib.media_context import identity
         uid, stream = identity(message)
         uid = uid or str(kwargs.get("user_id") or "")
         stream = stream or str(kwargs.get("stream_id") or kwargs.get("chat_id") or "")
@@ -1303,7 +1300,6 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             return None
         if session.phase not in {"text", "config"} and not self._is_finish_signal(text) and not self._extract_files_from_message(message):
             # SDK may serialize binary_hash without a source URL.
-            from rh_generic_lib.media_context import assets_from_message
             if not assets_from_message(message, stream, "current"):
                 return None
         async def consume():
@@ -1312,7 +1308,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             elif session.phase == "config":
                 await self._handle_config_edit(session, stream, message)
             elif self._is_finish_signal(text):
-                await self._finish_input_session(uid, stream, skip_remaining=True)
+                await self._finish_input_session(uid, stream)
             else:
                 await self._handle_incoming_files(uid, stream, message)
         self._queue_session_action(session, consume)
@@ -1355,7 +1351,6 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             await self.ctx.send.text("已中断输入收集", stream)
             return True, "", 1
         journal = await self._load_task_journal()
-        from rh_generic_lib.task_journal import ACTIVE_STATUSES
         tasks = [r for r in journal.records() if r["stream_id"] == stream and r["status"] in ACTIVE_STATUSES
                  and (r["user_id"] == uid or self._is_admin(uid))]
         if not tasks:
@@ -1434,7 +1429,6 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             return None
         async def consume_notice():
             file_data = await self._fetch_napcat_file_bytes(file_id, group_id)
-            import base64
             source = "base64://" + base64.b64encode(file_data).decode("ascii")
             await self._consume_files(session, key, [(file_type, source)], stream_id, client)
         self._queue_session_action(session, consume_notice)
@@ -1484,66 +1478,24 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
 
     @Command("识别国内工作流", description="识别国内工作流（runninghub.cn），仅提取文字/图片/音频/视频/分辨率/长宽比例等关键节点，例如：/识别国内工作流 2087492768787685378 动漫生图", pattern=r"^/识别国内工作流")
     async def handle_detect_domestic_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
-        stream_id = str(kwargs.get("stream_id") or "")
-        allowed, deny_msg = self._check_access_from_kwargs(kwargs)
-        if not allowed:
-            await self.ctx.send.text(deny_msg, stream_id)
-            return True, "", 1
-        if self.config.access.manage_workflows_admin_only and not self._is_admin(str(kwargs.get("user_id") or "")):
-            await self.ctx.send.text("识别并写入工作流配置需要管理员权限，请设置 access.admin_users", stream_id)
-            return True, "", 1
-        plain_text = self._command_text(kwargs)
-        rest = re.sub(r"^/识别国内工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
-        if not rest:
-            await self.ctx.send.text("用法：/识别国内工作流 <工作流ID> [工作流名称]", stream_id)
-            return True, "", 1
-        parts = rest.split(maxsplit=1)
-        workflow_id = parts[0].strip()
-        workflow_name = parts[1].strip() if len(parts) > 1 else workflow_id
-        return await self._detect_and_write(workflow_id, workflow_name, stream_id, detailed=False, region="domestic")
+        return await self._run_detect_command(kwargs, "识别国内工作流", detailed=False, region="domestic")
 
     @Command("识别国外工作流", description="识别国外工作流（runninghub.ai），仅提取文字/图片/音频/视频/分辨率/长宽比例等关键节点，例如：/识别国外工作流 2087492768787685378 动漫生图", pattern=r"^/识别国外工作流")
     async def handle_detect_overseas_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
-        stream_id = str(kwargs.get("stream_id") or "")
-        allowed, deny_msg = self._check_access_from_kwargs(kwargs)
-        if not allowed:
-            await self.ctx.send.text(deny_msg, stream_id)
-            return True, "", 1
-        if self.config.access.manage_workflows_admin_only and not self._is_admin(str(kwargs.get("user_id") or "")):
-            await self.ctx.send.text("识别并写入工作流配置需要管理员权限，请设置 access.admin_users", stream_id)
-            return True, "", 1
-        plain_text = self._command_text(kwargs)
-        rest = re.sub(r"^/识别国外工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
-        if not rest:
-            await self.ctx.send.text("用法：/识别国外工作流 <工作流ID> [工作流名称]", stream_id)
-            return True, "", 1
-        parts = rest.split(maxsplit=1)
-        workflow_id = parts[0].strip()
-        workflow_name = parts[1].strip() if len(parts) > 1 else workflow_id
-        return await self._detect_and_write(workflow_id, workflow_name, stream_id, detailed=False, region="overseas")
+        return await self._run_detect_command(kwargs, "识别国外工作流", detailed=False, region="overseas")
 
     @Command("详细识别国内工作流", description="详细识别国内工作流（runninghub.cn）：用 LLM 识别全部输入节点与配置节点（步数/采样器/CFG/种子等），例如：/详细识别国内工作流 2087492768787685378 动漫生图", pattern=r"^/详细识别国内工作流")
     async def handle_detail_detect_domestic_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
-        stream_id = str(kwargs.get("stream_id") or "")
-        allowed, deny_msg = self._check_access_from_kwargs(kwargs)
-        if not allowed:
-            await self.ctx.send.text(deny_msg, stream_id)
-            return True, "", 1
-        if self.config.access.manage_workflows_admin_only and not self._is_admin(str(kwargs.get("user_id") or "")):
-            await self.ctx.send.text("识别并写入工作流配置需要管理员权限，请设置 access.admin_users", stream_id)
-            return True, "", 1
-        plain_text = self._command_text(kwargs)
-        rest = re.sub(r"^/详细识别国内工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
-        if not rest:
-            await self.ctx.send.text("用法：/详细识别国内工作流 <工作流ID> [工作流名称]", stream_id)
-            return True, "", 1
-        parts = rest.split(maxsplit=1)
-        workflow_id = parts[0].strip()
-        workflow_name = parts[1].strip() if len(parts) > 1 else workflow_id
-        return await self._detect_and_write(workflow_id, workflow_name, stream_id, detailed=True, region="domestic")
+        return await self._run_detect_command(kwargs, "详细识别国内工作流", detailed=True, region="domestic")
 
     @Command("详细识别国外工作流", description="详细识别国外工作流（runninghub.ai）：用 LLM 识别全部输入节点与配置节点（步数/采样器/CFG/种子等），例如：/详细识别国外工作流 2087492768787685378 动漫生图", pattern=r"^/详细识别国外工作流")
     async def handle_detail_detect_overseas_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
+        return await self._run_detect_command(kwargs, "详细识别国外工作流", detailed=True, region="overseas")
+
+    async def _run_detect_command(
+        self, kwargs: dict[str, Any], command: str, *, detailed: bool, region: str
+    ) -> tuple[bool, str, int]:
+        """四个识别命令共用：权限检查、解析「/命令 <工作流ID> [名称]」，再识别并写入配置。"""
         stream_id = str(kwargs.get("stream_id") or "")
         allowed, deny_msg = self._check_access_from_kwargs(kwargs)
         if not allowed:
@@ -1553,14 +1505,14 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             await self.ctx.send.text("识别并写入工作流配置需要管理员权限，请设置 access.admin_users", stream_id)
             return True, "", 1
         plain_text = self._command_text(kwargs)
-        rest = re.sub(r"^/详细识别国外工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
+        rest = re.sub(rf"^/{re.escape(command)}[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
         if not rest:
-            await self.ctx.send.text("用法：/详细识别国外工作流 <工作流ID> [工作流名称]", stream_id)
+            await self.ctx.send.text(f"用法：/{command} <工作流ID> [工作流名称]", stream_id)
             return True, "", 1
         parts = rest.split(maxsplit=1)
         workflow_id = parts[0].strip()
         workflow_name = parts[1].strip() if len(parts) > 1 else workflow_id
-        return await self._detect_and_write(workflow_id, workflow_name, stream_id, detailed=True, region="overseas")
+        return await self._detect_and_write(workflow_id, workflow_name, stream_id, detailed=detailed, region=region)
 
     async def _detect_and_write(
         self,
@@ -1609,7 +1561,11 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             return True, "", 1
         self.ctx.logger.info("[识别] 工作流 JSON 已获取（区域=%s），节点总数=%d", region, len(workflow_json))
 
-        if detailed:
+        # 普通识别先认 README 提供的模板工作流；详细识别本就要列出全部参数，照常识别
+        preset = None if detailed else match_workflow_preset(workflow_json)
+        if preset:
+            detected, detect_method = preset["input_nodes"], f"模板「{preset['title']}」"
+        elif detailed:
             detected, detect_method = await self._detect_full(workflow_json)
         else:
             detected, detect_method = await self._detect_key_full(workflow_json)
@@ -1624,6 +1580,14 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             len(detected),
             ", ".join(f"{n['node_id']}/{n['field_name']}/{n['value_type']}" for n in detected),
         )
+        if sum(n["value_type"] == "prompt" for n in detected) > 1:
+            self.ctx.logger.warning("[识别] 识别出多个主提示词节点，未写入配置")
+            await self.ctx.send.text(
+                "识别出多个主提示词节点，未写入配置。识别结果有一定随机性，建议重新识别一次；"
+                "仍不行请到插件配置页手动配置输入节点",
+                stream_id,
+            )
+            return True, "", 1
 
         try:
             await self._append_workflow_to_config(
@@ -1631,6 +1595,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
                 workflow_id=workflow_id,
                 nodes=detected,
                 region=region,
+                settings=preset["settings"] if preset else None,
             )
         except Exception as exc:
             self.ctx.logger.error("[识别] 写入 config.toml 失败: %s", exc, exc_info=True)
@@ -1638,10 +1603,12 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             return True, "", 1
 
         region_label = "国内" if region == "domestic" else "国外"
-        await self.ctx.send.text(
-            f"识别成功（{detect_method}·{region_label}），共 {len(detected)} 个节点，具体请查看插件配置",
-            stream_id,
-        )
+        if preset:
+            message = (f"识别到模板工作流「{preset['title']}」（{region_label}），已直接应用预设配置，"
+                       "具体配置可在插件配置页修改")
+        else:
+            message = f"识别成功（{detect_method}·{region_label}），共 {len(detected)} 个节点，具体请查看插件配置"
+        await self.ctx.send.text(message, stream_id)
         return True, "", 1
 
     async def _detect_full(self, workflow_json: dict[str, Any]) -> tuple[list[dict[str, str]], str]:
@@ -1784,8 +1751,14 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         config_path = _PLUGIN_DIR / "config.toml"
         tmp_path = config_path.with_suffix(".toml.tmp")
         content = self._serialize_config_file(items)
-        tmp_path.write_text(content, encoding="utf-8")
+        # 文件里有 API Key：临时文件一创建就只让当前用户读写（Windows 上 chmod 只能控制只读位，靠目录 ACL）
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
         try:
+            if config_path.exists():
+                # 沿用管理员给 config.toml 设置的权限
+                shutil.copymode(config_path, tmp_path)
             tmp_path.replace(config_path)
         except Exception:
             tmp_path.unlink(missing_ok=True)
@@ -1917,22 +1890,25 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         *,
         workflow_name: str,
         workflow_id: str,
-        nodes: list[dict[str, str]],
+        nodes: list[dict[str, Any]],
         region: str = "overseas",
+        settings: dict[str, Any] | None = None,
     ) -> None:
         """将识别出的工作流以结构化条目写入 workflows.items 并重建 config.toml。
 
+        settings 覆盖工作流级配置（模板预设的扩写开关、模板路径等），名称、编号和区域始终用调用方给的。
         写盘后立即应用到当前实例（不必等待文件监听的热更新回环）。
         加锁串行化“读配置-合并-写盘-应用”，避免两个识别命令并发时互相覆盖。
         """
         async with self._config_write_lock:
             workflow_dict: dict[str, Any] = {
-                "name": workflow_name,
-                "workflow_id": workflow_id,
                 "instance_type": "Standard",
-                "region": region,
                 "llm_enhance": False,
                 "llm_template_path": "",
+                **(settings or {}),
+                "name": workflow_name,
+                "workflow_id": workflow_id,
+                "region": region,
                 "input_nodes": [
                     {
                         "node_id": str(node.get("node_id") or ""),
@@ -1940,6 +1916,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
                         "field_value": str(node.get("field_value") or ""),
                         "value_type": str(node.get("value_type") or ""),
                         "label": str(node.get("label") or node.get("hint") or ""),
+                        **({"choices": list(node["choices"])} if node.get("choices") else {}),
                     }
                     for node in nodes
                 ],
@@ -2193,6 +2170,8 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         result = await self._start_workflow(workflow_name, command_text, **kwargs)
         if not result["success"] or (result.get("waiting") and not result.get("announced")):
             await self.ctx.send.text(result["message"], stream_id)
+        elif result.get("notice"):
+            await self.ctx.send.text(result["notice"], stream_id)
         return True, "", 1
 
 
@@ -2204,6 +2183,9 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         stream_id: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
+        # 调用方自报 user_id / group_id / stream_id，宿主不做验证：默认关闭，避免绕过白名单扣费或往任意群发图
+        if not self.config.access.allow_plugin_api:
+            return {"success": False, "message": "插件 API 未开启，请在「使用权限」中打开「允许其他插件调用」"}
         kwargs["stream_id"] = stream_id
         return await self._start_workflow(workflow_name, prompt, **kwargs)
 

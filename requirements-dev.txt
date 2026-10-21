@@ -1,2 +1,4 @@
 -r requirements.txt
 maibot-plugin-sdk>=2.0,<3
+# 可选：GIF 表情等图片转 PNG 的测试需要
+Pillow>=10

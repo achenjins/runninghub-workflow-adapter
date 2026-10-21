@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from typing import Any
 
 from .workflow_runner import ordered_nodes, resolve_value_type
@@ -116,8 +117,18 @@ def validate_parameter(node: Any, value: Any) -> str:
         text = text.lower()
     choices = [str(x) for x in getattr(node, "choices", [])]
     if choices and text not in choices:
-        raise PlanError(f"参数 {key} 可选值：{'、'.join(choices)}")
+        # 「16:9 (Widescreen)」这类选项可以只写括号前的「16:9」；不区分大小写和全角冒号，对上唯一一项才算
+        wanted = text.replace("：", ":").casefold()
+        matched = [c for c in choices if wanted in (c.replace("：", ":").casefold(), short_choice(c).replace("：", ":").casefold())]
+        if len(matched) != 1:
+            raise PlanError(f"参数 {key} 可选值：{'、'.join(choices)}")
+        text = matched[0]
     return text
+
+
+def short_choice(choice: str) -> str:
+    """选项括号前的部分，如「16:9 (Widescreen)」→「16:9」；没有括号时原样返回。"""
+    return re.split(r"\s*[(（]", str(choice), maxsplit=1)[0].strip() or str(choice)
 
 
 def _media_key_hint(nodes: dict) -> str:
