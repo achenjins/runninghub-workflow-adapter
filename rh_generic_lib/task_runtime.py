@@ -7,6 +7,8 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
+from .delivery import DeliveryUncertain, NapcatDelivery
+from .file_source import detect_file_type_from_name
 from .media_plan import PlanError, request_fingerprint, validate_parameter, validate_workflow
 from .runninghub_client import RunningHubBusyError, RunningHubError, RunningHubTransportError, RunningHubTaskError
 from .task_journal import ACTIVE_STATUSES
@@ -285,7 +287,6 @@ class TaskRuntimeMixin:
                         if isinstance(item, dict):
                             url = item.get("url") or item.get("outputUrl") or item.get("fileUrl")
                             if url:
-                                from .file_source import detect_file_type_from_name
                                 kind = item.get("outputType") or item.get("fileType") or ""
                                 if not kind and detect_file_type_from_name(str(url)) == "unknown":
                                     kind = record["request"].get("workflow", {}).get("output_type", "")
@@ -350,7 +351,6 @@ class TaskRuntimeMixin:
                 elif self._is_video_url(url, kind):
                     mid = await self._send_video_with_id(url, record["stream_id"], chat_info=record)
                 else:
-                    from .delivery import NapcatDelivery
                     await NapcatDelivery._fallback_send(self.ctx.send.text(f"任务结果 {index + 1}：{url}", record["stream_id"]))
                     mid = ""
                 done.add(index)
@@ -366,7 +366,6 @@ class TaskRuntimeMixin:
                 if mid and cfg.enable and cfg.recall_seconds > 0:
                     self._schedule_recall(mid, cfg.recall_seconds)
             except Exception as exc:
-                from .delivery import DeliveryUncertain
                 # Disk failure after a send also requires manual reconciliation.
                 uncertain = isinstance(exc, (DeliveryUncertain, OSError))
                 await journal.update(record["task_id"], delivery_status="uncertain" if uncertain else "failed",

@@ -11,7 +11,7 @@ import time
 from maibot_sdk import Command, Tool
 from maibot_sdk.types import ToolParameterInfo as Param, ToolParamType as Type
 
-from .file_source import upload_filename
+from .file_source import prepare_upload
 from .image_memory import short_description
 from .media_plan import PlanError, bind_plan, workflow_card, parse_json_object
 from .task_runtime import ADMIN_REVIEW_STATUSES
@@ -286,7 +286,8 @@ class NaturalLanguageMixin:
                 await self._remember_image_usage(item["asset"], data, record["user_id"], record["stream_id"], description=description)
             summaries.append(summary)
             await self._task_journal.update(record["task_id"], message=f"上传参考素材「{item['role']}」到 RunningHub")
-            name = await client.upload_file(data, upload_filename(item["asset"]["type"], data))
+            filename, payload = prepare_upload(item["asset"]["type"], data)
+            name = await client.upload_file(payload, filename)
             nodes.append({"nodeId": item["node_id"], "fieldName": item["field_name"], "fieldValue": name})
         await self._task_journal.update(record["task_id"], message="整理生成提示词")
         prompt = await self._enhance_text(workflow, plan["prompt"], actual_file_desc="\n".join(summaries))

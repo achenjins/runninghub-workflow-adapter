@@ -4,6 +4,7 @@ import base64
 import copy
 import json
 import logging
+import os
 from pathlib import Path
 import tempfile
 import time
@@ -709,15 +710,21 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(schema["required"]["type"], "boolean")
         self.assertEqual(schema["choices"]["type"], "array")
 
+    @unittest.skipUnless(os.name == "posix", "Windows 上 chmod 只能控制只读位，权限由目录 ACL 决定")
     async def test_config_rewrite_keeps_file_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.toml"
             config_path.write_text("[plugin]\n", encoding="utf-8")
-            config_path.chmod(0o600)
+            config_path.chmod(0o640)
+            with patch("plugin._PLUGIN_DIR", Path(directory)):
+                self.p._write_config_file([workflow().model_dump()])
+            self.assertEqual(config_path.stat().st_mode & 0o777, 0o640)
+            self.assertIn("12345", config_path.read_text(encoding="utf-8"))
+            # 首次生成的配置文件同样不给其他用户读
+            config_path.unlink()
             with patch("plugin._PLUGIN_DIR", Path(directory)):
                 self.p._write_config_file([workflow().model_dump()])
             self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
-            self.assertIn("12345", config_path.read_text(encoding="utf-8"))
 
     async def test_matched_groups_and_raw_command_text(self):
         await self.p.handle_pao_tu(user_id="11", stream_id="s1", raw_message="/rh运行 draw cat")
@@ -946,6 +953,24 @@ class PureTests(unittest.IsolatedAsyncioTestCase):
         for file_type, data in (("audio", b"\x02#!SILK_V3"), ("audio", b"#!AMR\n"), ("image", b"GIF89a")):
             with self.assertRaises(RunningHubError):
                 upload_filename(file_type, data)
+
+    async def test_gif_sticker_is_converted_to_png_when_pillow_is_available(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("未安装 Pillow")
+        from io import BytesIO
+        from rh_generic_lib.file_source import prepare_upload
+        frames = [Image.new("RGB", (8, 8), color) for color in ("red", "blue")]
+        gif = BytesIO()
+        frames[0].save(gif, format="GIF", save_all=True, append_images=frames[1:])
+        filename, data = prepare_upload("image", gif.getvalue())
+        self.assertTrue(filename.endswith(".png"))
+        self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"))
+        with Image.open(BytesIO(data)) as converted:
+            self.assertEqual(converted.getpixel((0, 0))[:3], (255, 0, 0))
+        # 能直接上传的格式原样保留，不重新编码
+        self.assertEqual(prepare_upload("image", PNG)[1], PNG)
 
     async def test_video_and_unknown_file_segments(self):
         files = extract_files_from_message({"message": [{"type": "video", "data": {"file": "https://example.test/clip.mp4"}}, {"type": "file", "data": {"name": "x.zip", "url": "https://example.test/x.zip"}}]})
