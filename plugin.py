@@ -59,6 +59,7 @@ from rh_generic_lib.configuration import (  # noqa: E402
     migrate_legacy_feature_sections,
 )
 from rh_generic_lib.media_plan import validate_workflow, PlanError  # noqa: E402
+from rh_generic_lib.workflow_presets import match_workflow_preset  # noqa: E402
 from rh_generic_lib.delivery import NapcatDelivery  # noqa: E402
 from rh_generic_lib.file_source import (  # noqa: E402
     add_trusted_root as file_source_add_trusted_root,
@@ -1517,7 +1518,11 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             return True, "", 1
         self.ctx.logger.info("[识别] 工作流 JSON 已获取（区域=%s），节点总数=%d", region, len(workflow_json))
 
-        if detailed:
+        # 普通识别先认 README 提供的模板工作流；详细识别本就要列出全部参数，照常识别
+        preset = None if detailed else match_workflow_preset(workflow_json)
+        if preset:
+            detected, detect_method = preset["input_nodes"], f"模板「{preset['title']}」"
+        elif detailed:
             detected, detect_method = await self._detect_full(workflow_json)
         else:
             detected, detect_method = await self._detect_key_full(workflow_json)
@@ -1547,6 +1552,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
                 workflow_id=workflow_id,
                 nodes=detected,
                 region=region,
+                settings=preset["settings"] if preset else None,
             )
         except Exception as exc:
             self.ctx.logger.error("[识别] 写入 config.toml 失败: %s", exc, exc_info=True)
@@ -1554,10 +1560,12 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             return True, "", 1
 
         region_label = "国内" if region == "domestic" else "国外"
-        await self.ctx.send.text(
-            f"识别成功（{detect_method}·{region_label}），共 {len(detected)} 个节点，具体请查看插件配置",
-            stream_id,
-        )
+        if preset:
+            message = (f"识别到模板工作流「{preset['title']}」（{region_label}），已直接应用预设配置，"
+                       "具体配置可在插件配置页修改")
+        else:
+            message = f"识别成功（{detect_method}·{region_label}），共 {len(detected)} 个节点，具体请查看插件配置"
+        await self.ctx.send.text(message, stream_id)
         return True, "", 1
 
     async def _detect_full(self, workflow_json: dict[str, Any]) -> tuple[list[dict[str, str]], str]:
@@ -1839,22 +1847,25 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         *,
         workflow_name: str,
         workflow_id: str,
-        nodes: list[dict[str, str]],
+        nodes: list[dict[str, Any]],
         region: str = "overseas",
+        settings: dict[str, Any] | None = None,
     ) -> None:
         """将识别出的工作流以结构化条目写入 workflows.items 并重建 config.toml。
 
+        settings 覆盖工作流级配置（模板预设的扩写开关、模板路径等），名称、编号和区域始终用调用方给的。
         写盘后立即应用到当前实例（不必等待文件监听的热更新回环）。
         加锁串行化“读配置-合并-写盘-应用”，避免两个识别命令并发时互相覆盖。
         """
         async with self._config_write_lock:
             workflow_dict: dict[str, Any] = {
-                "name": workflow_name,
-                "workflow_id": workflow_id,
                 "instance_type": "Standard",
-                "region": region,
                 "llm_enhance": False,
                 "llm_template_path": "",
+                **(settings or {}),
+                "name": workflow_name,
+                "workflow_id": workflow_id,
+                "region": region,
                 "input_nodes": [
                     {
                         "node_id": str(node.get("node_id") or ""),
@@ -1862,6 +1873,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
                         "field_value": str(node.get("field_value") or ""),
                         "value_type": str(node.get("value_type") or ""),
                         "label": str(node.get("label") or node.get("hint") or ""),
+                        **({"choices": list(node["choices"])} if node.get("choices") else {}),
                     }
                     for node in nodes
                 ],

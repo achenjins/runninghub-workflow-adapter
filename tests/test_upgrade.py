@@ -20,6 +20,8 @@ from rh_generic_lib.media_plan import bind_plan, validate_parameter, validate_wo
 from rh_generic_lib.media_context import assets_from_message
 from rh_generic_lib.runninghub_client import RunningHubBusyError, RunningHubClient, RunningHubError, RunningHubTransportError
 from rh_generic_lib.task_journal import TaskJournal
+from rh_generic_lib.workflow_presets import match_workflow_preset
+from rh_generic_lib.workflow_runner import resolve_value_type
 from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"test-image"
@@ -923,8 +925,75 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("validation error", reply)
         self.assertNotIn("anima", [w.name for w in self.p._workflows])
 
+    async def detect_template(self, graph, name, *, detailed=False):
+        self.set_config(workflow(), server={"api_key_cn": "test-key"})
+        self.client.get_workflow_json = AsyncMock(return_value=graph)
+        with tempfile.TemporaryDirectory() as directory, patch("plugin._PLUGIN_DIR", Path(directory)):
+            await self.p._detect_and_write("777", name, "s1", detailed=detailed, region="domestic")
+        return next(w for w in self.p._workflows if w.name == name), self.ctx.send.text.await_args.args[0]
+
+    async def test_detect_applies_qwen_template_with_user_name_and_id(self):
+        wf, reply = await self.detect_template(qwen_template_graph(), "我的qwen")
+        self.assertEqual((wf.workflow_id, wf.region), ("777", "domestic"))
+        self.assertEqual((wf.llm_enhance, wf.llm_template_path), (True, "prompt/qwen_image_prompt_template.md"))
+        self.assertEqual([n.node_id for n in wf.input_nodes], ["420", "432", "433", "436", "435", "434", "494", "424"])
+        ratio = wf.input_nodes[-1]
+        self.assertEqual((resolve_value_type(ratio), ratio.field_value, len(ratio.choices)), ("text", "9:16 (Portrait Widescreen)", 5))
+        self.assertIn("识别到模板工作流", reply)
+        self.assertIn("具体配置可在插件配置页修改", reply)
+        self.ctx.llm.generate.assert_not_awaited()
+
+    async def test_anima_template_only_for_plain_detection(self):
+        wf, reply = await self.detect_template(anima_template_graph(), "二次元")
+        self.assertEqual([(n.node_id, n.field_name) for n in wf.input_nodes], [("353", "prompt")])
+        self.assertEqual(wf.llm_template_path, "prompt/anima3_prompt_template.txt")
+        self.assertIn("识别到模板工作流「anima 提示词生图」", reply)
+        # 详细识别要列出全部参数，不套用模板
+        self.ctx.llm.generate.return_value = {"success": True, "response": json.dumps({"nodes": [
+            {"node_id": "353", "field_name": "prompt", "value_type": "prompt", "label": "提示词"},
+            {"node_id": "362", "field_name": "steps", "value_type": "text", "label": "步数"}]})}
+        wf, reply = await self.detect_template(anima_template_graph(), "二次元详细", detailed=True)
+        self.assertEqual(len(wf.input_nodes), 2)
+        self.assertIn("识别成功", reply)
+
+
+def qwen_template_graph():
+    graph = {node_id: {"class_type": "LoadImage", "inputs": {"image": "None", "upload": "image"}}
+             for node_id in ("420", "432", "433", "434", "435", "436")}
+    graph.update({
+        "416": {"class_type": "KSampler", "inputs": {"positive": ["418", 0], "negative": ["418", 1], "steps": 40}},
+        "418": {"class_type": "TextEncodeQwenImage21", "inputs": {"prompt": ["498", 0], "negative_prompt": "", "resolution": 1024}},
+        "424": {"class_type": "ResolutionSelector", "inputs": {"aspect_ratio": "9:16 (Portrait Widescreen)", "megapixels": 2}},
+        "494": {"class_type": "CR Prompt Text", "inputs": {"prompt": "图1角色三视图"}},
+    })
+    return graph
+
+
+def anima_template_graph():
+    return {
+        "348": {"class_type": "UNETLoader", "inputs": {"unet_name": "anima_baseV10.safetensors"}},
+        "353": {"class_type": "CR Prompt Text", "inputs": {"prompt": "原神刻晴"}},
+        "357": {"class_type": "CLIPTextEncode", "inputs": {"text": ["387", 0], "clip": ["349", 0]}},
+        "358": {"class_type": "CLIPTextEncode", "inputs": {"text": "lowres", "clip": ["349", 0]}},
+        "362": {"class_type": "KSampler", "inputs": {"positive": ["357", 0], "negative": ["358", 0], "steps": 30}},
+        "368": {"class_type": "CR Prompt Text", "inputs": {"prompt": "@artist,"}},
+        "385": {"class_type": "CR Prompt Text", "inputs": {"prompt": "masterpiece"}},
+        "387": {"class_type": "JoinStringMulti", "inputs": {"string_1": ["368", 0], "string_2": ["385", 0], "string_3": ["353", 0]}},
+    }
+
 
 class PureTests(unittest.IsolatedAsyncioTestCase):
+    def test_changed_template_structure_is_not_treated_as_template(self):
+        self.assertEqual(match_workflow_preset(anima_template_graph())["title"], "anima 提示词生图")
+        missing = anima_template_graph()
+        del missing["387"]
+        linked = anima_template_graph()
+        linked["353"]["inputs"]["prompt"] = ["999", 0]
+        retyped = qwen_template_graph()
+        retyped["436"]["class_type"] = "LoadImageMask"
+        for graph in (missing, linked, retyped, {}):
+            self.assertIsNone(match_workflow_preset(graph))
+
     async def test_nested_adapter_response(self):
         result = {"success": True, "result": {"retcode": 0, "data": {"message_id": 123}}}
         self.assertEqual(NapcatDelivery.extract_message_id(result), "123")
