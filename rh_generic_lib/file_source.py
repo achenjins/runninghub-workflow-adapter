@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import os
 import re
 import tempfile
@@ -205,8 +206,9 @@ async def fetch_file_bytes(source: str, client: Any) -> bytes:
         return await client.download_bytes(source)
     path = trusted_local_file(source)
     if path is not None:
-        if path.stat().st_size > getattr(client, "max_file_bytes", MAX_FILE_BYTES):
-            raise RunningHubError(f"文件超过 {MAX_FILE_BYTES} 字节上限，已拒绝")
+        limit = getattr(client, "max_file_bytes", MAX_FILE_BYTES)
+        if path.stat().st_size > limit:
+            raise RunningHubError(f"文件超过 {limit} 字节上限，已拒绝")
         return await asyncio.to_thread(path.read_bytes)
     raise RunningHubError("无法读取文件：本地路径仅限适配器缓存/系统临时目录，其他内容请通过 URL 或重发消息提供")
 
@@ -214,7 +216,7 @@ async def fetch_file_bytes(source: str, client: Any) -> bytes:
 # RunningHub 文件上传支持的格式（官方文档「文件上传」）：
 # 图片 JPG/PNG/JPEG/WEBP，音频 MP3/WAV/FLAC，视频 MP4/AVI/MOV/MKV。
 _UNSUPPORTED_UPLOAD = {
-    "image": "图片只支持 JPG/PNG/WEBP，GIF 动图或表情请先转成 PNG/JPG 再发",
+    "image": "图片只支持 JPG/PNG/WEBP；GIF 动图或表情在安装 Pillow 后会自动取第一帧转成 PNG，否则请先转成 PNG/JPG 再发",
     "audio": "音频只支持 MP3/WAV/FLAC，QQ 语音请改发 MP3 等音频文件",
     "video": "视频只支持 MP4/AVI/MOV/MKV",
 }
@@ -251,6 +253,31 @@ def upload_filename(file_type: str, data: bytes) -> str:
     if not ext:
         raise RunningHubError(f"文件格式不受 RunningHub 支持：{_UNSUPPORTED_UPLOAD.get(file_type, '请换成常见图片、音频或视频格式')}")
     return f"input_{file_type}_{int(time.time())}{ext}"
+
+
+def _image_to_png(data: bytes) -> bytes | None:
+    """平台不收的图片（GIF 表情、BMP 等）取第一帧转成 PNG；没装 Pillow 或解码失败返回 None。"""
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            image.seek(0)
+            output = io.BytesIO()
+            image.convert("RGBA").save(output, format="PNG")
+            return output.getvalue()
+    except Exception:
+        return None
+
+
+def prepare_upload(file_type: str, data: bytes) -> tuple[str, bytes]:
+    """返回 (上传文件名, 上传内容)：QQ 表情多为 GIF，能转换时先转成 PNG，避免任务排队后才失败。"""
+    if file_type == "image" and not _upload_extension(file_type, data):
+        converted = _image_to_png(data)
+        if converted:
+            data = converted
+    return upload_filename(file_type, data), data
 
 
 def decode_base64_bounded(encoded: str, max_bytes: int = MAX_FILE_BYTES) -> bytes:
@@ -308,8 +335,9 @@ async def extract_bytes_from_napcat_result(result: Any, client: Any) -> bytes | 
         if path:
             p = trusted_local_file(path)
             if p is not None:
-                if p.stat().st_size > getattr(client, "max_file_bytes", MAX_FILE_BYTES):
-                    raise RunningHubError(f"本地文件超过 {MAX_FILE_BYTES} 字节上限，已拒绝")
+                limit = getattr(client, "max_file_bytes", MAX_FILE_BYTES)
+                if p.stat().st_size > limit:
+                    raise RunningHubError(f"本地文件超过 {limit} 字节上限，已拒绝")
                 return await asyncio.to_thread(p.read_bytes)
 
     url = result.get("url")

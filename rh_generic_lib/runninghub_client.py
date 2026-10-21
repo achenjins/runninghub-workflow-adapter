@@ -1,11 +1,11 @@
-"""RunningHub 工作流 API 客户端。
+"""RunningHub 工作流 API 客户端（国内 / 海外站点通用）。
 
-封装海外版（runninghub.ai）文生图工作流的提交、查询与结果下载。
-
-对外只暴露三个异步方法：
-- ``submit``：提交任务，返回 task_id
-- ``query``：查询任务状态，SUCCESS 时返回结果列表
-- ``download_base64``：下载图片并以 base64 字符串返回
+主要方法：
+- ``submit``：提交任务，返回 task_id；按响应区分「平台繁忙可重排」「状态不确定」「明确拒绝」
+- ``query`` / ``wait_for_result``：查询与轮询任务状态
+- ``upload_file``：上传输入素材，新接口失败时回退旧接口
+- ``download_bytes`` / ``download_base64``：下载结果
+- ``cancel`` / ``get_workflow_json``：取消任务、读取工作流结构
 
 所有 HTTP 请求通过 ``asyncio.to_thread`` 执行，避免阻塞插件事件循环；同一客户端复用一个 Session。
 """
@@ -41,6 +41,10 @@ class RunningHubError(RuntimeError):
 
 class RunningHubTransportError(RunningHubError):
     """The server outcome is unknown. Never automatically retry a paid POST."""
+
+
+class RunningHubRateLimitError(RunningHubTransportError):
+    """HTTP 429: the request was throttled and not processed. Queries retry later; submit converts it to busy."""
 
 
 class RunningHubBusyError(RunningHubError):
@@ -91,28 +95,46 @@ class RunningHubClient:
             "Authorization": f"Bearer {api_key}",
         }
 
-    async def _post(self, path: str, payload: dict[str, Any], *, use_api_key_header: bool = True) -> dict[str, Any]:
-        """异步发起 POST 请求并解析 JSON 响应。
+    def _send_json(self, path: str, payload: dict[str, Any], headers: dict[str, str]) -> tuple[int, Any]:
+        """发 POST 并返回 (HTTP 状态码, JSON 响应体)；响应体不是 JSON 时为 None。
 
-        所有 requests 异常（HTTPError/超时/断网等）统一包装为 RunningHubError，
-        避免调用方只捕获 RunningHubError 时被未捕获异常打断。
+        只有网络层失败才在这里抛出 RunningHubTransportError。错误响应体里常带
+        errorCode，必须先读出来再按状态码分类，否则限流、并发已满等信息会被丢掉。
         """
+        try:
+            response = self._session.post(f"{self.base_url}{path}", json=payload, headers=headers, timeout=self.timeout)
+        except requests.RequestException as exc:
+            raise RunningHubTransportError(f"请求状态不确定: {exc}") from exc
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        return response.status_code, body
+
+    @staticmethod
+    def _raise_for_status(status: int) -> None:
+        """HTTP 错误分类：429 限流未受理；其余 4xx 明确拒绝；408 / 5xx 状态不确定。"""
+        if status < 400:
+            return
+        if status == 429:
+            raise RunningHubRateLimitError("请求被限流（HTTP 429），平台未受理")
+        if status < 500 and status != 408:
+            raise RunningHubError(f"请求被拒绝（HTTP {status}）")
+        raise RunningHubTransportError(f"请求状态不确定（HTTP {status}）")
+
+    async def _post_raw(self, path: str, payload: dict[str, Any]) -> tuple[int, Any]:
+        return await asyncio.to_thread(self._send_json, path, payload, self._headers(self.api_key))
+
+    async def _post(self, path: str, payload: dict[str, Any], *, use_api_key_header: bool = True) -> dict[str, Any]:
+        """异步发起 POST 请求并解析 JSON 响应（不需要按业务错误码分类的接口使用）。"""
+        headers = self._headers(self.api_key) if use_api_key_header else {"Content-Type": "application/json"}
 
         def _do() -> dict[str, Any]:
-            try:
-                response = self._session.post(
-                    f"{self.base_url}{path}",
-                    json=payload,
-                    headers=self._headers(self.api_key) if use_api_key_header else {"Content-Type": "application/json"},
-                    timeout=self.timeout,
-                )
-                response.raise_for_status()
-                return response.json()
-            except requests.RequestException as exc:
-                response = getattr(exc, "response", None)
-                if response is not None and 400 <= response.status_code < 500 and response.status_code != 408:
-                    raise RunningHubError(f"请求被拒绝（HTTP {response.status_code}）") from exc
-                raise RunningHubTransportError(f"请求状态不确定: {exc}") from exc
+            status, body = self._send_json(path, payload, headers)
+            self._raise_for_status(status)
+            if body is None:
+                raise RunningHubTransportError(f"响应不是 JSON（HTTP {status}），请求状态不确定")
+            return body
 
         return await asyncio.to_thread(_do)
 
@@ -150,20 +172,21 @@ class RunningHubClient:
         payload = {"nodeInfoList": node_info_list or [], "usePersonalQueue": False, "addMetadata": False}
         if instance_type != "Standard":
             payload["instanceType"] = instance_type.lower()
-        result = await self._post(f"/openapi/v2/run/workflow/{target_workflow}", payload)
-        if not isinstance(result, dict):
-            raise RunningHubTransportError("提交响应格式异常，无法确认任务是否创建")
-        task_id = result.get("taskId")
-        if not task_id:
-            code = str(result.get("errorCode") or result.get("code") or "")
-            if code in _SUBMIT_RETRY_CODES:
-                raise RunningHubBusyError(f"{result.get('errorMessage') or result.get('msg') or '平台繁忙'}（{code}）")
-            if code in _SUBMIT_UNKNOWN_CODES:
-                raise RunningHubTransportError(f"提交时平台内部错误，无法确认任务是否创建（{code}）")
-            if result.get("errorMessage") or code not in ("", "0", "200"):
-                raise RunningHubError(f"提交任务被拒绝: {result.get('errorMessage') or code}")
-            raise RunningHubTransportError("提交响应缺少 taskId，无法确认是否已创建任务")
-        return str(task_id)
+        status, result = await self._post_raw(f"/openapi/v2/run/workflow/{target_workflow}", payload)
+        body = result if isinstance(result, dict) else {}
+        task_id = body.get("taskId") if status < 400 else None
+        if task_id:
+            return str(task_id)
+        code = str(body.get("errorCode") or body.get("code") or "")
+        message = str(body.get("errorMessage") or body.get("msg") or body.get("message") or "")
+        detail = code or f"HTTP {status}"
+        if status == 429 or code in _SUBMIT_RETRY_CODES:
+            raise RunningHubBusyError(f"{message or '平台繁忙'}（{detail}）")
+        if code in _SUBMIT_UNKNOWN_CODES or status >= 500 or status == 408 or (result is None and status < 400):
+            raise RunningHubTransportError(f"提交时平台出错或响应异常，无法确认任务是否创建（{detail}）")
+        if status >= 400 or message or code not in ("", "0", "200"):
+            raise RunningHubError(f"提交任务被拒绝: {message or detail}")
+        raise RunningHubTransportError("提交响应缺少 taskId，无法确认是否已创建任务")
 
     async def query(self, task_id: str) -> dict[str, Any]:
         """查询任务状态。
@@ -174,20 +197,25 @@ class RunningHubClient:
                 ``CANCEL`` 等，SUCCESS 时 ``results`` 列表包含 ``url`` 等结果字段。
 
         Raises:
-            RunningHubTransportError: 平台返回限流/繁忙错误码，可稍后重试。
+            RunningHubTransportError: 限流（HTTP 429 或繁忙错误码）、超时或 5xx，可稍后重试。
             RunningHubTaskError: 平台报告任务不存在或已过期。
-            RunningHubError: 平台以 HTTP 200 + errorCode 拒绝查询（如 Key 无效）。
+            RunningHubError: 平台明确拒绝查询（如 Key 无效）。
         """
-        result = await self._post("/openapi/v2/query", {"taskId": str(task_id)})
-        if isinstance(result, dict) and not result.get("status") and result.get("errorCode"):
-            code = str(result["errorCode"])
-            message = f"{result.get('errorMessage') or '查询被拒绝'}（{code}）"
-            if code in _BUSY_CODES:
-                raise RunningHubTransportError(message)
-            if code in _TASK_GONE_CODES:
-                raise RunningHubTaskError(message)
-            raise RunningHubError(message)
-        return result
+        status, result = await self._post_raw("/openapi/v2/query", {"taskId": str(task_id)})
+        body = result if isinstance(result, dict) else {}
+        code = str(body.get("errorCode") or "")
+        if status < 400 and not (code and not body.get("status")):
+            if result is None:
+                raise RunningHubTransportError(f"查询响应不是 JSON（HTTP {status}），远端任务状态未知")
+            return result
+        message = f"{body.get('errorMessage') or '查询被拒绝'}（{code or f'HTTP {status}'}）"
+        if status == 429:
+            raise RunningHubRateLimitError(message)
+        if status == 408 or status >= 500 or code in _BUSY_CODES:
+            raise RunningHubTransportError(message)
+        if code in _TASK_GONE_CODES:
+            raise RunningHubTaskError(message)
+        raise RunningHubError(message)
 
     async def cancel(self, task_id: str) -> dict[str, Any]:
         """取消任务（POST /task/openapi/cancel）。
@@ -238,56 +266,54 @@ class RunningHubClient:
         return await asyncio.to_thread(_do)
 
     async def upload_file(self, file_data: bytes, filename: str) -> str:
-        """上传文件到 RunningHub，返回文件名（新接口，形如 openapi/xxx.png）。
+        """上传文件到 RunningHub，返回可直接作为节点 fieldValue 的文件名。
 
-        官方新接口：POST /openapi/v2/media/upload/binary，
-        header Authorization（Bearer），multipart 仅 file 字段。
-        响应：{code:200, message, data:{type, download_url, filename, size}}。
-        兼容旧接口响应（code:0 / data.fileName）。
-
-        Args:
-            file_data: 文件字节内容。
-            filename: 文件名（含扩展名）。
-
-        Returns:
-            str: RunningHub 文件名（可直接作为节点 fieldValue）。
+        先用官方新接口 ``POST /openapi/v2/media/upload/binary``（返回 openapi/xxx）；
+        失败时回退旧接口 ``POST /task/openapi/upload``（返回 api/xxx）。新接口的体积
+        上限更严，个别部署也只认旧接口路径。上传不扣费，换接口重试是安全的。
 
         Raises:
-            RunningHubError: 上传失败时抛出。
+            RunningHubError: 两个接口都失败时抛出，消息里带两次失败原因。
         """
-
         if len(file_data) > self.max_file_bytes:
             raise RunningHubError("上传文件超过配置的大小上限")
+        try:
+            return await self._upload(
+                "/openapi/v2/media/upload/binary", file_data, filename, form=None)
+        except RunningHubError as first:
+            try:
+                return await self._upload(
+                    "/task/openapi/upload", file_data, filename,
+                    form={"apiKey": self.api_key, "fileType": "input"})
+            except RunningHubError as second:
+                raise RunningHubError(f"上传文件失败：新接口 {first}；旧接口 {second}") from second
 
-        def _do() -> dict[str, Any]:
+    async def _upload(self, path: str, file_data: bytes, filename: str, *, form: dict[str, str] | None) -> str:
+        def _do() -> Any:
             try:
                 response = self._session.post(
-                    f"{self.base_url}/openapi/v2/media/upload/binary",
+                    f"{self.base_url}{path}",
                     headers={"Authorization": f"Bearer {self.api_key}"},
+                    data=form,
                     files={"file": (filename, file_data)},
                     timeout=self.timeout,
                 )
                 response.raise_for_status()
                 return response.json()
-            except requests.RequestException as exc:
-                raise RunningHubError(f"上传失败: {exc}") from exc
+            except (requests.RequestException, ValueError) as exc:
+                raise RunningHubError(f"请求失败: {exc}") from exc
 
         result = await asyncio.to_thread(_do)
         if not isinstance(result, dict):
-            raise RunningHubError("上传文件失败: 响应格式异常")
-        code = result.get("code")
-        # 新接口成功码为 200，旧接口为 0
-        if code not in (0, 200, None):
-            raise RunningHubError(
-                f"上传文件失败: {result.get('message') or result.get('msg') or result}"
-            )
+            raise RunningHubError("响应格式异常")
+        # 新接口成功码为 200（文档写 0），旧接口为 0
+        if result.get("code") not in (0, 200, None):
+            raise RunningHubError(str(result.get("message") or result.get("msg") or result))
         data = result.get("data")
-        file_name = ""
-        if isinstance(data, dict):
-            # 新接口字段 filename，旧接口 fileName
-            file_name = str(data.get("filename") or data.get("fileName") or "")
+        # 新接口字段 filename，旧接口 fileName
+        file_name = str(data.get("filename") or data.get("fileName") or "") if isinstance(data, dict) else ""
         if not file_name:
-            raise RunningHubError("上传文件失败: 响应缺少 filename")
+            raise RunningHubError("响应缺少 filename")
         return file_name
 
     async def get_workflow_json(self, workflow_id: str) -> dict[str, Any]:

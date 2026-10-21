@@ -9,9 +9,12 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
+
+from .background_io import finish_in_thread
 
 STATUS_PENDING = "pending"
 STATUS_SUCCESS = "success"
@@ -62,8 +65,11 @@ class TaskJournal:
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
             except FileNotFoundError:
                 return []
+            except ValueError as exc:
+                # 不自动换成旧备份：旧状态里的排队任务可能已经提交过，重放会重复扣费
+                raise ValueError(f"任务日志无法解析，拒绝覆盖；请备份并检查 {self.path}：{exc}") from exc
             if not isinstance(raw, list):
-                raise ValueError("任务日志结构损坏，拒绝覆盖；请备份并检查 task_journal.json")
+                raise ValueError(f"任务日志结构损坏，拒绝覆盖；请备份并检查 {self.path}")
             records: list[dict[str, Any]] = []
             for item in raw:
                 if not isinstance(item, dict) or not str(item.get("task_id") or "").strip():
@@ -218,17 +224,22 @@ class TaskJournal:
     async def _write_locked(self) -> None:
         """调用方必须持有 self._lock。
 
-        同步写入紧凑 JSON：取消任务时不会在文件写入中间留下半截状态，也不会把
-        CancelledError 传播给调用方。
+        序列化与写盘都在线程里完成，不阻塞事件循环；期间收到的取消推迟到文件替换
+        完成后再抛出，锁不会在写到一半时被释放，磁盘与内存状态保持一致。
         """
+        # 记录只整条替换、不原地修改，浅拷贝列表即可安全交给线程
+        await finish_in_thread(self._write_file, list(self._records))
+
+    def _write_file(self, records: list[dict[str, Any]]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp = self.path.with_suffix(self.path.suffix + ".tmp")
         try:
-            temp.write_text(
-                json.dumps(self._records, ensure_ascii=False, separators=(",", ":")),
-                encoding="utf-8",
-            )
-            temp.replace(self.path)
+            with open(temp, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(records, ensure_ascii=False, separators=(",", ":")))
+                handle.flush()
+                # 断电时不能留下空文件：日志损坏会让插件拒绝启动
+                os.fsync(handle.fileno())
+            os.replace(temp, self.path)
         except OSError:
             # A paid submission must not proceed if its reservation cannot be saved.
             temp.unlink(missing_ok=True)

@@ -40,6 +40,8 @@ max_per_user_per_hour = 0
 admin_users = []
 # 聊天中识别并写入工作流配置需要先填好上面的管理员 QQ
 manage_workflows_admin_only = true
+# 是否允许其他插件通过 run_workflow_api 代用户提交任务（调用方自报身份，宿主不验证）
+allow_plugin_api = false
 
 [natural_language]
 enabled = true

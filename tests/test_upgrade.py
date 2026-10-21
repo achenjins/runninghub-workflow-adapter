@@ -4,6 +4,7 @@ import base64
 import copy
 import json
 import logging
+import os
 from pathlib import Path
 import tempfile
 import time
@@ -168,6 +169,30 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.p._task_journal.records(), [])
         self.client.submit.assert_not_awaited()
 
+    async def test_group_tool_identity_is_strict_when_access_is_limited(self):
+        # 请求人 130 秒前发言、别人 2 秒前插话：开启白名单或限频时不能把任务记到插话的人头上
+        for access in ({"allow_users": ["11", "77"]}, {"max_per_user_per_hour": 5}):
+            self.set_config(workflow(), access=access)
+            now = time.time()
+            self.p._stream_senders["s1"] = {"77": now - 130, "11": now - 2}
+            result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
+            await self.settled()
+            self.assertFalse(result["success"])
+            self.assertIn("多人发言", result["message"])
+        self.assertEqual(self.p._task_journal.records(), [])
+        self.client.submit.assert_not_awaited()
+
+    async def test_plugin_api_is_disabled_by_default(self):
+        args = {"stream_id": "s1", "user_id": "11", "group_id": "22"}
+        result = await self.p.handle_run_workflow_api("draw", "cat", **args)
+        self.assertFalse(result["success"])
+        self.assertIn("允许其他插件调用", result["message"])
+        self.set_config(workflow(), access={"allow_plugin_api": True})
+        result = await self.p.handle_run_workflow_api("draw", "cat", **args)
+        self.assertTrue(result["success"], result.get("message"))
+        await self.settled()
+        self.client.submit.assert_awaited_once()
+
     async def test_definite_query_error_pauses_for_manual_recovery(self):
         # 查询被拒绝时停止自动轮询，保留远端任务；修复后恢复且不重复提交。
         self.client.wait_for_result.side_effect = RunningHubError("APIKEY_USER_NOT_FOUND（806）")
@@ -179,7 +204,11 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         record = self.p._task_journal.get(result["task_id"])
         self.assertEqual(record["status"], "needs_attention")
         self.assertEqual(record["remote_task_id"], "remote-1")
-        await asyncio.sleep(0.02)
+        # 工作协程发完通知后退出、让出名额（写盘在线程里完成，收尾时间不固定）
+        for _ in range(200):
+            if result["task_id"] not in self.p._pending:
+                break
+            await asyncio.sleep(0.005)
         self.assertNotIn(result["task_id"], self.p._pending)
         self.client.wait_for_result.side_effect = None
         await self.p._resume_pending_tasks()
@@ -224,6 +253,57 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.p._task_journal.get(first["task_id"])["status"], "failed")
         self.assertEqual(self.p._task_journal.get(second["task_id"])["status"], "success")
         self.assertEqual(self.client.submit.await_count, 2)
+
+    async def wait_status(self, task_id, status):
+        for _ in range(100):
+            if self.p._task_journal.get(task_id)["status"] == status:
+                return
+            await asyncio.sleep(0.005)
+        self.fail(f"{task_id} 没有进入 {status}")
+
+    async def test_tasks_blocked_by_admin_review_tell_the_user(self):
+        self.client.wait_for_result.side_effect = RunningHubError("APIKEY_USER_NOT_FOUND（806）")
+        first = await self.enqueue()
+        await self.wait_status(first["task_id"], "needs_attention")
+        second = await self.enqueue(anchor_id="m2")
+        self.assertTrue(second["success"])
+        self.assertIn("等待管理员核对", second["notice"])
+        self.assertEqual(self.p._task_journal.get(second["task_id"])["status"], "queued")
+
+    async def test_status_tool_does_not_retry_rejected_queries(self):
+        # 模型查状态不能顺手重试被拒绝的查询；只有用户发 /rh状态 才恢复
+        self.client.wait_for_result.side_effect = RunningHubError("APIKEY_USER_NOT_FOUND（806）")
+        first = await self.enqueue()
+        await self.wait_status(first["task_id"], "needs_attention")
+        self.client.wait_for_result.side_effect = None
+        await self.p.handle_rh_task("status", user_id="11", stream_id="s1")
+        await self.settled()
+        self.assertEqual(self.p._task_journal.get(first["task_id"])["status"], "needs_attention")
+        await self.p.handle_rh_status(user_id="11", stream_id="s1")
+        await self.settled()
+        self.assertEqual(self.p._task_journal.get(first["task_id"])["status"], "success")
+        self.client.submit.assert_awaited_once()
+
+    async def test_admin_reconciles_from_another_chat(self):
+        self.set_config(workflow(), access={"admin_users": ["11"]})
+        self.client.wait_for_result.side_effect = RunningHubError("APIKEY_USER_NOT_FOUND（806）")
+        first = await self.enqueue()
+        await self.wait_status(first["task_id"], "needs_attention")
+        status = await self.p.handle_rh_task("status", user_id="11", stream_id="admin-chat")
+        self.assertIn(first["task_id"], [t["task_id"] for t in status["tasks"]])
+        await self.p.handle_rh_reconcile(user_id="11", stream_id="admin-chat",
+                                         matched_groups={"task_id": first["task_id"], "remote_id": "放弃"})
+        self.assertEqual(self.p._task_journal.get(first["task_id"])["status"], "failed")
+
+    async def test_persistent_platform_busy_gives_up_without_charge(self):
+        self.client.submit.side_effect = RunningHubBusyError("Concurrency limit reached（1520）")
+        with patch("rh_generic_lib.task_runtime._BUSY_RESUBMIT_LIMIT", 0):
+            result = await self.enqueue()
+            await self.settled()
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual(record["status"], "failed")
+        self.assertIn("未扣费", record["message"])
+        self.assertEqual(self.p._task_journal.quota_used("11", time.time()), 0)
 
     async def test_refused_cancel_keeps_polling_and_delivers_result(self):
         entered, release = asyncio.Event(), asyncio.Event()
@@ -630,15 +710,21 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(schema["required"]["type"], "boolean")
         self.assertEqual(schema["choices"]["type"], "array")
 
+    @unittest.skipUnless(os.name == "posix", "Windows 上 chmod 只能控制只读位，权限由目录 ACL 决定")
     async def test_config_rewrite_keeps_file_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.toml"
             config_path.write_text("[plugin]\n", encoding="utf-8")
-            config_path.chmod(0o600)
+            config_path.chmod(0o640)
+            with patch("plugin._PLUGIN_DIR", Path(directory)):
+                self.p._write_config_file([workflow().model_dump()])
+            self.assertEqual(config_path.stat().st_mode & 0o777, 0o640)
+            self.assertIn("12345", config_path.read_text(encoding="utf-8"))
+            # 首次生成的配置文件同样不给其他用户读
+            config_path.unlink()
             with patch("plugin._PLUGIN_DIR", Path(directory)):
                 self.p._write_config_file([workflow().model_dump()])
             self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
-            self.assertIn("12345", config_path.read_text(encoding="utf-8"))
 
     async def test_matched_groups_and_raw_command_text(self):
         await self.p.handle_pao_tu(user_id="11", stream_id="s1", raw_message="/rh运行 draw cat")
@@ -867,6 +953,24 @@ class PureTests(unittest.IsolatedAsyncioTestCase):
         for file_type, data in (("audio", b"\x02#!SILK_V3"), ("audio", b"#!AMR\n"), ("image", b"GIF89a")):
             with self.assertRaises(RunningHubError):
                 upload_filename(file_type, data)
+
+    async def test_gif_sticker_is_converted_to_png_when_pillow_is_available(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("未安装 Pillow")
+        from io import BytesIO
+        from rh_generic_lib.file_source import prepare_upload
+        frames = [Image.new("RGB", (8, 8), color) for color in ("red", "blue")]
+        gif = BytesIO()
+        frames[0].save(gif, format="GIF", save_all=True, append_images=frames[1:])
+        filename, data = prepare_upload("image", gif.getvalue())
+        self.assertTrue(filename.endswith(".png"))
+        self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"))
+        with Image.open(BytesIO(data)) as converted:
+            self.assertEqual(converted.getpixel((0, 0))[:3], (255, 0, 0))
+        # 能直接上传的格式原样保留，不重新编码
+        self.assertEqual(prepare_upload("image", PNG)[1], PNG)
 
     async def test_video_and_unknown_file_segments(self):
         files = extract_files_from_message({"message": [{"type": "video", "data": {"file": "https://example.test/clip.mp4"}}, {"type": "file", "data": {"name": "x.zip", "url": "https://example.test/x.zip"}}]})

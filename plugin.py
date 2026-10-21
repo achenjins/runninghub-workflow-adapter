@@ -16,15 +16,17 @@
 - 命令：``/识别国内工作流 <工作流ID>`` / ``/识别国外工作流 <工作流ID>`` 识别关键节点（分别配置区域）
 - 命令：``/详细识别国内工作流 <工作流ID>`` / ``/详细识别国外工作流 <工作流ID>`` LLM 详细识别全部节点
 - 工具：``run_workflow``（供 LLM 调用）
-- API：``run_workflow_api``（public，供其他插件调用）
+- API：``run_workflow_api``（public，供其他插件调用；需开启 access.allow_plugin_api）
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import sys
@@ -66,7 +68,7 @@ from rh_generic_lib.file_source import (  # noqa: E402
     extract_text_from_message,
     fetch_file_bytes,
     is_finish_signal,
-    upload_filename,
+    prepare_upload,
 )
 from rh_generic_lib.runninghub_client import RunningHubClient, RunningHubError  # noqa: E402
 from rh_generic_lib.session_machine import (  # noqa: E402
@@ -76,9 +78,9 @@ from rh_generic_lib.session_machine import (  # noqa: E402
 )
 from rh_generic_lib.task_runtime import TaskRuntimeMixin
 from rh_generic_lib.task_queue import TaskLimiter
-from rh_generic_lib.media_context import MediaContextMixin
+from rh_generic_lib.media_context import MediaContextMixin, assets_from_message, identity
 from rh_generic_lib.natural_language import NaturalLanguageMixin
-from rh_generic_lib.task_journal import TaskJournal  # noqa: E402
+from rh_generic_lib.task_journal import ACTIVE_STATUSES, TaskJournal  # noqa: E402
 
 __all__ = ["RunningHubGenericPlugin", "create_plugin"]
 
@@ -180,6 +182,8 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         self._client_cn: RunningHubClient | None = None
         self._limiter = TaskLimiter(2)
         self._leased_jobs = set()
+        # 工作协程收尾期间收到的恢复/补发请求，结束后重新调度
+        self._reschedule_requested = set()
         self._request_lock = asyncio.Lock()
         self._background_tasks = set()
         self._anchors = {}
@@ -356,7 +360,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         while True:
             try:
                 await asyncio.sleep(5)
-                self._cleanup_cache_once(max_age_seconds=max_age)
+                await asyncio.to_thread(self._cleanup_cache_once, max_age_seconds=max_age)
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 raise
@@ -365,7 +369,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
                 await asyncio.sleep(interval)
 
     def _cleanup_cache_once(self, *, max_age_seconds: int) -> None:
-        """清理缓存目录中超过保留时间的文件（同步，经 to_thread 调用更佳）。"""
+        """清理缓存目录中超过保留时间的文件（同步实现，由 _cleanup_cache_loop 放到线程执行）。"""
         cache_dir = self._get_cache_dir()
         if cache_dir is None:
             return
@@ -860,10 +864,8 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             return False
         key = self._session_key(session.user_id, session.stream_id)
 
-        from rh_generic_lib.media_context import assets_from_message
         assets = assets_from_message(message, stream_id, "current")
         if assets and message.get("message_id"):
-            import base64
             client = self._get_client(session.workflow.region)
             files = []
             for asset in assets:
@@ -912,7 +914,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             node = session.waiting_nodes.pop(index)
             try:
                 file_data = await self._fetch_file_bytes(source)
-                filename = upload_filename(file_type, file_data)
+                filename, file_data = prepare_upload(file_type, file_data)
                 file_name = await client.upload_file(file_data, filename)
             except Exception as exc:
                 self.ctx.logger.error("上传文件到 RunningHub 失败: %s", exc)
@@ -1078,7 +1080,9 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             self._remove_input_session(key)
             if session.expire_task:
                 session.expire_task.cancel()
-        if not result["success"]:
+            if result.get("notice"):
+                await self.ctx.send.text(result["notice"], stream_id)
+        else:
             await self.ctx.send.text(result["message"], stream_id)
 
     async def _finish_input_session(self, user_id: str, stream_id: str) -> bool:
@@ -1218,7 +1222,6 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
     async def handle_input_collector(self, message: dict | None = None, **kwargs: Any) -> dict | None:
         if not isinstance(message, dict):
             return None
-        from rh_generic_lib.media_context import identity
         uid, stream = identity(message)
         uid = uid or str(kwargs.get("user_id") or "")
         stream = stream or str(kwargs.get("stream_id") or kwargs.get("chat_id") or "")
@@ -1253,7 +1256,6 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             return None
         if session.phase not in {"text", "config"} and not self._is_finish_signal(text) and not self._extract_files_from_message(message):
             # SDK may serialize binary_hash without a source URL.
-            from rh_generic_lib.media_context import assets_from_message
             if not assets_from_message(message, stream, "current"):
                 return None
         async def consume():
@@ -1305,7 +1307,6 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             await self.ctx.send.text("已中断输入收集", stream)
             return True, "", 1
         journal = await self._load_task_journal()
-        from rh_generic_lib.task_journal import ACTIVE_STATUSES
         tasks = [r for r in journal.records() if r["stream_id"] == stream and r["status"] in ACTIVE_STATUSES
                  and (r["user_id"] == uid or self._is_admin(uid))]
         if not tasks:
@@ -1384,7 +1385,6 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             return None
         async def consume_notice():
             file_data = await self._fetch_napcat_file_bytes(file_id, group_id)
-            import base64
             source = "base64://" + base64.b64encode(file_data).decode("ascii")
             await self._consume_files(session, key, [(file_type, source)], stream_id, client)
         self._queue_session_action(session, consume_notice)
@@ -1434,66 +1434,24 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
 
     @Command("识别国内工作流", description="识别国内工作流（runninghub.cn），仅提取文字/图片/音频/视频/分辨率/长宽比例等关键节点，例如：/识别国内工作流 2087492768787685378 动漫生图", pattern=r"^/识别国内工作流")
     async def handle_detect_domestic_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
-        stream_id = str(kwargs.get("stream_id") or "")
-        allowed, deny_msg = self._check_access_from_kwargs(kwargs)
-        if not allowed:
-            await self.ctx.send.text(deny_msg, stream_id)
-            return True, "", 1
-        if self.config.access.manage_workflows_admin_only and not self._is_admin(str(kwargs.get("user_id") or "")):
-            await self.ctx.send.text("识别并写入工作流配置需要管理员权限，请设置 access.admin_users", stream_id)
-            return True, "", 1
-        plain_text = self._command_text(kwargs)
-        rest = re.sub(r"^/识别国内工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
-        if not rest:
-            await self.ctx.send.text("用法：/识别国内工作流 <工作流ID> [工作流名称]", stream_id)
-            return True, "", 1
-        parts = rest.split(maxsplit=1)
-        workflow_id = parts[0].strip()
-        workflow_name = parts[1].strip() if len(parts) > 1 else workflow_id
-        return await self._detect_and_write(workflow_id, workflow_name, stream_id, detailed=False, region="domestic")
+        return await self._run_detect_command(kwargs, "识别国内工作流", detailed=False, region="domestic")
 
     @Command("识别国外工作流", description="识别国外工作流（runninghub.ai），仅提取文字/图片/音频/视频/分辨率/长宽比例等关键节点，例如：/识别国外工作流 2087492768787685378 动漫生图", pattern=r"^/识别国外工作流")
     async def handle_detect_overseas_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
-        stream_id = str(kwargs.get("stream_id") or "")
-        allowed, deny_msg = self._check_access_from_kwargs(kwargs)
-        if not allowed:
-            await self.ctx.send.text(deny_msg, stream_id)
-            return True, "", 1
-        if self.config.access.manage_workflows_admin_only and not self._is_admin(str(kwargs.get("user_id") or "")):
-            await self.ctx.send.text("识别并写入工作流配置需要管理员权限，请设置 access.admin_users", stream_id)
-            return True, "", 1
-        plain_text = self._command_text(kwargs)
-        rest = re.sub(r"^/识别国外工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
-        if not rest:
-            await self.ctx.send.text("用法：/识别国外工作流 <工作流ID> [工作流名称]", stream_id)
-            return True, "", 1
-        parts = rest.split(maxsplit=1)
-        workflow_id = parts[0].strip()
-        workflow_name = parts[1].strip() if len(parts) > 1 else workflow_id
-        return await self._detect_and_write(workflow_id, workflow_name, stream_id, detailed=False, region="overseas")
+        return await self._run_detect_command(kwargs, "识别国外工作流", detailed=False, region="overseas")
 
     @Command("详细识别国内工作流", description="详细识别国内工作流（runninghub.cn）：用 LLM 识别全部输入节点与配置节点（步数/采样器/CFG/种子等），例如：/详细识别国内工作流 2087492768787685378 动漫生图", pattern=r"^/详细识别国内工作流")
     async def handle_detail_detect_domestic_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
-        stream_id = str(kwargs.get("stream_id") or "")
-        allowed, deny_msg = self._check_access_from_kwargs(kwargs)
-        if not allowed:
-            await self.ctx.send.text(deny_msg, stream_id)
-            return True, "", 1
-        if self.config.access.manage_workflows_admin_only and not self._is_admin(str(kwargs.get("user_id") or "")):
-            await self.ctx.send.text("识别并写入工作流配置需要管理员权限，请设置 access.admin_users", stream_id)
-            return True, "", 1
-        plain_text = self._command_text(kwargs)
-        rest = re.sub(r"^/详细识别国内工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
-        if not rest:
-            await self.ctx.send.text("用法：/详细识别国内工作流 <工作流ID> [工作流名称]", stream_id)
-            return True, "", 1
-        parts = rest.split(maxsplit=1)
-        workflow_id = parts[0].strip()
-        workflow_name = parts[1].strip() if len(parts) > 1 else workflow_id
-        return await self._detect_and_write(workflow_id, workflow_name, stream_id, detailed=True, region="domestic")
+        return await self._run_detect_command(kwargs, "详细识别国内工作流", detailed=True, region="domestic")
 
     @Command("详细识别国外工作流", description="详细识别国外工作流（runninghub.ai）：用 LLM 识别全部输入节点与配置节点（步数/采样器/CFG/种子等），例如：/详细识别国外工作流 2087492768787685378 动漫生图", pattern=r"^/详细识别国外工作流")
     async def handle_detail_detect_overseas_workflow(self, **kwargs: Any) -> tuple[bool, str, int]:
+        return await self._run_detect_command(kwargs, "详细识别国外工作流", detailed=True, region="overseas")
+
+    async def _run_detect_command(
+        self, kwargs: dict[str, Any], command: str, *, detailed: bool, region: str
+    ) -> tuple[bool, str, int]:
+        """四个识别命令共用：权限检查、解析「/命令 <工作流ID> [名称]」，再识别并写入配置。"""
         stream_id = str(kwargs.get("stream_id") or "")
         allowed, deny_msg = self._check_access_from_kwargs(kwargs)
         if not allowed:
@@ -1503,14 +1461,14 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             await self.ctx.send.text("识别并写入工作流配置需要管理员权限，请设置 access.admin_users", stream_id)
             return True, "", 1
         plain_text = self._command_text(kwargs)
-        rest = re.sub(r"^/详细识别国外工作流[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
+        rest = re.sub(rf"^/{re.escape(command)}[\s：:，,、]*", "", plain_text.strip(), count=1).strip()
         if not rest:
-            await self.ctx.send.text("用法：/详细识别国外工作流 <工作流ID> [工作流名称]", stream_id)
+            await self.ctx.send.text(f"用法：/{command} <工作流ID> [工作流名称]", stream_id)
             return True, "", 1
         parts = rest.split(maxsplit=1)
         workflow_id = parts[0].strip()
         workflow_name = parts[1].strip() if len(parts) > 1 else workflow_id
-        return await self._detect_and_write(workflow_id, workflow_name, stream_id, detailed=True, region="overseas")
+        return await self._detect_and_write(workflow_id, workflow_name, stream_id, detailed=detailed, region=region)
 
     async def _detect_and_write(
         self,
@@ -1734,10 +1692,13 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         config_path = _PLUGIN_DIR / "config.toml"
         tmp_path = config_path.with_suffix(".toml.tmp")
         content = self._serialize_config_file(items)
-        tmp_path.write_text(content, encoding="utf-8")
+        # 文件里有 API Key：临时文件一创建就只让当前用户读写（Windows 上 chmod 只能控制只读位，靠目录 ACL）
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
         try:
             if config_path.exists():
-                # 文件里有 API Key，沿用管理员设置的权限
+                # 沿用管理员给 config.toml 设置的权限
                 shutil.copymode(config_path, tmp_path)
             tmp_path.replace(config_path)
         except Exception:
@@ -2146,6 +2107,8 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         result = await self._start_workflow(workflow_name, command_text, **kwargs)
         if not result["success"] or (result.get("waiting") and not result.get("announced")):
             await self.ctx.send.text(result["message"], stream_id)
+        elif result.get("notice"):
+            await self.ctx.send.text(result["notice"], stream_id)
         return True, "", 1
 
 
@@ -2157,6 +2120,9 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         stream_id: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
+        # 调用方自报 user_id / group_id / stream_id，宿主不做验证：默认关闭，避免绕过白名单扣费或往任意群发图
+        if not self.config.access.allow_plugin_api:
+            return {"success": False, "message": "插件 API 未开启，请在「使用权限」中打开「允许其他插件调用」"}
         kwargs["stream_id"] = stream_id
         return await self._start_workflow(workflow_name, prompt, **kwargs)
 

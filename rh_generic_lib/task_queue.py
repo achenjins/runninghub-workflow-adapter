@@ -17,6 +17,11 @@ class TaskLimiter:
             self.limit = max(1, limit)
             self._condition.notify_all()
 
+    async def wake(self) -> None:
+        """外部占位（任务日志里的远端任务）变化后，让等待者重新检查名额。"""
+        async with self._condition:
+            self._condition.notify_all()
+
     @asynccontextmanager
     async def slot(self, extra=None):
         async with self._condition:

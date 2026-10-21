@@ -169,6 +169,43 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(RunningHubTransportError):
                     await client().query("1")
 
+    async def test_http_429_is_throttling_not_refusal(self):
+        # 429 表示平台未受理：查询要继续重试，提交要回到排队，都不能当作明确拒绝
+        throttled = response({}, 429)
+        with patch.object(requests.Session, "post", side_effect=[throttled, response(QUERY_SUCCESS)]), \
+                patch("rh_generic_lib.runninghub_client.asyncio.sleep"):
+            self.assertEqual((await client().wait_for_result("1"))["status"], "SUCCESS")
+        with patch.object(requests.Session, "post", return_value=response({}, 429)):
+            with self.assertRaises(RunningHubTransportError):
+                await client().query("1")
+            with self.assertRaises(RunningHubBusyError):
+                await client().submit([])
+
+    async def test_error_codes_in_http_error_bodies_are_classified(self):
+        # 错误码可能放在非 2xx 响应体里，必须先读响应体再按状态码分类
+        with patch.object(requests.Session, "post", return_value=response(QUERY_1003, 400)):
+            with self.assertRaises(RunningHubTransportError):
+                await client().query("1")
+        busy = {"taskId": "", "errorCode": "1520", "errorMessage": "Concurrency limit reached"}
+        with patch.object(requests.Session, "post", return_value=response(busy, 400)):
+            with self.assertRaises(RunningHubBusyError):
+                await client().submit([])
+        refused = {"taskId": "", "errorCode": "806", "errorMessage": "APIKEY_USER_NOT_FOUND"}
+        with patch.object(requests.Session, "post", return_value=response(refused, 401)):
+            with self.assertRaises(RunningHubError) as caught:
+                await client().submit([])
+        self.assertNotIsInstance(caught.exception, (RunningHubBusyError, RunningHubTransportError))
+        self.assertIn("APIKEY_USER_NOT_FOUND", str(caught.exception))
+
+    async def test_non_json_success_is_unknown(self):
+        html = response(None)
+        html.json.side_effect = ValueError("not json")
+        with patch.object(requests.Session, "post", return_value=html):
+            with self.assertRaises(RunningHubTransportError):
+                await client().submit([])
+            with self.assertRaises(RunningHubTransportError):
+                await client().query("1")
+
     async def test_download_respects_size_limit(self):
         streamed = MagicMock(status_code=200)
         streamed.__enter__.return_value = streamed
@@ -203,6 +240,21 @@ class AuxiliaryEndpointTests(unittest.IsolatedAsyncioTestCase):
                     await client().upload_file(b"\x89PNG", "input.png")
         with self.assertRaises(RunningHubError):
             await client(max_file_bytes=2).upload_file(b"\x89PNG", "input.png")
+
+    async def test_upload_falls_back_to_legacy_endpoint(self):
+        legacy = {"code": 0, "msg": "success", "data": {"fileName": "api/6fd.wav", "fileType": "input"}}
+        replies = [response({"code": 1, "message": "file too large", "data": None}), response(legacy)]
+        with patch.object(requests.Session, "post", side_effect=replies) as post:
+            self.assertEqual(await client().upload_file(b"RIFF", "input.wav"), "api/6fd.wav")
+        first, second = post.call_args_list
+        self.assertTrue(first.args[0].endswith("/openapi/v2/media/upload/binary"))
+        self.assertTrue(second.args[0].endswith("/task/openapi/upload"))
+        self.assertEqual(second.kwargs["data"], {"apiKey": "key", "fileType": "input"})
+        failure = requests.ConnectionError("offline")
+        with patch.object(requests.Session, "post", side_effect=[failure, failure]):
+            with self.assertRaises(RunningHubError) as caught:
+                await client().upload_file(b"RIFF", "input.wav")
+        self.assertIn("旧接口", str(caught.exception))
 
     async def test_get_workflow_json(self):
         body = {"code": 0, "msg": "success", "data": {"prompt": '{"6": {"class_type": "CLIPTextEncode", "inputs": {"text": "cat"}}}'}}
