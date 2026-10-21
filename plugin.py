@@ -58,7 +58,7 @@ from rh_generic_lib.configuration import (  # noqa: E402
     GenericConfig, InputNodeSection, PluginMetaSection, WorkflowItemSection, build_item_fields, localize_schema,
     migrate_legacy_feature_sections,
 )
-from rh_generic_lib.media_plan import validate_workflow, validate_parameter, short_choice, PlanError  # noqa: E402
+from rh_generic_lib.media_plan import validate_workflow, validate_parameter, PlanError  # noqa: E402
 from rh_generic_lib.workflow_presets import match_workflow_preset  # noqa: E402
 from rh_generic_lib.delivery import NapcatDelivery  # noqa: E402
 from rh_generic_lib.file_source import (  # noqa: E402
@@ -953,9 +953,12 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         """进入可编辑配置确认阶段并向用户发确认提示。"""
         session.phase = "config"
         tips = self._build_config_edit_tips(session.editable_nodes, session.workflow)
+        has_choices = any(getattr(self._workflow_node(session.workflow, item), "choices", None)
+                          for item in session.editable_nodes)
+        example = "有选项的回序号，如「2」" if has_choices else "如「512 16:9」"
         prefix = f"{notice}。" if notice else ""
         await self.ctx.send.text(
-            f"{prefix}可修改：\n{tips}\n（回复新值，如「512 16:9」，- 保持默认，「不变」全默认）",
+            f"{prefix}可修改：\n{tips}\n（按顺序回复新值，用空格分隔，{example}；- 保持默认，「不变」全默认）",
             stream_id,
         )
 
@@ -989,15 +992,25 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
 
     @classmethod
     def _build_config_edit_tips(cls, editable_nodes: list[dict[str, str]], workflow: Any = None) -> str:
-        """构建可编辑配置的确认提示；有可选值时列出简写。"""
+        """构建可编辑配置的确认提示；有可选值时逐行列出带序号的选项。"""
         lines = []
         for index, item in enumerate(editable_nodes, 1):
-            line = f"{index}.{item['label']}：{item['field_value']}"
+            lines.append(f"{index}.{item['label']}：{item['field_value']}")
             node = cls._workflow_node(workflow, item) if workflow is not None else None
             if node is not None and node.choices:
-                line += f"（可选：{'、'.join(short_choice(c) for c in node.choices)}）"
-            lines.append(line)
+                lines.extend(f"   {number}) {choice}" for number, choice in enumerate(node.choices, 1))
         return "\n".join(lines)
+
+    @staticmethod
+    def _pick_choice(node: Any, value: str) -> str:
+        """有可选值时允许回序号：原值就是选项时照用，否则把数字当作 1 起的序号。"""
+        choices = [str(c) for c in getattr(node, "choices", None) or []]
+        if choices and value not in choices and value.isdigit():
+            number = int(value)
+            if not 1 <= number <= len(choices):
+                raise PlanError(f"请回复选项序号 1～{len(choices)}")
+            return choices[number - 1]
+        return value
 
     @staticmethod
     def _parse_config_edit(text: str, count: int) -> list[str | None]:
@@ -1076,11 +1089,11 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             if index < len(values) and values[index] is not None:
                 node = self._workflow_node(session.workflow, item)
                 try:
-                    value = validate_parameter(node, values[index]) if node is not None else values[index]
+                    value = (validate_parameter(node, self._pick_choice(node, values[index]))
+                             if node is not None else values[index])
                 except PlanError as exc:
                     await self.ctx.send.text(
-                        f"{item['label']}：{exc}。请重新回复（带括号的选项可以只写括号前的部分，如「16:9」），"
-                        "或回「不变」全部保持默认",
+                        f"{item['label']}：{exc}。请重新回复（有选项的参数回序号），或回「不变」全部保持默认",
                         stream_id,
                     )
                     return

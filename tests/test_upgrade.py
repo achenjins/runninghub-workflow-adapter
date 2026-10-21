@@ -956,18 +956,20 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(wf.input_nodes), 2)
         self.assertIn("识别成功", reply)
 
-    async def test_command_reply_maps_short_choice_and_rejects_unknown(self):
+    async def test_command_reply_picks_choice_by_number(self):
         self.set_config(WorkflowItemSection(name="draw", workflow_id="12345", input_nodes=[
             dict(node_id="1", field_name="prompt", value_type="prompt", label="description"),
             dict(node_id="5", field_name="aspect_ratio", value_type="text", label="长宽比例",
                  field_value="9:16 (Portrait Widescreen)", choices=RATIO_CHOICES)]))
         await self.p.handle_pao_tu(user_id="11", stream_id="s1", raw_message="/rh运行 draw cat")
-        self.assertIn("可选：9:16、16:9、1:1", self.ctx.send.text.await_args.args[0])
+        tips = self.ctx.send.text.await_args.args[0]
+        self.assertIn("   2) 16:9 (Widescreen)", tips)
+        self.assertIn("有选项的回序号", tips)
         session = self.p._find_input_session("11", "s1")
-        await self.p._handle_config_edit(session, "s1", message(text="2:1"))
-        self.assertIn("请重新回复", self.ctx.send.text.await_args.args[0])
+        await self.p._handle_config_edit(session, "s1", message(text="9"))
+        self.assertIn("请回复选项序号 1～3", self.ctx.send.text.await_args.args[0])
         self.client.submit.assert_not_awaited()
-        await self.p._handle_config_edit(session, "s1", message(text="16：9"))
+        await self.p._handle_config_edit(session, "s1", message(text="2"))
         await self.settled()
         self.assertIn({"nodeId": "5", "fieldName": "aspect_ratio", "fieldValue": "16:9 (Widescreen)"},
                       self.client.submit.await_args.args[0])
