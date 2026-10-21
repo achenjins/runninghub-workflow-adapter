@@ -12,6 +12,12 @@ from .runninghub_client import RunningHubBusyError, RunningHubError, RunningHubT
 from .task_journal import ACTIVE_STATUSES
 from .workflow_runner import consume_coins_from_result, resolve_value_type
 
+# 等待管理员核对的状态：远端可能仍在运行，名额不能自动释放
+ADMIN_REVIEW_STATUSES = {"unknown_submission", "needs_attention"}
+
+# 平台持续繁忙时重新提交的总时限（秒）；超过后放弃，任务未创建也未扣费
+_BUSY_RESUBMIT_LIMIT = 1800
+
 
 class TaskRuntimeMixin:
     @asynccontextmanager
@@ -65,7 +71,9 @@ class TaskRuntimeMixin:
                 limit = self.config.access.max_per_user_per_hour
                 if limit > 0 and journal.quota_used(kwargs["user_id"], time.time()) >= limit:
                     raise PlanError("你本小时的生成次数已达上限（包含排队任务）")
-                active = sum(r["status"] in ACTIVE_STATUSES for r in journal.records())
+                records = journal.records()
+                blocked = sum(r["status"] in ADMIN_REVIEW_STATUSES for r in records)
+                active = sum(r["status"] in ACTIVE_STATUSES for r in records)
                 if active >= self.config.generation.max_concurrent + self.config.generation.max_queued:
                     raise PlanError("任务队列已满，请稍后再试；可用 /rh状态 查看进度，或 /rh中断 取消旧任务")
                 task_id = "rh-" + uuid.uuid4().hex[:16]
@@ -74,8 +82,13 @@ class TaskRuntimeMixin:
                                      stream_id=stream_id, user_id=kwargs["user_id"],
                                      group_id=kwargs.get("group_id", ""))
                 self._schedule_job(journal.get(task_id))
-            return {"success": True, "task_id": task_id, "status": "queued",
-                    "message": "已接手，后台完成后通知。"}
+            result = {"success": True, "task_id": task_id, "status": "queued",
+                      "message": "已接手，后台完成后通知。"}
+            if blocked >= self.config.generation.max_concurrent:
+                # 等待核对的任务占满名额时，新任务排进去也不会开始；告诉用户原因，不让人空等
+                result["notice"] = (f"已排队，但有 {blocked} 个任务等待管理员核对、占满了运行名额；"
+                                    "管理员发 /rh状态 查看并用 /rh核对 处理后才会开始")
+            return result
         except (PlanError, OSError, ValueError) as exc:
             return {"success": False, "message": str(exc)}
 
@@ -178,6 +191,7 @@ class TaskRuntimeMixin:
                                                 message="提交 RunningHub 任务", expected_statuses={"queued"}):
                         return
                     attempt = 0
+                    busy_since = time.monotonic()
                     while True:
                         try:
                             remote = await client.submit(nodes, instance_type=request["workflow"]["instance_type"],
@@ -186,6 +200,11 @@ class TaskRuntimeMixin:
                         except RunningHubBusyError as exc:
                             if journal.get(task_id)["cancel_requested"]:
                                 await journal.update(task_id, status="cancelled", submitted_at=0, message="用户取消")
+                                return
+                            if time.monotonic() - busy_since >= _BUSY_RESUBMIT_LIMIT:
+                                await journal.update(task_id, status="failed", submitted_at=0,
+                                                     message=f"平台持续繁忙，{_BUSY_RESUBMIT_LIMIT // 60} 分钟内未能提交，已放弃（任务未创建、未扣费）：{exc}")
+                                await self._notify_job(record, f"{task_id} 平台持续繁忙，已放弃提交，没有扣费", notify_model=True)
                                 return
                             # 平台按官方说明要求自行排队：任务未创建，回到排队后重新提交
                             if not await journal.update(task_id, status="queued", submitted_at=0,
@@ -408,7 +427,7 @@ class TaskRuntimeMixin:
             message = "提交状态未知，无法安全取消；请管理员核对 RunningHub 任务记录"
         else:
             message = "任务已结束"
-        await self._limiter.resize(self.config.generation.max_concurrent)
+        await self._limiter.wake()
         if announce:
             await self._notify_job(record, message)
         return message

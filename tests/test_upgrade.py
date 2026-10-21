@@ -249,6 +249,57 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.p._task_journal.get(second["task_id"])["status"], "success")
         self.assertEqual(self.client.submit.await_count, 2)
 
+    async def wait_status(self, task_id, status):
+        for _ in range(100):
+            if self.p._task_journal.get(task_id)["status"] == status:
+                return
+            await asyncio.sleep(0.005)
+        self.fail(f"{task_id} 没有进入 {status}")
+
+    async def test_tasks_blocked_by_admin_review_tell_the_user(self):
+        self.client.wait_for_result.side_effect = RunningHubError("APIKEY_USER_NOT_FOUND（806）")
+        first = await self.enqueue()
+        await self.wait_status(first["task_id"], "needs_attention")
+        second = await self.enqueue(anchor_id="m2")
+        self.assertTrue(second["success"])
+        self.assertIn("等待管理员核对", second["notice"])
+        self.assertEqual(self.p._task_journal.get(second["task_id"])["status"], "queued")
+
+    async def test_status_tool_does_not_retry_rejected_queries(self):
+        # 模型查状态不能顺手重试被拒绝的查询；只有用户发 /rh状态 才恢复
+        self.client.wait_for_result.side_effect = RunningHubError("APIKEY_USER_NOT_FOUND（806）")
+        first = await self.enqueue()
+        await self.wait_status(first["task_id"], "needs_attention")
+        self.client.wait_for_result.side_effect = None
+        await self.p.handle_rh_task("status", user_id="11", stream_id="s1")
+        await self.settled()
+        self.assertEqual(self.p._task_journal.get(first["task_id"])["status"], "needs_attention")
+        await self.p.handle_rh_status(user_id="11", stream_id="s1")
+        await self.settled()
+        self.assertEqual(self.p._task_journal.get(first["task_id"])["status"], "success")
+        self.client.submit.assert_awaited_once()
+
+    async def test_admin_reconciles_from_another_chat(self):
+        self.set_config(workflow(), access={"admin_users": ["11"]})
+        self.client.wait_for_result.side_effect = RunningHubError("APIKEY_USER_NOT_FOUND（806）")
+        first = await self.enqueue()
+        await self.wait_status(first["task_id"], "needs_attention")
+        status = await self.p.handle_rh_task("status", user_id="11", stream_id="admin-chat")
+        self.assertIn(first["task_id"], [t["task_id"] for t in status["tasks"]])
+        await self.p.handle_rh_reconcile(user_id="11", stream_id="admin-chat",
+                                         matched_groups={"task_id": first["task_id"], "remote_id": "放弃"})
+        self.assertEqual(self.p._task_journal.get(first["task_id"])["status"], "failed")
+
+    async def test_persistent_platform_busy_gives_up_without_charge(self):
+        self.client.submit.side_effect = RunningHubBusyError("Concurrency limit reached（1520）")
+        with patch("rh_generic_lib.task_runtime._BUSY_RESUBMIT_LIMIT", 0):
+            result = await self.enqueue()
+            await self.settled()
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual(record["status"], "failed")
+        self.assertIn("未扣费", record["message"])
+        self.assertEqual(self.p._task_journal.quota_used("11", time.time()), 0)
+
     async def test_refused_cancel_keeps_polling_and_delivers_result(self):
         entered, release = asyncio.Event(), asyncio.Event()
         done = self.client.wait_for_result.return_value

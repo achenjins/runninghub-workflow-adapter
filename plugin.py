@@ -1078,7 +1078,9 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             self._remove_input_session(key)
             if session.expire_task:
                 session.expire_task.cancel()
-        if not result["success"]:
+            if result.get("notice"):
+                await self.ctx.send.text(result["notice"], stream_id)
+        else:
             await self.ctx.send.text(result["message"], stream_id)
 
     async def _finish_input_session(self, user_id: str, stream_id: str) -> bool:
@@ -2146,6 +2148,8 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         result = await self._start_workflow(workflow_name, command_text, **kwargs)
         if not result["success"] or (result.get("waiting") and not result.get("announced")):
             await self.ctx.send.text(result["message"], stream_id)
+        elif result.get("notice"):
+            await self.ctx.send.text(result["notice"], stream_id)
         return True, "", 1
 
 
