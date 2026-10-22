@@ -67,7 +67,8 @@ class TaskRuntimeMixin:
                 if existing:
                     return {"success": True, "duplicate": True, "task_id": existing["task_id"],
                             "status": existing["status"], "message": "本条请求已记录，请勿重复提交"}
-                allowed, reason = self._check_access(kwargs["user_id"], kwargs.get("group_id", ""))
+                allowed, reason = self._check_access(kwargs["user_id"], kwargs.get("group_id", ""),
+                                                     natural_language=request["trigger"] == "natural_language")
                 if not allowed:
                     raise PlanError(reason)
                 limit = self.config.access.max_per_user_per_hour
@@ -176,10 +177,11 @@ class TaskRuntimeMixin:
                                                 expected_statuses={"needs_attention"}):
                         return
                 if record["status"] == "queued":
-                    allowed, reason = self._check_access(record["user_id"], record["group_id"])
+                    request = record["request"]
+                    allowed, reason = self._check_access(record["user_id"], record["group_id"],
+                                                         natural_language=request.get("trigger") == "natural_language")
                     if not allowed:
                         raise PlanError(reason)
-                    request = record["request"]
                     await self._announce_job_start(record)
                     nodes = request["nodes"]
                     if request.get("plan"):
@@ -194,7 +196,8 @@ class TaskRuntimeMixin:
                     # Cancellation or an access update during preparation must prevent submission.
                     if journal.get(task_id)["status"] == "cancelled":
                         return
-                    allowed, reason = self._check_access(record["user_id"], record["group_id"])
+                    allowed, reason = self._check_access(record["user_id"], record["group_id"],
+                                                         natural_language=request.get("trigger") == "natural_language")
                     if not allowed:
                         raise PlanError(reason)
                     if not await journal.update(task_id, status="submitting", submitted_at=time.time(),

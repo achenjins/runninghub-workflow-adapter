@@ -116,7 +116,7 @@ class AccessSection(PluginConfigBase):
     """白名单留空表示不限制。"""
     __ui_label__ = "使用权限"
 
-    allow_users: list[str] = Field(default_factory=list, description="留空允许所有用户。",
+    allow_users: list[str] = Field(default_factory=list, description="限制命令和其他插件调用，留空允许所有用户；自然语言调用不受此项限制。",
                                  json_schema_extra={"label": "允许的用户", "placeholder": "用户号码，每行一个"})
     allow_groups: list[str] = Field(default_factory=list, description="留空允许所有群，私聊不受此项限制。",
                                   json_schema_extra={"label": "允许的群", "placeholder": "群号，每行一个"})

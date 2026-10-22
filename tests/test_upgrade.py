@@ -136,52 +136,131 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(stale["success"])
         self.client.submit.assert_awaited_once()
 
-    async def test_group_tool_identity_ignores_earlier_speakers(self):
-        # 别人几分钟前说过话，不影响当前发言人用自然语言提交
-        self.p._stream_senders["s1"]["77"] = time.time() - 200
+    async def test_group_tool_identity_allows_other_recent_speakers(self):
+        self.p._stream_senders["s1"]["77"] = time.time() - 10
         result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
         self.assertTrue(result["success"], result.get("message"))
         await self.settled()
-        self.assertEqual(self.p._task_journal.get(result["task_id"])["user_id"], "11")
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual(record["user_id"], "11")
+        self.assertEqual((record["status"], record["delivery_status"]), ("success", "sent"))
         self.client.submit.assert_awaited_once()
 
-    async def test_group_tool_identity_rejects_later_speaker_during_slow_turn(self):
-        # 宿主一轮处理可能超过一次模型调用的超时；请求人 60 秒前发言、别人 10 秒前插话时不能记到后者头上
+    async def test_group_tool_identity_uses_latest_hook_sender_in_active_group(self):
         now = time.time()
-        for mid, uid, text, age in (("a1", "11", "帮我画一只猫", 60), ("b1", "77", "哈哈", 10)):
+        for mid, uid, text, age in (("a1", "11", "帮我画一只猫", 60), ("b1", "77", "画一只狗", 10)):
             self.messages[mid] = message(mid=mid, uid=uid, text=text)
             with patch("rh_generic_lib.media_context.time.time", return_value=now - age):
                 self.p._remember_anchor(self.messages[mid])
         self.recent = [self.messages["a1"], self.messages["b1"]]
-        result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
+        result = await self.p.handle_run_workflow("draw", "dog", chat_id="s1", group_id="22")
+        self.assertTrue(result["success"], result.get("message"))
         await self.settled()
-        self.assertFalse(result["success"])
-        self.assertIn("多人发言", result["message"])
-        self.assertEqual(self.p._task_journal.records(), [])
-        self.client.submit.assert_not_awaited()
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual((record["user_id"], record["anchor_id"]), ("77", "b1"))
+        self.assertEqual((record["status"], record["delivery_status"]), ("success", "sent"))
+        self.client.submit.assert_awaited_once()
 
-    async def test_group_tool_identity_fails_closed_when_speakers_interleave(self):
-        self.set_config(workflow(), access={"allow_users": ["77"]})
-        self.p._remember_anchor(message(mid="a1", uid="11", text="帮我画一只猫"))
+    async def test_group_tool_identity_prefers_host_message_over_latest_sender(self):
+        self.messages["a1"] = message(mid="a1", uid="11", text="帮我画一只猫")
+        self.p._remember_anchor(self.messages["a1"])
         self.p._remember_anchor(message(mid="b1", uid="77", text="哈哈"))
-        result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
+        result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22", message=self.messages["a1"])
+        self.assertTrue(result["success"], result.get("message"))
         await self.settled()
-        self.assertFalse(result["success"])
-        self.assertIn("/rh运行", result["message"])
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual((record["user_id"], record["anchor_id"]), ("11", "a1"))
+        self.client.submit.assert_awaited_once()
+
+    async def test_group_tool_identity_accepts_whitelisted_latest_sender(self):
+        self.set_config(workflow(), access={"allow_users": ["77"]})
+        self.p._remember_anchor(message(mid="a1", uid="11", text="哈哈"))
+        self.p._remember_anchor(message(mid="b1", uid="77", text="帮我画一只猫"))
+        result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
+        self.assertTrue(result["success"], result.get("message"))
+        await self.settled()
+        self.assertEqual(self.p._task_journal.get(result["task_id"])["user_id"], "77")
+        self.client.submit.assert_awaited_once()
+
+    async def test_group_tool_identity_allows_active_groups_with_access_limits(self):
+        for index, access in enumerate(({"allow_users": ["11", "77"]}, {"max_per_user_per_hour": 5})):
+            with self.subTest(access=access):
+                self.set_config(workflow(), access=access)
+                self.p._remember_anchor(message(mid=f"request-{index}", uid="11"))
+                now = time.time()
+                self.p._stream_senders["s1"] = {"77": now - 130, "11": now - 2}
+                result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
+                self.assertTrue(result["success"], result.get("message"))
+                await self.settled()
+                self.assertEqual(self.p._task_journal.get(result["task_id"])["user_id"], "11")
+        self.assertEqual(self.client.submit.await_count, 2)
+
+    async def test_natural_language_bypasses_user_whitelist_through_submission(self):
+        self.set_config(workflow(), access={"allow_users": ["11"]})
+        self.p._remember_anchor(message(mid="a1", uid="11"))
+        self.p._remember_anchor(message(mid="b1", uid="77"))
+        result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
+        self.assertTrue(result["success"], result.get("message"))
+        await self.settled()
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual((record["user_id"], record["status"], record["delivery_status"]), ("77", "success", "sent"))
+        self.assertEqual(self.p._task_journal.quota_used("77", time.time()), 1)
+        self.client.submit.assert_awaited_once()
+
+    async def test_commands_and_plugin_api_keep_user_whitelist(self):
+        self.set_config(workflow(), access={"allow_users": ["11"], "allow_plugin_api": True})
+        for handler in (self.p._start_workflow, self.p.handle_run_workflow_api):
+            result = await handler("draw", "cat", user_id="77", stream_id="s1", group_id="22")
+            self.assertFalse(result["success"])
+            self.assertEqual(result["message"], "你没有使用本插件的权限")
         self.assertEqual(self.p._task_journal.records(), [])
         self.client.submit.assert_not_awaited()
 
-    async def test_group_tool_identity_is_strict_when_access_is_limited(self):
-        # 请求人 130 秒前发言、别人 2 秒前插话：开启白名单或限频时不能把任务记到插话的人头上
-        for access in ({"allow_users": ["11", "77"]}, {"max_per_user_per_hour": 5}):
-            self.set_config(workflow(), access=access)
-            now = time.time()
-            self.p._stream_senders["s1"] = {"77": now - 130, "11": now - 2}
-            result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
-            await self.settled()
-            self.assertFalse(result["success"])
-            self.assertIn("多人发言", result["message"])
+    async def test_natural_generation_checks_group_whitelist(self):
+        self.set_config(workflow(), access={"allow_users": ["99"], "allow_groups": ["99"]})
+        result = await self.p.handle_run_workflow("draw", "cat", user_id="11", chat_id="s1", group_id="22")
+        self.assertFalse(result["success"])
+        self.assertEqual(result["message"], "当前群组没有使用本插件的权限")
         self.assertEqual(self.p._task_journal.records(), [])
+        self.client.submit.assert_not_awaited()
+
+    async def test_natural_generation_quota_stays_with_host_requester(self):
+        self.set_config(workflow(), access={"allow_users": ["99"], "allow_groups": ["22"], "max_per_user_per_hour": 1})
+        first_message = message(mid="a1", uid="11")
+        self.p._remember_anchor(first_message)
+        self.p._remember_anchor(message(mid="b1", uid="77", text="哈哈"))
+        first = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22", message=first_message)
+        self.assertTrue(first["success"], first.get("message"))
+        await self.settled()
+        journal = self.p._task_journal
+        self.assertEqual(journal.get(first["task_id"])["user_id"], "11")
+        self.assertEqual(journal.quota_used("11", time.time()), 1)
+        self.assertEqual(journal.quota_used("77", time.time()), 0)
+        second_message = message(mid="a2", uid="11")
+        self.p._remember_anchor(second_message)
+        limited = await self.p.handle_run_workflow("draw", "another cat", chat_id="s1", group_id="22", message=second_message)
+        self.assertFalse(limited["success"])
+        self.assertIn("本小时的生成次数已达上限", limited["message"])
+        other_message = message(mid="b2", uid="77")
+        self.p._remember_anchor(other_message)
+        other = await self.p.handle_run_workflow("draw", "dog", chat_id="s1", group_id="22", message=other_message)
+        self.assertTrue(other["success"], other.get("message"))
+        await self.settled()
+        self.assertEqual(journal.quota_used("11", time.time()), 1)
+        self.assertEqual(journal.quota_used("77", time.time()), 1)
+        self.assertEqual(len(journal.records()), 2)
+        self.assertEqual(self.client.submit.await_count, 2)
+
+    async def test_natural_queue_rechecks_group_whitelist(self):
+        self.set_config(workflow(), access={"allow_users": ["99"], "allow_groups": ["22"]})
+        async with self.p._limiter.slot():
+            result = await self.p.handle_run_workflow("draw", "cat", user_id="11", chat_id="s1", group_id="22")
+            self.assertTrue(result["success"], result.get("message"))
+            self.set_config(workflow(), access={"allow_users": ["99"], "allow_groups": ["99"]})
+        await self.settled()
+        record = self.p._task_journal.get(result["task_id"])
+        self.assertEqual(record["status"], "failed")
+        self.assertIn("当前群组没有使用本插件的权限", record["message"])
         self.client.submit.assert_not_awaited()
 
     async def test_plugin_api_is_disabled_by_default(self):

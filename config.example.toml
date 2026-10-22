@@ -33,6 +33,7 @@ enhance_model = "utils"
 
 [access]
 # 使用权限（留空=不限制；max_per_user_per_hour = 0 表示不限频）
+# 仅限制命令和其他插件调用；自然语言调用只受群白名单和每人每小时次数限制。
 allow_users = []
 allow_groups = []
 max_per_user_per_hour = 0
