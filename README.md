@@ -87,7 +87,7 @@ pip install -r runninghub-workflow-adapter/requirements.txt
 
 这是最重要的一步，不填后面全都会失败。
 
-**① 注册账号（用邀请码注册，可得 500 RH 币）**
+**① 注册账号**（用邀请码注册，**获得 1000 RH 币！**）
 
 打开对应平台的注册链接（邀请码已内置在链接里）：
 
