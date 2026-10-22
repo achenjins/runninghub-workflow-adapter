@@ -575,6 +575,8 @@ A：这是「自动撤回结果」功能，仅 NapCat / QQ 适配器可用，在
   本项目由 RunningHub 提供支持 · 单一接口直连 400+ 主流大模型 · <a href="https://www.runninghub.ai/call-api?source=github">免费测试</a>
 </p>
 
+<a href="https://www.runninghub.ai/call-api?source=github"><img src="docs/runninghub/card.png" alt="RunningHub API 介绍卡" width="100%"></a>
+
 - Seedance 满血版 API 接入**全网骨折价**，在线工具低至 **0.21元/秒**，节省 **60%–80% 成本**！
 - 超稳定高并发高**折扣**，随用随充按需弹性付费，不捆绑不排队不抽卡
 - 无限画布、ComfyUI、Agent 等在线工具从剧本到成片全链路制作
