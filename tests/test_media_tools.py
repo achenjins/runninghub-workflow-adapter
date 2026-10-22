@@ -154,6 +154,15 @@ class MediaToolTests(unittest.IsolatedAsyncioTestCase):
                                      [helpers.PNG, style])
                     self.assertEqual(self.p._task_journal.get(result["task_id"])["anchor_id"], anchor["message_id"])
 
+    async def test_media_tools_ignore_user_whitelist_in_allowed_group(self):
+        saved = await self.save_image()
+        self.set_config(helpers.workflow(), access={"allow_users": ["99"], "allow_groups": ["22"]})
+        for handler, args in ((self.p.handle_rh_workflows, {}),
+                              (self.p.handle_rh_media, {"source": "memory"}),
+                              (self.p.handle_rh_inspect_media, {"media_id": saved["memory_id"]})):
+            result = await handler(user_id="11", stream_id="s1", group_id="22", **args)
+            self.assertTrue(result["success"], result)
+
     async def test_tokenless_saved_id_is_scoped_and_permission_checked(self):
         saved = await self.save_image()
         for uid, stream in (("33", "s1"), ("11", "s2")):

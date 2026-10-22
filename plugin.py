@@ -473,11 +473,10 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
                 return workflow
         return None
 
-    def _check_access(self, user_id: str, group_id: str) -> tuple[bool, str]:
-        """访问控制：白名单 + 每用户每小时频率限制。
+    def _check_access(self, user_id: str, group_id: str, *, natural_language: bool = False) -> tuple[bool, str]:
+        """自然语言只检查群白名单；命令和插件 API 另检查用户白名单。
 
-        默认（未配置任何限制）返回 (True, "")，与旧版行为完全一致；
-        配置后才按白名单/频率拦截，返回 (False, 提示信息)。
+        每人每小时次数统一在任务日志预留时检查，包含排队任务。
         """
         if not self.config.plugin.enabled:
             return False, "插件已停用"
@@ -487,7 +486,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
 
         if not uid:
             return False, "无法识别用户身份"
-        if cfg.allow_users:
+        if cfg.allow_users and not natural_language:
             allowed_users = {str(u).strip() for u in cfg.allow_users if str(u).strip()}
             if not uid or uid not in allowed_users:
                 return False, "你没有使用本插件的权限"

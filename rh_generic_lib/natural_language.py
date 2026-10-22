@@ -191,7 +191,7 @@ class NaturalLanguageMixin:
             if not self.config.natural_language.enabled:
                 raise PlanError("自然语言生成已关闭")
             uid, stream = self._trusted_scope(kwargs)
-            allowed, reason = self._check_access(uid, str(kwargs.get("group_id") or ""))
+            allowed, reason = self._check_access(uid, str(kwargs.get("group_id") or ""), natural_language=True)
             if not allowed:
                 raise PlanError(reason)
             kwargs.update(user_id=uid, stream_id=stream)
