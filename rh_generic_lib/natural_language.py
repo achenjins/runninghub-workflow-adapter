@@ -195,10 +195,8 @@ class NaturalLanguageMixin:
             if not allowed:
                 raise PlanError(reason)
             kwargs.update(user_id=uid, stream_id=stream)
-            trigger_message = kwargs.get("message") or (self._anchors.get((uid, stream)) or {}).get("message") or {}
-            trigger_anchor = str(trigger_message.get("message_id") or "")
             requested_ids = [r.get("media_id", "") for r in (references or []) if isinstance(r, dict)] if isinstance(references, list) else []
-            snapshot = await self._media_snapshot(kwargs, context_id, media_ids=requested_ids)
+            snapshot = await self._media_snapshot(kwargs, context_id, media_ids=requested_ids, for_generation=True)
             candidates = copy.deepcopy(snapshot["assets"])
             plan = {"workflow_name": workflow_name, "prompt": prompt,
                     "references": references if references is not None else [], "parameters": parameters if parameters is not None else {}}
@@ -275,7 +273,7 @@ class NaturalLanguageMixin:
                 self._drafts[(uid, stream)] = {"created_at": time.time(), "plan": plan}
                 return _tool_result({"success": False, "status": "needs_input", "missing": missing,
                         **_planning_context(snapshot, [workflow], details=True), "message": "补充后 continue_draft=true；仅询问缺项或素材用途"})
-            kwargs.update(group_id=snapshot["group_id"], anchor_id=trigger_anchor or snapshot["anchor_id"], natural_plan=plan,
+            kwargs.update(group_id=snapshot["group_id"], anchor_id=snapshot["anchor_id"], natural_plan=plan,
                           trigger="natural_language", start_message=start_message)
             result = await self._submit_and_poll(self._get_client(workflow.region), workflow, nodes, stream, kwargs)
             if result["success"]:

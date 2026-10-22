@@ -266,32 +266,39 @@ class MediaContextMixin:
                         snapshot["assets"].append({**saved, "media_id": mid})
         return snapshot
 
-    async def _media_snapshot(self, kwargs, context_id="", *, media_ids=(), source="all", media_type=""):
+    async def _media_snapshot(self, kwargs, context_id="", *, media_ids=(), source="all", media_type="",
+                              for_generation=False):
         uid, stream = self._trusted_scope(kwargs)
         previous = self._contexts.get(context_id) if context_id else None
         if previous and (previous["user_id"] != uid or previous["stream_id"] != stream):
             raise PlanError("素材上下文不属于当前用户会话")
         self._prune_context()
+        previous = self._contexts.get(context_id) if context_id else None
         if context_id:
-            snapshot = self._contexts.get(context_id)
+            snapshot = previous
             if snapshot:
                 self._check_snapshot_access(kwargs, snapshot.get("group_id", ""), uid)
                 snapshot["last_used_at"] = time.time()
                 await self._apply_image_memory(snapshot)
-                return await self._add_memory_aliases(snapshot, media_ids)
-        if source == "memory":
+                if not for_generation:
+                    return await self._add_memory_aliases(snapshot, media_ids)
+        if source == "memory" and not for_generation:
             return await self._memory_snapshot(kwargs)
+        saved_only = False
         if media_ids:
             memory = await self._load_image_memory()
-            if memory and all(isinstance(mid, str) and not mid.startswith(("avatar:", "avatar-group:"))
-                              and memory.find(uid, stream, mid) for mid in media_ids):
+            saved_only = bool(memory) and all(isinstance(mid, str) and not mid.startswith(("avatar:", "avatar-group:"))
+                                              and memory.find(uid, stream, mid) for mid in media_ids)
+            if saved_only and not for_generation:
                 snapshot = await self._memory_snapshot(kwargs)
                 # Old host aliases remain usable too; expose stable IDs on new queries.
                 return await self._add_memory_aliases(snapshot, media_ids)
         anchor = kwargs.get("message") or (self._anchors.get((uid, stream)) or {}).get("message")
         recent = []
         warnings = []
-        if not anchor or source in {"all", "recent"}:
+        # Saved bytes need no history lookup when a live trigger is already known.
+        # Generation still collects current/quoted inputs and resolves a missing trigger.
+        if not anchor or (source in {"all", "recent"} and not (for_generation and saved_only)):
             try:
                 value = unwrap(await self.ctx.message.get_recent(stream, limit=self.config.natural_language.history_limit))
                 recent = value if isinstance(value, list) else (value or {}).get("messages", [])
@@ -311,6 +318,8 @@ class MediaContextMixin:
                     return 0
             anchor = max(own, key=timestamp) if own else None
         if not anchor or not anchor.get("message_id"):
+            if for_generation:
+                raise PlanError("暂时无法定位触发消息，无法防止重复生成；请重新发送需求或使用 /rh运行")
             snapshot = await self._memory_snapshot(kwargs)
             snapshot["warnings"] = [*warnings, "未定位到触发消息，仅返回已保存图片"]
             return snapshot
@@ -398,7 +407,14 @@ class MediaContextMixin:
                     "assets": list(unique.values())[:self.config.natural_language.max_candidates],
                     "warnings": list(dict.fromkeys(warnings))}
         self._contexts[token] = snapshot
-        return await self._apply_image_memory(snapshot)
+        await self._apply_image_memory(snapshot)
+        if for_generation and previous:
+            # A query token selects media, not the identity of a new paid request.
+            # Keep explicitly selected temporary assets while refreshing live inputs.
+            present = {a["media_id"] for a in snapshot["assets"]}
+            snapshot["assets"].extend(dict(a) for a in previous["assets"]
+                                      if a["media_id"] in media_ids and a["media_id"] not in present)
+        return await self._add_memory_aliases(snapshot, media_ids)
 
     def _check_snapshot_access(self, kwargs, group_id, user_id):
         injected = str(kwargs.get("group_id") or "").strip()

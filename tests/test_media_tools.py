@@ -80,13 +80,79 @@ class MediaToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(inspected["message"], "白猫在蓝色窗边")
         generated = await self.p.handle_run_workflow("draw", "让猫挥手", context_id=context["context_id"],
             references=[{"input": "subject", "media_id": saved["memory_id"]}],
-            user_id="11", stream_id="s1", group_id="22")
+            user_id="11", stream_id="s1", group_id="22", message=helpers.message("after-restart"))
         self.assertTrue(generated["success"], generated)
         await self.settled()
         self.assertEqual(self.client.upload_file.await_args.args[0], helpers.PNG + b"exact-saved-bytes")
         self.ctx.message.get_recent.assert_not_awaited()
         self.ctx.message.get_by_id.assert_not_awaited()
         self.client.download_bytes.assert_not_awaited()
+
+    async def test_saved_reference_recovers_trigger_and_deduplicates_after_anchor_loss(self):
+        self.set_config(helpers.workflow(media=True))
+        saved = await self.save_image(helpers.PNG + b"saved-reference")
+        self.p._anchors.clear()
+        args = dict(workflow_name="draw", prompt="让猫挥手",
+                    references=[{"input": "subject", "media_id": saved["memory_id"]}],
+                    user_id="11", stream_id="s1", group_id="22")
+        first = await self.p.handle_run_workflow(**args)
+        self.assertTrue(first["success"], first)
+        await self.settled()
+        second = await self.p.handle_run_workflow(**args)
+        await self.settled()
+        self.assertTrue(second.get("duplicate"), second)
+        self.assertEqual(first["task_id"], second["task_id"])
+        self.client.submit.assert_awaited_once()
+        self.assertEqual(self.p._task_journal.get(first["task_id"])["anchor_id"], "m1")
+        self.recent = [helpers.message("new-request")]
+        self.p._remember_anchor(self.messages["m1"])
+        self.p._anchors[("11", "s1")]["created_at"] -= self.p.config.natural_language.media_ttl_seconds + 1
+        third = await self.p.handle_run_workflow(**args)
+        self.assertTrue(third["success"], third)
+        self.assertNotEqual(first["task_id"], third["task_id"])
+        self.assertEqual(self.p._task_journal.get(third["task_id"])["anchor_id"], "new-request")
+        await self.settled()
+        self.assertEqual(self.client.submit.await_count, 2)
+
+    async def test_generation_requires_trigger_even_with_saved_context(self):
+        saved = await self.save_image()
+        context = await self.p.handle_rh_media(source="memory", user_id="11", stream_id="s1")
+        self.lose_chat()
+        for context_id in ("", context["context_id"]):
+            for use_image in (False, True):
+                with self.subTest(context_id=context_id, use_image=use_image):
+                    self.set_config(helpers.workflow(media=use_image))
+                    result = await self.p.handle_run_workflow("draw", "只生成一次", context_id=context_id,
+                        references=[{"input": "subject", "media_id": saved["memory_id"]}] if use_image else [],
+                        user_id="11", stream_id="s1", group_id="22")
+                    self.assertFalse(result["success"], result)
+                    self.assertIn("触发消息", result["message"])
+        self.client.submit.assert_not_awaited()
+        self.client.upload_file.assert_not_awaited()
+        self.assertEqual(self.p._task_journal.records(), [])
+
+    async def test_saved_style_keeps_current_or_quoted_subject_with_or_without_context(self):
+        self.set_config(helpers.workflow(media=True, two=True), natural_language={"avatar_candidates": False})
+        style = helpers.PNG + b"saved-style"
+        saved = await self.save_image(style)
+        context = await self.p.handle_rh_media(source="memory", user_id="11", stream_id="s1")
+        for context_id in ("", context["context_id"]):
+            for quoted in (False, True):
+                with self.subTest(context_id=context_id, quoted=quoted):
+                    mid = f"mixed-{bool(context_id)}-{quoted}"
+                    subject = helpers.message(mid + "-subject", uid="33" if quoted else "11", images=1)
+                    anchor = helpers.message(mid, reply=subject["message_id"]) if quoted else subject
+                    self.messages.update({subject["message_id"]: subject, anchor["message_id"]: anchor})
+                    self.p._remember_anchor(anchor)
+                    self.client.upload_file.reset_mock()
+                    result = await self.p.handle_run_workflow("draw", "当前主体使用保存的风格", context_id=context_id,
+                        references=[{"input": "style", "media_id": saved["memory_id"]}],
+                        user_id="11", stream_id="s1", group_id="22")
+                    self.assertTrue(result["success"], result)
+                    await self.settled()
+                    self.assertEqual([c.args[0] for c in self.client.upload_file.await_args_list],
+                                     [helpers.PNG, style])
+                    self.assertEqual(self.p._task_journal.get(result["task_id"])["anchor_id"], anchor["message_id"])
 
     async def test_tokenless_saved_id_is_scoped_and_permission_checked(self):
         saved = await self.save_image()
