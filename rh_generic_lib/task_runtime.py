@@ -63,7 +63,7 @@ class TaskRuntimeMixin:
                 journal = await self._load_task_journal()
                 existing = journal.find_request(key)
                 if not existing and request.get("plan"):
-                    existing = journal.find_anchor_request(kwargs["user_id"], stream_id, anchor, workflow.workflow_id, workflow.region)
+                    existing = journal.find_anchor_request(kwargs["user_id"], stream_id, anchor, request)
                 if existing:
                     return {"success": True, "duplicate": True, "task_id": existing["task_id"],
                             "status": existing["status"], "message": "本条请求已记录，请勿重复提交"}

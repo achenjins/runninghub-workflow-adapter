@@ -1,4 +1,5 @@
 """Query separation and durable image IDs without a running host or paid API."""
+import asyncio
 import json
 import time
 import unittest
@@ -98,7 +99,8 @@ class MediaToolTests(unittest.IsolatedAsyncioTestCase):
         first = await self.p.handle_run_workflow(**args)
         self.assertTrue(first["success"], first)
         await self.settled()
-        second = await self.p.handle_run_workflow(**args)
+        self.p._task_journal = helpers.TaskJournal(self.p._task_journal.path)
+        second = await self.p.handle_run_workflow(start_message="换一句开始提示", **args)
         await self.settled()
         self.assertTrue(second.get("duplicate"), second)
         self.assertEqual(first["task_id"], second["task_id"])
@@ -113,6 +115,126 @@ class MediaToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.p._task_journal.get(third["task_id"])["anchor_id"], "new-request")
         await self.settled()
         self.assertEqual(self.client.submit.await_count, 2)
+
+    async def test_same_message_three_distinct_requests_queue_independently(self):
+        qwen = helpers.workflow()
+        qwen.name = "qwen"
+        qwen.input_nodes.extend([
+            helpers.InputNodeSection(node_id="420", field_name="image", value_type="image", input_key="420.image", role="subject"),
+            helpers.InputNodeSection(node_id="424", field_name="aspect_ratio", value_type="text", field_value="1:1",
+                                     input_key="424.aspect_ratio", choices=["1:1", "16:9 (Widescreen)"]),
+        ])
+        text_only = helpers.workflow()
+        text_only.name, text_only.workflow_id = "文生图", "67890"
+        self.set_config(qwen, workflows={"items": [qwen.model_dump(), text_only.model_dump()]})
+        saved = await self.save_image()
+        args = dict(user_id="11", stream_id="s1", group_id="22", output_type="image")
+        async with self.p._limiter.slot():
+            results = [
+                await self.p.handle_run_workflow("qwen", "蓝发小女仆提着花篮奔跑",
+                    references=[{"input": "420.image", "media_id": saved["memory_id"]}], use_reference=True, **args),
+                await self.p.handle_run_workflow("文生图", "银白短发少女剑士站在雨后石桥上", **args),
+                await self.p.handle_run_workflow("qwen", "黄昏海边小镇，白裙少女看海",
+                    parameters={"424.aspect_ratio": "16:9 (Widescreen)"}, **args),
+            ]
+            self.assertTrue(all(r["success"] and r["status"] == "queued" for r in results), results)
+            self.assertEqual(len({r["task_id"] for r in results}), 3, results)
+            self.assertFalse(any(r.get("duplicate") for r in results), results)
+            self.assertEqual(self.p._task_journal.quota_used("11", time.time()), 3)
+            self.client.submit.assert_not_awaited()
+        await self.settled()
+        self.assertEqual(self.client.submit.await_count, 3)
+        self.client.upload_file.assert_awaited_once()
+        calls = self.client.submit.await_args_list
+        self.assertCountEqual([c.kwargs["workflow_id"] for c in calls], ["12345", "67890", "12345"])
+        by_prompt = {next(n["fieldValue"] for n in c.args[0] if n["fieldName"] == "prompt"): c for c in calls}
+        self.assertEqual(set(by_prompt), {"蓝发小女仆提着花篮奔跑", "银白短发少女剑士站在雨后石桥上", "黄昏海边小镇，白裙少女看海"})
+        self.assertEqual(by_prompt["黄昏海边小镇，白裙少女看海"].kwargs["workflow_id"], "12345")
+        self.assertIn({"nodeId": "424", "fieldName": "aspect_ratio", "fieldValue": "16:9 (Widescreen)"},
+                      by_prompt["黄昏海边小镇，白裙少女看海"].args[0])
+        self.assertTrue(all(self.p._task_journal.get(r["task_id"])["status"] == "success" for r in results))
+
+    async def test_same_message_prompt_and_parameter_changes_create_new_tasks(self):
+        self.set_config(helpers.workflow(parameter=True))
+        args = dict(user_id="11", stream_id="s1", group_id="22")
+        async with self.p._limiter.slot():
+            results = [await self.p.handle_run_workflow("draw", prompt, parameters={"width": width}, **args)
+                       for prompt, width in (("cat", 512), ("dog", 512), ("dog", 1024))]
+            self.assertTrue(all(r["success"] for r in results), results)
+            self.assertEqual(len({r["task_id"] for r in results}), 3, results)
+        await self.settled()
+        self.assertEqual(self.client.submit.await_count, 3)
+
+    async def test_same_message_reference_changes_create_new_tasks(self):
+        self.set_config(helpers.workflow(media=True))
+        saved = [await self.save_image(helpers.PNG + suffix, mid=f"reference-{i}")
+                 for i, suffix in enumerate((b"first", b"second"))]
+        args = dict(user_id="11", stream_id="s1", group_id="22")
+        async with self.p._limiter.slot():
+            results = [await self.p.handle_run_workflow("draw", "cat",
+                       references=[{"input": "subject", "media_id": item["memory_id"]}], **args) for item in saved]
+            self.assertTrue(all(r["success"] for r in results), results)
+            self.assertEqual(len({r["task_id"] for r in results}), 2, results)
+        await self.settled()
+        self.assertEqual(self.client.submit.await_count, 2)
+        self.assertCountEqual([c.args[0] for c in self.client.upload_file.await_args_list],
+                              [helpers.PNG + b"first", helpers.PNG + b"second"])
+
+    async def test_equivalent_validated_parameters_reuse_same_task(self):
+        self.set_config(helpers.workflow(parameter=True))
+        args = dict(user_id="11", stream_id="s1", group_id="22")
+        async with self.p._limiter.slot():
+            first = await self.p.handle_run_workflow("draw", "cat", parameters={"width": 512}, **args)
+            retry = await self.p.handle_run_workflow("draw", "cat", parameters={"width": "512"}, **args)
+            self.assertTrue(first["success"], first)
+            self.assertTrue(retry.get("duplicate"), retry)
+            self.assertEqual(first["task_id"], retry["task_id"])
+        await self.settled()
+        self.client.submit.assert_awaited_once()
+
+    async def test_current_reference_retry_after_caching_reuses_same_task(self):
+        self.set_config(helpers.workflow(media=True), natural_language={"avatar_candidates": False})
+        self.messages["m1"] = helpers.message(images=1)
+        self.recent = [self.messages["m1"]]
+        self.p._remember_anchor(self.messages["m1"])
+        args = dict(workflow_name="draw", prompt="cat", use_reference=True,
+                    user_id="11", stream_id="s1", group_id="22")
+        first = await self.p.handle_run_workflow(**args)
+        self.assertTrue(first["success"], first)
+        await self.settled()
+        retry = await self.p.handle_run_workflow(**args)
+        self.assertTrue(retry.get("duplicate"), retry)
+        self.assertEqual(first["task_id"], retry["task_id"])
+        await self.settled()
+        self.client.submit.assert_awaited_once()
+        self.client.upload_file.assert_awaited_once()
+
+    async def test_concurrent_identical_natural_requests_reserve_once(self):
+        args = dict(workflow_name="draw", prompt="cat", user_id="11", stream_id="s1", group_id="22")
+        async with self.p._limiter.slot():
+            results = await asyncio.gather(*(self.p.handle_run_workflow(**args) for _ in range(3)))
+            self.assertTrue(all(r["success"] for r in results), results)
+            self.assertEqual(len({r["task_id"] for r in results}), 1, results)
+            self.assertEqual(sum(bool(r.get("duplicate")) for r in results), 2)
+            self.assertEqual(self.p._task_journal.quota_used("11", time.time()), 1)
+        await self.settled()
+        self.client.submit.assert_awaited_once()
+
+    async def test_distinct_same_message_requests_obey_hourly_quota(self):
+        self.set_config(helpers.workflow(), access={"max_per_user_per_hour": 1})
+        args = dict(user_id="11", stream_id="s1", group_id="22")
+        async with self.p._limiter.slot():
+            first = await self.p.handle_run_workflow("draw", "cat", **args)
+            second = await self.p.handle_run_workflow("draw", "dog", **args)
+            retry = await self.p.handle_run_workflow("draw", "cat", **args)
+            self.assertTrue(first["success"], first)
+            self.assertFalse(second["success"], second)
+            self.assertIn("本小时的生成次数已达上限", second["message"])
+            self.assertTrue(retry.get("duplicate"), retry)
+            self.assertEqual(retry["task_id"], first["task_id"])
+            self.assertEqual(len(self.p._task_journal.records()), 1)
+        await self.settled()
+        self.client.submit.assert_awaited_once()
 
     async def test_generation_requires_trigger_even_with_saved_context(self):
         saved = await self.save_image()

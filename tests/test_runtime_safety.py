@@ -23,7 +23,7 @@ class RuntimeSafetyTests(unittest.IsolatedAsyncioTestCase):
         if proactive is not None:
             self.ctx.maisaka = SimpleNamespace(proactive=SimpleNamespace(trigger=proactive))
 
-    async def test_same_trigger_cannot_rebill_by_changing_plan_or_start_text(self):
+    async def test_same_generation_reuses_task_when_only_start_text_changes(self):
         self.set_config(helpers.workflow(parameter=True))
         first = await self.p.handle_run_workflow(
             "draw", "一只白猫", parameters={"width": 512}, start_message="我来画白猫。",
@@ -35,8 +35,8 @@ class RuntimeSafetyTests(unittest.IsolatedAsyncioTestCase):
             self.p.handle_run_workflow(
                 "draw", prompt, parameters={"width": width}, start_message=notice,
                 user_id="11", stream_id="s1", message=self.messages["m1"])
-            for prompt, width, notice in (("一只黑猫", 1024, "准备好了，开始。"),
-                                          ("加一片草地", 768, "我来添上草地。"))
+            for prompt, width, notice in (("一只白猫", 512, "准备好了，开始。"),
+                                          ("一只白猫", 512, "我来画这只白猫。"))
         ))
         await self.settled()
         for retry in retries:
