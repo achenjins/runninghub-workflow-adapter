@@ -1,6 +1,6 @@
 # 麦麦画师 · RunningHub
 
-![running](https://count.kjchmc.cn/get/@rhaajinse?theme=gelbooru)
+![running](https://count.getloli.com/@rhaajinse?name=rhaajinse&theme=gelbooru)
 ![Version](https://img.shields.io/badge/version-1.2.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-NapCat%20%2F%20QQ-orange)
@@ -8,6 +8,12 @@
 让麦麦亲手给你画画：从一句话文生图，到多参考图 / 视频生成，统统自动完成并把成品发回聊天。支持自定义工作流、自己优化成本、AI 扩写提示词和限流防刷。仅适配 NapCat / QQ。
 
 平台入口：[RunningHub 国外](https://www.runninghub.ai?inviteCode=bvhsaqdr) / [RunningHub 国内](https://www.runninghub.cn?inviteCode=8cq8uhl8)
+
+<p align="center">
+  <a href="https://www.runninghub.ai/call-api?source=github"><img src="docs/runninghub/banner.png" alt="RunningHub API：通过 API 调用 Seedance、Kling、MiniMax、Nano Banana、Veo 等 400+ 主流 AI 模型，支持免费测试" width="100%"></a>
+  <br>
+  <sub>赞助支持 · 本项目由 RunningHub 提供支持 · 单一接口直连 400+ 主流大模型 · <a href="https://www.runninghub.ai/call-api?source=github">免费测试 API</a> · <a href="#赞助支持">折扣与联系方式</a></sub>
+</p>
 
 **1.2.0 更新**：配置页面重构，自然语言调用大幅增强。在配置页配好工作流并开启「允许聊天调用」后，直接在聊天里说需求，麦麦就会帮你调用工作流，不用记命令；聊天上下文里的图片、视频和文件也能直接当作素材。
 
@@ -31,6 +37,7 @@
 - [完整配置项参考](#完整配置项参考)
 - [进阶玩法](#进阶玩法)
 - [常见问题 FAQ](#常见问题-faq)
+- [赞助支持](#赞助支持)
 - [开发者：项目结构](#开发者项目结构)
 
 ---
@@ -555,6 +562,17 @@ A：确认「聊天生成」里的「启用聊天生成」已打开，工作流�
 A：这是「自动撤回结果」功能，仅 NapCat / QQ 适配器可用，在「辅助功能」里开启并设好撤回延迟。
 
 </details>
+
+---
+
+## 赞助支持
+
+本项目由 [RunningHub](https://www.runninghub.ai/call-api?source=github) 提供支持：单一接口直连 400+ 主流大模型，可免费测试。
+
+<a href="https://www.runninghub.ai/call-api?source=github"><img src="docs/runninghub/card.png" alt="RunningHub API 介绍：Seedance 满血版 API 低至 0.21 元/秒；高并发、按需付费；无限画布、ComfyUI、Agent 等在线工具；一站式接入 LLM、多模态、工作流 API 与 AI 应用；400+ 主流模型、8000+ 版本可选" width="100%"></a>
+
+- 免费测试 API：<https://www.runninghub.ai/call-api?source=github>
+- 折扣获取与免费测试联系：[zhenyuedong@haima.me](mailto:zhenyuedong@haima.me)
 
 ---
 
