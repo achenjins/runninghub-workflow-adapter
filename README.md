@@ -1,7 +1,7 @@
 # 麦麦画师 · RunningHub
 
 ![running](https://count.kjchmc.cn/get/@rhaajinse?theme=gelbooru)
-![Version](https://img.shields.io/badge/version-1.2.0-blue)
+![Version](https://img.shields.io/badge/version-1.3.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-NapCat%20%2F%20QQ-orange)
 
@@ -15,7 +15,7 @@
   <sub>赞助支持 · 本项目由 RunningHub 提供支持 · 单一接口直连 400+ 主流大模型 · <a href="https://www.runninghub.ai/call-api?source=github">免费测试 API</a> · <a href="#赞助支持">了解 RunningHub 平台</a></sub>
 </p>
 
-**1.2.0 更新**：配置页面重构，自然语言调用大幅增强。在配置页配好工作流并开启「允许聊天调用」后，直接在聊天里说需求，麦麦就会帮你调用工作流，不用记命令；聊天上下文里的图片、视频和文件也能直接当作素材。
+**1.3.0 更新**：自然语言调用支持在同一条消息中向同一工作流提交多个不同任务，分别排队；使用权限按群白名单和每人每小时次数控制。工作流查询与素材查询分开，最近图片默认最多保存 20 张、按最近使用时间保留 24 小时，凭稳定图片 ID 和简短简介继续使用。完整变化见 [更新日志](CHANGELOG.md)。
 
 > [!WARNING]
 > 本插件目前**仅适配 NapCat 的 QQ**，其余平台 / 适配器未经测试，可能无法正常使用。
@@ -598,7 +598,7 @@ RunningHub 折扣获取与免费测试联系：[zhenyuedong@haima.me](mailto:zhe
 ## 开发者：项目结构
 
 <details>
-<summary>展开查看：模块划分与任务日志（v1.2.0）</summary>
+<summary>展开查看：模块划分与任务日志（v1.3.0）</summary>
 
 插件入口负责配置、命令和宿主适配；主要逻辑位于 `rh_generic_lib/`。自然语言工具模块使用 MaiBot SDK，其余核心模块采用可注入接口：
 
