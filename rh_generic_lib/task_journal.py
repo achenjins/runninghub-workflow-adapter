@@ -115,12 +115,34 @@ class TaskJournal:
             return None
         return copy.deepcopy(next((r for r in self._records if r.get("request_key") == request_key), None))
 
-    def find_anchor_request(self, user_id: str, stream_id: str, anchor_id: str, workflow_id: str, region: str):
+    def find_anchor_request(self, user_id: str, stream_id: str, anchor_id: str, request: dict[str, Any]):
+        """Match generation content, ignoring refreshed asset metadata and start wording."""
         if not anchor_id:
             return None
+        current_plan = request["plan"]
+        def references(plan):
+            assets = {asset["media_id"]: asset for asset in plan.get("assets", [])}
+            identities = {}
+            for ref in plan.get("references", []):
+                asset = assets.get(ref["media_id"], {})
+                # A current/reply image can acquire an im- ID after its first use.
+                identity = (("message", asset.get("stream_id"), asset["message_id"], asset.get("index", 0))
+                            if asset.get("message_id") else ("media", asset.get("memory_id") or ref["media_id"]))
+                identities[ref["input"]] = identity
+            return identities
+        def same_generation(record):
+            previous = record["request"]
+            plan = previous.get("plan")
+            return (previous.get("workflow") == request["workflow"]
+                    # Nodes already contain validated, canonical parameter values.
+                    and previous.get("nodes") == request["nodes"]
+                    and plan is not None
+                    and plan.get("prompt") == current_plan.get("prompt")
+                    and (plan.get("references") == current_plan.get("references")
+                         or references(plan) == references(current_plan)))
         return copy.deepcopy(next((r for r in self._records
             if r["user_id"] == user_id and r["stream_id"] == stream_id and r.get("anchor_id") == anchor_id
-            and r["region"] == region and r["request"].get("workflow", {}).get("workflow_id") == workflow_id), None))
+            and same_generation(r)), None))
 
     def recoverable_records(self) -> list[dict[str, Any]]:
         return [r for r in self.records() if r["status"] in ACTIVE_STATUSES
