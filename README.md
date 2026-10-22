@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://www.runninghub.ai/call-api?source=github"><img src="docs/runninghub/banner.png" alt="RunningHub API：通过 API 调用 Seedance、Kling、MiniMax、Nano Banana、Veo 等 400+ 主流 AI 模型，支持免费测试" width="100%"></a>
   <br>
-  <sub>赞助支持 · 本项目由 RunningHub 提供支持 · 单一接口直连 400+ 主流大模型 · <a href="https://www.runninghub.ai/call-api?source=github">免费测试 API</a> · <a href="#赞助支持">折扣与联系方式</a></sub>
+  <sub>赞助支持 · 本项目由 RunningHub 提供支持 · 单一接口直连 400+ 主流大模型 · <a href="https://www.runninghub.ai/call-api?source=github">免费测试 API</a> · <a href="#赞助支持">了解 RunningHub 平台</a></sub>
 </p>
 
 **1.2.0 更新**：配置页面重构，自然语言调用大幅增强。在配置页配好工作流并开启「允许聊天调用」后，直接在聊天里说需求，麦麦就会帮你调用工作流，不用记命令；聊天上下文里的图片、视频和文件也能直接当作素材。
@@ -567,12 +567,24 @@ A：这是「自动撤回结果」功能，仅 NapCat / QQ 适配器可用，在
 
 ## 赞助支持
 
-本项目由 [RunningHub](https://www.runninghub.ai/call-api?source=github) 提供支持：单一接口直连 400+ 主流大模型，可免费测试。
+<p align="center">
+  <a href="https://www.runninghub.ai/call-api?source=github"><img src="docs/runninghub/logo.png" alt="RunningHub" width="64"></a>
+  <br>
+  <b>RunningHub API</b>
+  <br>
+  本项目由 RunningHub 提供支持 · 单一接口直连 400+ 主流大模型 · <a href="https://www.runninghub.ai/call-api?source=github">免费测试</a>
+</p>
 
-<a href="https://www.runninghub.ai/call-api?source=github"><img src="docs/runninghub/card.png" alt="RunningHub API 介绍：Seedance 满血版 API 低至 0.21 元/秒；高并发、按需付费；无限画布、ComfyUI、Agent 等在线工具；一站式接入 LLM、多模态、工作流 API 与 AI 应用；400+ 主流模型、8000+ 版本可选" width="100%"></a>
+- Seedance 满血版 API 接入**全网骨折价**，在线工具低至 **0.21元/秒**，节省 **60%–80% 成本**！
+- 超稳定高并发高**折扣**，随用随充按需弹性付费，不捆绑不排队不抽卡
+- 无限画布、ComfyUI、Agent 等在线工具从剧本到成片全链路制作
+- 一站式接入 LLM API、多模态 API、工作流 API、AI 应用
+- 400+ 主流模型（**支持国际版权限**），8000+ 版本**任选**
+- 数千家企业信赖，**500 万 C 端月活**验证
 
-- 免费测试 API：<https://www.runninghub.ai/call-api?source=github>
-- 折扣获取与免费测试联系：[zhenyuedong@haima.me](mailto:zhenyuedong@haima.me)
+RunningHub 折扣获取与免费测试联系：[zhenyuedong@haima.me](mailto:zhenyuedong@haima.me)
+
+免费测试 API：<https://www.runninghub.ai/call-api?source=github>
 
 ---
 
