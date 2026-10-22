@@ -362,6 +362,7 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
             try:
                 await asyncio.sleep(5)
                 await asyncio.to_thread(self._cleanup_cache_once, max_age_seconds=max_age)
+                await self._load_image_memory(force_prune=True)
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 raise

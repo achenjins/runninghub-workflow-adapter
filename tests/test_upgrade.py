@@ -107,7 +107,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tool_schemas_do_not_expose_identity(self):
         tools = [c for c in self.p.get_components() if c["type"] == "TOOL"]
-        self.assertEqual({c["name"] for c in tools}, {"rh_context", "rh_inspect_media", "rh_task", "run_workflow"})
+        self.assertEqual({c["name"] for c in tools}, {"rh_workflows", "rh_media", "rh_inspect_media", "rh_task", "run_workflow"})
         for component in tools:
             self.assertFalse({p["name"] for p in component["metadata"]["parameters"]} & {"user_id", "group_id", "stream_id", "chat_id"})
 
@@ -381,7 +381,9 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({a["media_id"] for a in ctx["media"] if a["origin"] != "avatar"},
                          {a["media_id"] for a in expected})
         self.assertTrue(all(not {"source", "message_id", "platform_message_id"} & a.keys() for a in ctx["media"]))
-        self.assertEqual(ctx["workflows"][0]["inputs"][-1]["key"], "width")
+        self.assertNotIn("workflows", ctx)
+        detail = await self.p.handle_rh_workflows("draw", user_id="11", stream_id="s1")
+        self.assertEqual(detail["workflows"][0]["inputs"][-1]["key"], "width")
 
     async def test_current_image_is_bound_and_uploaded(self):
         self.set_config(workflow(media=True))

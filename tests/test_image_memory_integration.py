@@ -56,12 +56,16 @@ class ImageMemoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         }
 
     async def test_settings_default_bounds_and_real_toml_roundtrip(self):
-        self.assertEqual(NaturalLanguageSection().recent_images, 5)
+        self.assertEqual(NaturalLanguageSection().recent_images, 20)
+        self.assertEqual(NaturalLanguageSection().image_ttl_seconds, 86400)
         for count in (0, 20):
             self.assertEqual(NaturalLanguageSection(recent_images=count).recent_images, count)
         for count in (-1, 21):
             with self.subTest(invalid_count=count), self.assertRaises(ValidationError):
                 NaturalLanguageSection(recent_images=count)
+        for ttl in (59, 86401):
+            with self.subTest(invalid_ttl=ttl), self.assertRaises(ValidationError):
+                NaturalLanguageSection(image_ttl_seconds=ttl)
 
         self.set_config(helpers.workflow(), natural_language={"recent_images": 8})
         target = Path(self.tmp.name)

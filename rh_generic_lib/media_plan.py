@@ -48,6 +48,27 @@ def validate_workflow(workflow: Any) -> None:
             raise PlanError(f"参数 {key} 的最小值大于最大值")
 
 
+def workflow_overview(workflow: Any) -> dict[str, Any]:
+    """Enough to select a workflow without expanding its parameter schema."""
+    card = {"name": workflow.name, "output_type": getattr(workflow, "output_type", "image")}
+    for field in ("description", "capability", "cost_hint"):
+        value = getattr(workflow, field, "")
+        if value and value != "auto":
+            card[field] = value
+    media = {}
+    for node in ordered_nodes(workflow):
+        kind = resolve_value_type(node)
+        if kind in MEDIA_TYPES:
+            item = media.setdefault(kind, {"type": kind, "count": 0, "required": 0, "roles": []})
+            item["count"] += 1
+            item["required"] += bool(getattr(node, "required", False) and not node.field_value)
+            if getattr(node, "role", "") and node.role not in item["roles"]:
+                item["roles"].append(node.role)
+    if media:
+        card["media_inputs"] = list(media.values())
+    return card
+
+
 def workflow_card(workflow: Any) -> dict[str, Any]:
     """Expose only user-editable inputs, never server credentials or graph internals."""
     validate_workflow(workflow)

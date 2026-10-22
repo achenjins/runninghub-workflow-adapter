@@ -83,6 +83,63 @@ class ImageMemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.memory.read("u", "s", "0"))
         self.assertEqual(len(list(self.path.glob("*.img"))), 5)
 
+    async def test_twenty_image_limit_and_result_batches_never_displace_references(self):
+        references = [await self.remember(str(i), limit=20) for i in range(18)]
+        for number in range(25):
+            await self.memory.remember("u", "s", {"media_id": f"result-{number}", "type": "image", "origin": "result"},
+                                       f"result-{number}".encode(), "生成结果", 20)
+        records = self.memory.list_images("u", "s", 100)
+        self.assertEqual(len(records), 20)
+        self.assertEqual({r["memory_id"] for r in records if r["origin"] == "reference"},
+                         {r["memory_id"] for r in references})
+        self.assertEqual([r["media_id"] for r in records if r["origin"] == "result"], ["result-24", "result-23"])
+        self.assertEqual(len(list(self.path.glob("*.img"))), 20)
+
+    async def test_expiry_applies_to_list_read_touch_and_restart_and_deletes_bytes(self):
+        with patch("rh_generic_lib.image_memory.time.time", return_value=100000):
+            saved = await self.remember("old")
+        with patch("rh_generic_lib.image_memory.time.time", return_value=186401):
+            self.assertEqual(self.memory.list_images("u", "s", 20), [])
+            self.assertIsNone(self.memory.find("u", "s", saved["memory_id"]))
+            self.assertIsNone(await self.memory.touch("u", "s", saved["memory_id"]))
+            self.assertIsNone(await self.memory.read("u", "s", "old"))
+            self.assertEqual(list(self.path.glob("*.img")), [])
+        # Reload independently enforces expiry even without a prior read/prune.
+        with patch("rh_generic_lib.image_memory.time.time", return_value=200000):
+            await self.remember("another")
+        with patch("rh_generic_lib.image_memory.time.time", return_value=286401):
+            restored = ImageMemory(self.path)
+            await restored.load()
+            self.assertEqual(restored.list_images("u", "s", 20), [])
+            self.assertEqual(list(self.path.glob("*.img")), [])
+
+    async def test_expiry_is_based_on_last_use_and_pins_do_not_bypass_time_limit(self):
+        with patch("rh_generic_lib.image_memory.time.time", return_value=100000):
+            saved = await self.remember("refresh")
+        with patch("rh_generic_lib.image_memory.time.time", return_value=150000):
+            await self.memory.touch("u", "s", saved["memory_id"])
+        with patch("rh_generic_lib.image_memory.time.time", return_value=200000):
+            self.assertEqual(await self.memory.read("u", "s", saved["memory_id"]), b"refresh")
+        self.memory.protected_ids = {("u", "s", saved["memory_id"])}
+        with patch("rh_generic_lib.image_memory.time.time", return_value=236401):
+            await self.memory.trim(20)
+            self.assertIsNone(await self.memory.read("u", "s", saved["memory_id"]))
+
+    async def test_result_reused_as_reference_is_promoted_and_old_index_is_compatible(self):
+        await self.memory.remember("u", "s", {"media_id": "result", "type": "image", "origin": "result"}, b"r", "结果", 1)
+        await self.remember("selected", b"r", limit=1)
+        saved = self.memory.list_images("u", "s", 1)[0]
+        self.assertEqual(saved["origin"], "reference")
+        await self.memory.remember("u", "s", {"media_id": "new-result", "type": "image", "origin": "result"}, b"n", "新结果", 1)
+        self.assertEqual(await self.memory.read("u", "s", "result"), b"r")
+        index = self.path / "index.json"
+        raw = json.loads(index.read_text(encoding="utf-8"))
+        raw["images"][0].pop("origin")
+        index.write_text(json.dumps(raw), encoding="utf-8")
+        restored = ImageMemory(self.path)
+        await restored.load()
+        self.assertEqual(restored.list_images("u", "s", 1)[0]["origin"], "reference")
+
     async def test_touch_refreshes_lru_by_alias_or_stable_id_without_blob_io(self):
         first = await self.remember("first", b"cat")
         await self.remember("first-new", b"cat")

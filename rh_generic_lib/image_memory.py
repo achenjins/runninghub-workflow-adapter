@@ -42,8 +42,10 @@ class ImageMemory:
     lock is never released while a writer is still replacing files.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, ttl_seconds: int = 86400) -> None:
         self.path = Path(path)
+        self.ttl_seconds = ttl_seconds
+        self.protected_ids: set[tuple[str, str, str]] = set()
         self._records: list[dict[str, Any]] = []
         self._lock = asyncio.Lock()
         self.loaded = False
@@ -64,7 +66,7 @@ class ImageMemory:
             records = [self._normalize_record(item) for item in raw["images"]]
             records.sort(key=lambda item: item["used_at"], reverse=True)
             # Deduplicate a restored index and enforce the global scope bound.
-            records = self._bounded(records, limit=None)
+            records = self._bounded(self._fresh(records), limit=None)
             if records != raw["images"]:
                 await self._commit(records)
             else:
@@ -93,7 +95,8 @@ class ImageMemory:
         digest = hashlib.sha256(data).hexdigest()
         media_id = str(asset["media_id"])
         async with self._lock:
-            previous = next((item for item in self._records
+            fresh = self._fresh(self._records)
+            previous = next((item for item in fresh
                              if self._scope(item) == (user_id, stream_id) and item["_digest"] == digest), None)
             memory_id = "im-" + digest
             if previous and media_id == memory_id:
@@ -109,13 +112,16 @@ class ImageMemory:
                 "used_at": max(time.time(), self._records[0]["used_at"] + 0.000001 if self._records else 0),
                 "message_id": str(asset.get("message_id") or ""),
                 "index": asset.get("index") if isinstance(asset.get("index"), int) else 0,
+                "origin": "result" if asset.get("origin") == "result" and not
+                (previous and previous["origin"] == "reference") else "reference",
             }
-            records = [item for item in self._records
+            records = [item for item in fresh
                        if self._scope(item) != (user_id, stream_id)
                        or (item["_digest"] != digest and media_id not in item["media_ids"])]
             records = self._bounded([record, *records], limit)
-            await self._commit(records, blob=(digest, data))
-            return self._public(record)
+            retained = record in records
+            await self._commit(records, blob=(digest, data) if retained else None)
+            return self._public(record) if retained else None
 
     def list_images(self, user_id: str, stream_id: str, limit: int) -> list[dict[str, Any]]:
         """Return detached metadata, latest use first, without exposing paths."""
@@ -123,7 +129,29 @@ class ImageMemory:
         scope = (str(user_id or ""), str(stream_id or ""))
         if not limit or not all(scope):
             return []
-        return [self._public(item) for item in self._records if self._scope(item) == scope][:limit]
+        return [self._public(item) for item in self._fresh(self._records) if self._scope(item) == scope][:limit]
+
+    def find(self, user_id: str, stream_id: str, media_id: str) -> dict[str, Any] | None:
+        """Resolve a stable ID or host alias without consulting a chat snapshot."""
+        scope = (str(user_id or ""), str(stream_id or ""))
+        if not all(scope) or not media_id:
+            return None
+        record = next((item for item in self._fresh(self._records) if self._scope(item) == scope
+                       and (media_id == item["memory_id"] or media_id in item["media_ids"])), None)
+        return self._public(record) if record else None
+
+    def has_expired(self) -> bool:
+        cutoff = time.time() - self.ttl_seconds
+        return any(item["used_at"] < cutoff for item in self._records)
+
+    def _fresh(self, records):
+        cutoff = time.time() - self.ttl_seconds
+        return [item for item in records if item["used_at"] >= cutoff]
+
+    async def _prune_expired_locked(self):
+        records = self._fresh(self._records)
+        if records != self._records:
+            await self._commit(records)
 
     async def read(self, user_id: str, stream_id: str, media_id: str) -> bytes | None:
         """Read saved bytes only when the ID belongs to the requested scope."""
@@ -132,6 +160,7 @@ class ImageMemory:
         if not all(scope) or not media_id:
             return None
         async with self._lock:
+            await self._prune_expired_locked()
             record = next((item for item in self._records
                            if self._scope(item) == scope
                            and (media_id == item["memory_id"] or media_id in item["media_ids"])), None)
@@ -151,6 +180,7 @@ class ImageMemory:
             return None
         await self.load()
         async with self._lock:
+            await self._prune_expired_locked()
             previous = next((item for item in self._records
                              if self._scope(item) == scope
                              and (media_id == item["memory_id"] or media_id in item["media_ids"])), None)
@@ -164,7 +194,7 @@ class ImageMemory:
         """Apply a new per-scope limit; zero clears all saved images."""
         await self.load()
         async with self._lock:
-            records = self._bounded(self._records, max(0, int(limit)))
+            records = self._bounded(self._fresh(self._records), max(0, int(limit)))
             if records != self._records:
                 await self._commit(records)
             else:
@@ -205,18 +235,25 @@ class ImageMemory:
             "type": "image", "description": short_description(raw.get("description")), "used_at": used_at,
             "message_id": str(raw.get("message_id") or ""),
             "index": raw.get("index") if isinstance(raw.get("index"), int) else 0,
+            "origin": "result" if raw.get("origin") == "result" else "reference",
         }
 
-    @classmethod
-    def _bounded(cls, records: list[dict[str, Any]], limit: int | None) -> list[dict[str, Any]]:
+    def _bounded(self, records: list[dict[str, Any]], limit: int | None) -> list[dict[str, Any]]:
         if limit == 0:
             return []
         retained = []
         scopes: dict[tuple[str, str], int] = {}
         seen_digests = set()
         seen_ids = set()
-        for record in records:
-            scope = cls._scope(record)
+        def priority(record):
+            scope = self._scope(record)
+            protected = any((*scope, identifier) in self.protected_ids
+                            for identifier in (record["memory_id"], *record["media_ids"]))
+            return (not protected, record["origin"] == "result", -record["used_at"])
+        # Active task inputs survive count eviction. Results never displace references.
+        # TTL and the configured total count still apply to every retained image.
+        for record in sorted(records, key=priority):
+            scope = self._scope(record)
             if scope not in scopes and len(scopes) >= _MAX_SCOPES:
                 continue
             if limit is not None and scopes.get(scope, 0) >= limit:
@@ -228,7 +265,7 @@ class ImageMemory:
             seen_digests.add(digest_key)
             seen_ids.add(id_key)
             retained.append(record)
-        return retained
+        return sorted(retained, key=lambda item: item["used_at"], reverse=True)
 
     def _blob_path(self, digest: str) -> Path:
         if not _DIGEST.fullmatch(digest):

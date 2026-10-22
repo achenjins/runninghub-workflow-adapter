@@ -52,8 +52,10 @@ planner_model = "utils"
 # 模型仅可选择：replyer、planner、utils、vlm。
 # 视觉模型默认对应宿主的 vlm；旧空值也改用此项。识图失败仍上传原图。
 vision_model = "vlm"
-# 每人每个会话保留最近使用的原图与约五十字简介；填零关闭并清空。
-recent_images = 5
+# 每人每个会话最多20张原图与约五十字简介；填零关闭并清空。
+# 按最近一次使用计算24小时；生成结果优先淘汰，不挤掉参考图。
+recent_images = 20
+image_ttl_seconds = 86400
 # 把用户头像（群聊含群头像）作为可选素材，支持「画我」类请求；不需要可设 false
 avatar_candidates = true
 llm_timeout = 45
