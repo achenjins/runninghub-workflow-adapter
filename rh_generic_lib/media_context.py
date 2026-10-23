@@ -8,6 +8,7 @@ import uuid
 
 from .file_source import detect_file_type_from_name, extract_files_from_message, fetch_file_bytes, extract_bytes_from_napcat_result
 from .media_plan import PlanError
+from .group_files import list_group_media, read_group_file
 
 # 群聊工具上下文缺少 user_id 时，钩子记录的发言人身份可回退使用的时限（秒）；
 # 超时后后台主动回复等无新消息场景不会冒用旧身份。
@@ -140,7 +141,7 @@ class MediaContextMixin:
                                      self.config.natural_language.recent_images) if memory else []
         normal = [a for a in snapshot["assets"] if a.get("origin") != "memory"]
         for asset in normal:
-            for key in ("memory_id", "memory_user_id", "recent_index"):
+            for key in ("memory_id", "memory_user_id", "recent_index", "media_aliases"):
                 asset.pop(key, None)
         recalled = []
         for position, record in enumerate(records, 1):
@@ -149,6 +150,7 @@ class MediaContextMixin:
             matching = [a for a in normal if a["media_id"] in aliases
                         and a.get("origin") != "avatar" and a.get("type") == "image"]
             fields = {"memory_id": record["memory_id"], "memory_user_id": snapshot["user_id"],
+                      "media_aliases": record.get("media_ids", []),
                       "description": record["description"], "recent_index": position,
                       "used_at": record["used_at"],
                       "expires_at": record["used_at"] + self.config.natural_language.image_ttl_seconds}
@@ -256,7 +258,7 @@ class MediaContextMixin:
         return snapshot
 
     async def _media_snapshot(self, kwargs, context_id="", *, media_ids=(), source="all", media_type="",
-                              for_generation=False):
+                              for_generation=False, filename=""):
         uid, stream = self._trusted_scope(kwargs)
         previous = self._contexts.get(context_id) if context_id else None
         if previous and (previous["user_id"] != uid or previous["stream_id"] != stream):
@@ -287,7 +289,7 @@ class MediaContextMixin:
         warnings = []
         # Saved bytes need no history lookup when a live trigger is already known.
         # Generation still collects current/quoted inputs and resolves a missing trigger.
-        if not anchor or (source in {"all", "recent"} and not (for_generation and saved_only)):
+        if source != "group_file" and (not anchor or (source in {"all", "recent"} and not (for_generation and saved_only))):
             try:
                 value = unwrap(await self.ctx.message.get_recent(stream, limit=self.config.natural_language.history_limit))
                 recent = value if isinstance(value, list) else (value or {}).get("messages", [])
@@ -309,9 +311,12 @@ class MediaContextMixin:
         if not anchor or not anchor.get("message_id"):
             if for_generation:
                 raise PlanError("暂时无法定位触发消息，无法防止重复生成；请重新发送需求或使用 /rh运行")
-            snapshot = await self._memory_snapshot(kwargs)
-            snapshot["warnings"] = [*warnings, "未定位到触发消息，仅返回已保存图片"]
-            return snapshot
+            if source != "group_file":
+                snapshot = await self._memory_snapshot(kwargs)
+                snapshot["warnings"] = [*warnings, "未定位到触发消息，仅返回已保存图片"]
+                return snapshot
+            # Explicit group-file queries only need trusted group identity, not a chat message.
+            anchor = {}
         group_info = (anchor.get("message_info") or {}).get("group_info") or {}
         gid = str(group_info.get("group_id") or anchor.get("group_id") or kwargs.get("group_id") or "").strip()
         self._check_snapshot_access(kwargs, gid, uid)
@@ -357,6 +362,16 @@ class MediaContextMixin:
                     fresh = False
                 if fresh:
                     assets.extend(assets_from_message(message, stream, "recent", group_id=gid))
+        if gid and source in {"all", "recent", "group_file"} and (not for_generation or any(
+                mid.startswith("gf-") for mid in media_ids)):
+            # Query metadata directly; group uploads need not have reached a notice hook.
+            try:
+                assets.extend(await list_group_media(self.ctx.api, gid, stream, filename=filename,
+                    media_type=media_type, since=0 if source == "group_file" or filename else
+                    time.time() - self.config.natural_language.media_ttl_seconds, media_ids=media_ids))
+            except Exception as exc:
+                self.ctx.logger.warning("群文件列表读取失败: %s", exc)
+                warnings.append(f"群文件列表读取失败：{exc}")
         if self.config.natural_language.avatar_candidates:
             # 头像不是消息段：以宿主可信的 uid/群号为目标生成候选，LLM 只能引用不能指定
             assets.append({"media_id": f"avatar:{uid}", "type": "image", "origin": "avatar",
@@ -385,14 +400,16 @@ class MediaContextMixin:
                                    "timestamp": record["updated_at"]})
         unique = {}
         for asset in assets:
-            if source != "all" and asset["origin"] != source:
+            if source != "all" and asset["origin"] != source and not (source == "recent" and asset["origin"] == "group_file"):
+                continue
+            if filename and filename.casefold() not in str(asset.get("filename") or "").casefold():
                 continue
             if media_type and asset["type"] != media_type:
                 continue
             unique.setdefault(asset["media_id"], asset)
         token = uuid.uuid4().hex
         snapshot = {"context_id": token, "created_at": time.time(), "user_id": uid, "stream_id": stream,
-                    "group_id": gid, "anchor_id": str(anchor["message_id"]),
+                    "group_id": gid, "anchor_id": str(anchor.get("message_id") or ""),
                     "assets": list(unique.values())[:self.config.natural_language.max_candidates],
                     "warnings": list(dict.fromkeys(warnings))}
         self._contexts[token] = snapshot
@@ -425,6 +442,8 @@ class MediaContextMixin:
                     self.ctx.logger.warning("已保存图片暂不可读: %s", exc)
             if asset.get("origin") == "memory":
                 raise PlanError("这张图片已不在最近图片记录中，请重新发送")
+        if asset.get("group_file"):
+            return await read_group_file(self.ctx.api, client, asset)
         media_id = str(asset.get("media_id") or "")
         if media_id.startswith("avatar:") or media_id.startswith("avatar-group:"):
             from .avatar_source import fetch_avatar_bytes

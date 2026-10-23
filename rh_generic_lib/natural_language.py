@@ -28,7 +28,7 @@ def _tool_result(payload):
 
 def _public_media(snapshot):
     return [{k: short_description(a[k]) if k == "description" else a[k]
-             for k in ("media_id", "type", "origin", "description", "task_id", "recent_index", "timestamp", "used_at", "expires_at")
+             for k in ("media_id", "type", "origin", "description", "task_id", "recent_index", "timestamp", "used_at", "expires_at", "filename", "size")
              if a.get(k)} for a in snapshot["assets"]]
 
 
@@ -57,21 +57,24 @@ class NaturalLanguageMixin:
         except (PlanError, ValueError) as exc:
             return _tool_result({"success": False, "message": str(exc)})
 
-    @Tool("rh_media", description="查询当前、引用、近期聊天素材或已保存图片，只返回素材ID与简短简介。可按来源/类型筛选；memory 不读取聊天历史。图片最多20张、24小时，先按简介选图。", parameters=[
-        Param(name="source", description="素材来源；memory 查询已保存图片", enum_values=["all", "current", "reply", "recent", "memory", "result", "avatar"], required=False, default="all"),
-        Param(name="media_type", description="留空不限类型", enum_values=["image", "video", "audio"], required=False, default="")])
-    async def handle_rh_media(self, source="all", media_type="", **kwargs):
+    @Tool("rh_media", description="查询聊天素材、群文件或已保存图片。文件形式发送可用 group_file 主动查群文件，支持 filename 查找；recent/all 也包含近期群文件。只返回素材ID与简介，选中后才下载；memory 不读取聊天历史。", parameters=[
+        Param(name="source", description="素材来源；group_file 主动查询群文件，memory 查询已保存图片", enum_values=["all", "current", "reply", "recent", "group_file", "memory", "result", "avatar"], required=False, default="all"),
+        Param(name="media_type", description="留空不限类型", enum_values=["image", "video", "audio"], required=False, default=""),
+        Param(name="filename", description="群文件名，支持完整名或部分名称；留空不筛文件名", required=False, default="")])
+    async def handle_rh_media(self, source="all", media_type="", filename="", **kwargs):
         try:
             if not self.config.natural_language.enabled:
                 raise PlanError("自然语言生成已关闭")
-            if source not in {"all", "current", "reply", "recent", "memory", "result", "avatar"} or media_type not in {"", "image", "video", "audio"}:
+            if source not in {"all", "current", "reply", "recent", "group_file", "memory", "result", "avatar"} or media_type not in {"", "image", "video", "audio"}:
                 raise PlanError("素材来源或类型无效")
             uid, stream = self._trusted_scope(kwargs)
-            snapshot = await self._media_snapshot(kwargs, source=source, media_type=media_type)
+            snapshot = await self._media_snapshot(kwargs, source=source, media_type=media_type, filename=filename)
             draft = (self._drafts.get((uid, stream)) or {}).get("plan")
             media = [a for a in _public_media(snapshot)
-                     if (source == "all" or a["origin"] == source or (source == "memory" and a.get("recent_index")))
-                     and (not media_type or a["type"] == media_type)]
+                     if (source == "all" or a["origin"] == source or (source == "recent" and a["origin"] == "group_file")
+                         or (source == "memory" and a.get("recent_index")))
+                     and (not media_type or a["type"] == media_type)
+                     and (not filename or filename.casefold() in str(a.get("filename") or "").casefold())]
             payload = {"success": True, "context_id": snapshot["context_id"], "media": media,
                        "count": len(media), "warnings": snapshot.get("warnings", [])}
             if draft:
