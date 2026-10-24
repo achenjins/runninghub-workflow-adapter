@@ -125,11 +125,16 @@ class TaskJournal:
             identities = {}
             for ref in plan.get("references", []):
                 asset = assets.get(ref["media_id"], {})
-                # A current/reply image can acquire an im- ID after its first use.
-                identity = (("message", asset.get("stream_id"), asset["message_id"], asset.get("index", 0))
-                            if asset.get("message_id") else ("media", asset.get("memory_id") or ref["media_id"]))
-                identities[ref["input"]] = identity
+                # Message and group-file IDs can acquire an im- ID after first use.
+                aliases = {ref["media_id"], asset.get("memory_id"), *asset.get("media_aliases", [])}
+                identifiers = {("media", identifier) for identifier in aliases if identifier}
+                if asset.get("message_id"):
+                    identifiers.add(("message", asset.get("stream_id"), asset["message_id"], asset.get("index", 0)))
+                identities[ref["input"]] = identifiers
             return identities
+        def same_references(left, right):
+            left, right = references(left), references(right)
+            return left.keys() == right.keys() and all(left[key] & right[key] for key in left)
         def same_generation(record):
             previous = record["request"]
             plan = previous.get("plan")
@@ -139,7 +144,7 @@ class TaskJournal:
                     and plan is not None
                     and plan.get("prompt") == current_plan.get("prompt")
                     and (plan.get("references") == current_plan.get("references")
-                         or references(plan) == references(current_plan)))
+                         or same_references(plan, current_plan)))
         return copy.deepcopy(next((r for r in self._records
             if r["user_id"] == user_id and r["stream_id"] == stream_id and r.get("anchor_id") == anchor_id
             and same_generation(r)), None))

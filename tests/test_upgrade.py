@@ -65,6 +65,11 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                                     get_by_id=AsyncMock(side_effect=lambda mid, **k: self.messages.get(mid))),
             llm=SimpleNamespace(generate=AsyncMock(return_value={"success": True, "response": "enhanced"})),
         )
+        async def api_call(*args, **kwargs):
+            if kwargs.get("action_name") in {"get_group_root_files", "get_group_files_by_folder"}:
+                return {"success": True, "result": {"retcode": 0, "data": {"files": [], "folders": []}}}
+            return self.ctx.api.call.return_value
+        self.ctx.api.call.side_effect = api_call
         self.p._set_context(self.ctx)
         self.set_config(workflow())
         self.client = SimpleNamespace(api_key="test-key", max_file_bytes=1024,
@@ -896,7 +901,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             "message_id": "qq-123", "group_id": "22", "message": [{"type": "image", "data": {"url": "https://example.test/ref.png"}}]}}}
         ctx = await self.p.handle_rh_context(user_id="11", stream_id="s1", group_id="22")
         self.assertEqual(ctx["media"][0]["origin"], "reply")
-        self.ctx.api.call.assert_awaited_with("adapter.napcat.action.call", action_name="get_msg", params={"message_id": "qq-123"})
+        self.ctx.api.call.assert_any_await("adapter.napcat.action.call", action_name="get_msg", params={"message_id": "qq-123"})
         self.ctx.llm.generate.side_effect = RuntimeError("vision unavailable")
         result = await self.p.handle_rh_inspect_media(ctx["context_id"], ctx["media"][0]["media_id"], user_id="11", stream_id="s1", group_id="22")
         self.assertEqual(base64.b64decode(result["content_items"][0]["data"]), PNG)
