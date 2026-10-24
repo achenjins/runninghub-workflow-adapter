@@ -1,6 +1,6 @@
 # 麦麦画师 · RunningHub
 
-![running](https://count.kjchmc.cn/get/@rhaajinse?theme=gelbooru)
+![running](https://count.getloli.com/get/@rhaajinse?theme=gelbooru)
 ![Version](https://img.shields.io/badge/version-1.3.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-NapCat%20%2F%20QQ-orange)
@@ -633,3 +633,5 @@ RunningHub 折扣获取与免费测试联系：[zhenyuedong@haima.me](mailto:zhe
 ## 许可证
 
 MIT
+
+原访问统计链接（备用，恢复后可替换回顶部）：[count.kjchmc.cn](https://count.kjchmc.cn/get/@rhaajinse?theme=gelbooru)
