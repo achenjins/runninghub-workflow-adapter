@@ -1,7 +1,7 @@
 # 麦麦画师 · RunningHub
 
 ![running](https://count.getloli.com/get/@rhaajinse?theme=gelbooru&darkmode=0)
-![Version](https://img.shields.io/badge/version-1.3.0-blue)
+![Version](https://img.shields.io/badge/version-1.3.1-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-NapCat%20%2F%20QQ-orange)
 
