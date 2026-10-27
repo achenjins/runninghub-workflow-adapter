@@ -131,7 +131,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((record["status"], record["delivery_status"]), ("success", "sent"))
         self.client.submit.assert_awaited_once()
         # 超时限的发言人记录不得冒用（后台主动回复等无新消息场景保持 fail-closed）
-        self.p._stream_senders["s1"] = {"11": time.time() - 400}
+        self.p._stream_senders["s1"] = {"11": time.time() - 2000}
         stale = await self.p.handle_run_workflow("draw", "another cat", chat_id="s1", group_id="22")
         self.assertFalse(stale["success"])
         self.client.submit.assert_awaited_once()

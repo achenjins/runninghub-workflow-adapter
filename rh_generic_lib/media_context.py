@@ -11,7 +11,8 @@ from .media_plan import PlanError
 
 # 群聊工具上下文缺少 user_id 时，钩子记录的发言人身份可回退使用的时限（秒）；
 # 超时后后台主动回复等无新消息场景不会冒用旧身份。
-_FALLBACK_SENDER_TTL = 300.0
+# 生成一张图常要几分钟，AI 在出图后接着补图时用户可能已有一阵没说话，所以留 30 分钟。
+_FALLBACK_SENDER_TTL = 1800.0
 
 
 def unwrap(value):
