@@ -7,7 +7,7 @@
 
 让麦麦亲手给你画画：从一句话文生图，到多参考图 / 视频生成，统统自动完成并把成品发回聊天。支持自定义工作流、自己优化成本、AI 扩写提示词和限流防刷。仅适配 NapCat / QQ。
 
-平台入口：[RunningHub 国外](https://www.runninghub.ai?inviteCode=bvhsaqdr) / [RunningHub 国内](https://www.runninghub.cn?inviteCode=8cq8uhl8)
+平台入口：[RunningHub 国外](https://www.runninghub.ai?inviteCode=c1ooihmg) / [RunningHub 国内](https://www.runninghub.cn?inviteCode=8cq8uhl8)
 
 <p align="center">
   <a href="https://www.runninghub.ai/call-api?source=github"><img src="docs/runninghub/banner.png" alt="RunningHub API：通过 API 调用 Seedance、Kling、MiniMax、Nano Banana、Veo 等 400+ 主流 AI 模型，支持免费测试" width="100%"></a>
@@ -93,19 +93,19 @@ pip install -r runninghub-workflow-adapter/requirements.txt
 
 这是最重要的一步，不填后面全都会失败。
 
-**① 注册账号**（用邀请码注册，**获得 1000 RH 币！**）
+**① 注册账号**（用邀请码注册：国内站**获得 1000 RH 币**，海外站**获得 500 RH 币**！）
 
 打开对应平台的注册链接（邀请码已内置在链接里）：
 
 - 国内站：[注册国内账号](https://www.runninghub.cn?inviteCode=8cq8uhl8) 国内邀请码：8cq8uhl8
-- 海外站：[注册海外账号](https://www.runninghub.ai?inviteCode=bvhsaqdr) 海外邀请码：bvhsaqdr
+- 海外站：[注册海外账号](https://www.runninghub.ai?inviteCode=c1ooihmg) 海外邀请码：c1ooihmg
 
 **② 获取 API Key**
 
 注册并登录后，打开对应平台的 API 页面，复制页面里的 API Key：
 
 - 国内站：[打开国内 API 页面](https://www.runninghub.cn/enterprise-api/consumerApi?inviteCode=8cq8uhl8)
-- 海外站：[打开海外 API 页面](https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=bvhsaqdr)
+- 海外站：[打开海外 API 页面](https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=c1ooihmg)
 
 **③ 填进插件**
 
@@ -131,7 +131,7 @@ pip install -r runninghub-workflow-adapter/requirements.txt
 
 这是我**删掉了内部高成本豆包提示词优化节点**的**文生图体验工作流**。注意：去掉提示词优化节点后，它不能直接在 RunningHub 页面上使用，要导入插件、配合插件的 LLM 扩写来用（导入时会自动开启）；想体验原版，可以去下方 up 主的视频里找完整版工作流。
 
-- 海外版：[海外体验工作流](https://www.runninghub.ai/zh-cn/workflow/2087492768787685378?inviteCode=bvhsaqdr)
+- 海外版：[海外体验工作流](https://www.runninghub.ai/zh-cn/workflow/2087492768787685378?inviteCode=c1ooihmg)
 - 国内版：[国内体验工作流](https://www.runninghub.cn/workflow/2087939838371786753?inviteCode=8cq8uhl8)
 
 > [!NOTE]
@@ -139,7 +139,7 @@ pip install -r runninghub-workflow-adapter/requirements.txt
 
 **② qwen-image2.1 全能参考生图（支持参考图生图）**
 
-- 海外版：[海外体验工作流](https://www.runninghub.ai/zh-cn/post/2112874041647345665?inviteCode=bvhsaqdr)
+- 海外版：[海外体验工作流](https://www.runninghub.ai/zh-cn/post/2112874041647345665?inviteCode=c1ooihmg)
 - 国内版：[国内体验工作流](https://www.runninghub.cn/post/2103013637228154881?inviteCode=8cq8uhl8)
 
 > [!IMPORTANT]
