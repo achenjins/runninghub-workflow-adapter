@@ -13,7 +13,7 @@ from maibot_sdk.types import ToolParameterInfo as Param, ToolParamType as Type
 
 from .file_source import prepare_upload
 from .image_memory import short_description
-from .media_plan import PlanError, bind_plan, workflow_card, workflow_overview, parse_json_object
+from .media_plan import ParameterError, PlanError, bind_plan, workflow_card, workflow_overview, parse_json_object
 from .task_runtime import ADMIN_REVIEW_STATUSES
 from .workflow_runner import resolve_value_type
 
@@ -32,10 +32,17 @@ def _public_media(snapshot):
              if a.get(k)} for a in snapshot["assets"]]
 
 
-def _planning_context(snapshot, workflows, *, details=False):
-    return {"context_id": snapshot["context_id"],
-            "workflows": [(workflow_card if details else workflow_overview)(w) for w in workflows],
-            "media": _public_media(snapshot), "warnings": snapshot.get("warnings", [])}
+def _planning_context(snapshot, workflows, *, details=False, media_types=(), parameters_only=False):
+    cards = [(workflow_card if details else workflow_overview)(w) for w in workflows]
+    if parameters_only:
+        for card in cards:
+            card["inputs"] = [item for item in card["inputs"] if item["type"] == "text"]
+    context = {"context_id": snapshot["context_id"], "workflows": cards}
+    if media_types:
+        context["media"] = [item for item in _public_media(snapshot) if item["type"] in media_types]
+    if snapshot.get("warnings"):
+        context["warnings"] = snapshot["warnings"]
+    return context
 
 
 class NaturalLanguageMixin:
@@ -75,7 +82,8 @@ class NaturalLanguageMixin:
             payload = {"success": True, "context_id": snapshot["context_id"], "media": media,
                        "count": len(media), "warnings": snapshot.get("warnings", [])}
             if draft:
-                payload["draft"] = {k: v for k, v in draft.items() if k != "assets" and v}
+                payload["draft"] = {"workflow_name": draft["workflow_name"], "continue_draft": True,
+                                    "next_action": "原需求已保存；补充时仅传新增内容，无需重发原提示词。"}
             return _tool_result(payload)
         except (PlanError, ValueError) as exc:
             return _tool_result({"success": False, "message": str(exc)})
@@ -183,6 +191,7 @@ class NaturalLanguageMixin:
     async def handle_run_workflow(self, workflow_name="", prompt="", context_id="", references=None,
                                   parameters=None, source_task_id="", continue_draft=False, output_type="", use_reference=False, start_message="", **kwargs):
         snapshot, workflow = None, None
+        selection_options, repair_context = None, False
         try:
             if not self.config.natural_language.enabled:
                 raise PlanError("自然语言生成已关闭")
@@ -231,6 +240,7 @@ class NaturalLanguageMixin:
             if not plan["workflow_name"]:
                 available = [w for w in self.config.workflows.items if self._is_llm_callable_workflow(w)
                              and (not output_type or w.output_type == output_type) and (not needs_media or accepts_media(w))]
+                selection_options = available
                 if not available:
                     raise PlanError("没有符合成品类型和素材需求的可用工作流")
                 if len(available) == 1:
@@ -253,13 +263,19 @@ class NaturalLanguageMixin:
             workflow = self._find_workflow(plan["workflow_name"])
             if not workflow or not self._is_llm_callable_workflow(workflow):
                 workflow = None
+                selection_options = [w for w in self.config.workflows.items if self._is_llm_callable_workflow(w)]
                 raise PlanError("工作流不存在或未启用自然语言调用，请从返回的列表选择")
             if output_type and workflow.output_type != output_type:
                 workflow = None
+                selection_options = [w for w in self.config.workflows.items if self._is_llm_callable_workflow(w)
+                                     and w.output_type == output_type]
                 raise PlanError("所选工作流的成品类型不符，请从返回的列表选择")
             if needs_media and not accepts_media(workflow):
                 workflow = None
+                selection_options = [w for w in self.config.workflows.items if self._is_llm_callable_workflow(w)
+                                     and accepts_media(w)]
                 raise PlanError("所选工作流没有参考素材输入，请选择支持编辑或参考素材的工作流")
+            repair_context = True
             nodes, media, missing = bind_plan(workflow, plan["prompt"], plan["references"], plan["parameters"], candidates)
             if use_reference and not media and not any(m["type"] in {"image", "video", "audio"} for m in missing):
                 raise PlanError("请选择本次参考素材及输入；不能用工作流的固定素材代替用户指定素材")
@@ -268,7 +284,8 @@ class NaturalLanguageMixin:
             if missing:
                 self._drafts[(uid, stream)] = {"created_at": time.time(), "plan": plan}
                 return _tool_result({"success": False, "status": "needs_input", "missing": missing,
-                        **_planning_context(snapshot, [workflow], details=True), "message": "补充后 continue_draft=true；仅询问缺项或素材用途"})
+                        **_planning_context(snapshot, [workflow], details=True, media_types={m["type"] for m in missing}),
+                        "message": "补充后 continue_draft=true；仅询问缺项或素材用途"})
             kwargs.update(group_id=snapshot["group_id"], anchor_id=snapshot["anchor_id"], natural_plan=plan,
                           trigger="natural_language", start_message=start_message)
             result = await self._submit_and_poll(self._get_client(workflow.region), workflow, nodes, stream, kwargs)
@@ -281,9 +298,15 @@ class NaturalLanguageMixin:
             return _tool_result(result)
         except (PlanError, ValueError, TimeoutError) as exc:
             payload = {"success": False, "message": str(exc) or "规划超时，请指定工作流后重试"}
-            if snapshot:
-                payload.update(status="needs_input", **_planning_context(snapshot,
-                    [workflow] if workflow else [w for w in self.config.workflows.items if self._is_llm_callable_workflow(w)], details=bool(workflow)))
+            if snapshot and repair_context:
+                parameter_error = isinstance(exc, ParameterError)
+                media_types = () if parameter_error else {
+                    resolve_value_type(n) for n in self._ordered_nodes(workflow)
+                    if resolve_value_type(n) in {"image", "audio", "video"}}
+                payload.update(status="needs_input", **_planning_context(snapshot, [workflow], details=True,
+                    media_types=media_types, parameters_only=parameter_error))
+            elif snapshot and selection_options:
+                payload.update(status="needs_input", **_planning_context(snapshot, selection_options))
             return _tool_result(payload)
 
     async def _prepare_natural_plan(self, request, client, record):
