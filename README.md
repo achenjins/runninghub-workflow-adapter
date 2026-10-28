@@ -1,7 +1,7 @@
 # 麦麦画师 · RunningHub
 
 ![running](https://count.getloli.com/get/@rhaajinse?theme=gelbooru&darkmode=0)
-![Version](https://img.shields.io/badge/version-1.3.2-blue)
+![Version](https://img.shields.io/badge/version-1.3.5-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-NapCat%20%2F%20QQ-orange)
 
@@ -14,7 +14,7 @@
   <br>
   <sub>赞助支持 · 本项目由 RunningHub 提供支持 · 单一接口直连 400+ 主流大模型 · <a href="https://www.runninghub.ai/call-api?source=github">免费测试 API</a> · <a href="#赞助支持">了解 RunningHub 平台</a></sub>
 </p>
-**1.3.2 更新**：自然语言工具改用独立的 Bot 工作流每日额度（0 不限制），不再占用个人小时次数；命令和插件 API 保持原有限制。完整变化见 [更新日志](CHANGELOG.md)。
+**1.3.5 更新**：精简工具返回的上下文，素材查询不再重复回传待补需求的长提示词；参数错误只返回参数约束，素材纠错只列相关类型的候选。完整变化见 [更新日志](CHANGELOG.md)。
 
 **更新计划：**
 
