@@ -129,14 +129,22 @@ class ImageMemory:
         scope = (str(user_id or ""), str(stream_id or ""))
         if not limit or not all(scope):
             return []
-        return [self._public(item) for item in self._fresh(self._records) if self._scope(item) == scope][:limit]
+        cutoff = time.time() - self.ttl_seconds
+        result = []
+        for item in self._records:
+            if self._scope(item) == scope and item["used_at"] >= cutoff:
+                result.append(self._public(item))
+                if len(result) == limit:
+                    break
+        return result
 
     def find(self, user_id: str, stream_id: str, media_id: str) -> dict[str, Any] | None:
         """Resolve a stable ID or host alias without consulting a chat snapshot."""
         scope = (str(user_id or ""), str(stream_id or ""))
         if not all(scope) or not media_id:
             return None
-        record = next((item for item in self._fresh(self._records) if self._scope(item) == scope
+        cutoff = time.time() - self.ttl_seconds
+        record = next((item for item in self._records if self._scope(item) == scope and item["used_at"] >= cutoff
                        and (media_id == item["memory_id"] or media_id in item["media_ids"])), None)
         return self._public(record) if record else None
 

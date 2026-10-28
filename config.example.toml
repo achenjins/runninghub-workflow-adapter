@@ -3,7 +3,7 @@
 # 配置键名保留兼容。实际配置文件已排除在版本控制之外。
 
 [plugin]
-config_version = "1.3.0"
+config_version = "1.3.2"
 
 [server]
 base_url = "https://www.runninghub.ai"
@@ -33,7 +33,7 @@ enhance_model = "utils"
 
 [access]
 # 使用权限（留空=不限制；max_per_user_per_hour = 0 表示不限频）
-# 仅限制命令和其他插件调用；自然语言调用只受群白名单和每人每小时次数限制。
+# 用户白名单和个人小时额度仅限制命令和其他插件调用；群白名单同时适用于工具。
 allow_users = []
 allow_groups = []
 max_per_user_per_hour = 0
@@ -46,6 +46,9 @@ allow_plugin_api = false
 
 [natural_language]
 enabled = true
+# Bot 工具生成的全局每日额度，所有用户、会话和工作流共用；0 表示不限制。
+# 包含排队任务，按部署服务器的本地日期跨日重置，不占用个人小时额度。
+max_workflows_per_day = 0
 history_limit = 20
 media_ttl_seconds = 3600
 max_candidates = 12

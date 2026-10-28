@@ -188,8 +188,6 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         self._request_lock = asyncio.Lock()
         self._background_tasks = set()
         self._anchors = {}
-        # stream -> {user_id: 最近发言时间}；群聊工具身份回退用
-        self._stream_senders = {}
         self._contexts = {}
         self._drafts = {}
         self._vision_cache = {}
@@ -473,24 +471,28 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
                 return workflow
         return None
 
-    def _check_access(self, user_id: str, group_id: str, *, natural_language: bool = False) -> tuple[bool, str]:
-        """自然语言只检查群白名单；命令和插件 API 另检查用户白名单。
-
-        每人每小时次数统一在任务日志预留时检查，包含排队任务。
-        """
+    def _check_access(self, user_id: str, group_id: str) -> tuple[bool, str]:
+        """命令和插件 API 的用户、群权限；个人小时额度在任务预留时检查。"""
         if not self.config.plugin.enabled:
             return False, "插件已停用"
         cfg = self.config.access
         uid = str(user_id or "").strip()
-        gid = str(group_id or "").strip()
 
         if not uid:
             return False, "无法识别用户身份"
-        if cfg.allow_users and not natural_language:
+        if cfg.allow_users:
             allowed_users = {str(u).strip() for u in cfg.allow_users if str(u).strip()}
-            if not uid or uid not in allowed_users:
+            if uid not in allowed_users:
                 return False, "你没有使用本插件的权限"
 
+        return self._check_tool_access(group_id)
+
+    def _check_tool_access(self, group_id: str) -> tuple[bool, str]:
+        """工具独立检查群权限，不借用群成员的白名单或个人额度。"""
+        if not self.config.plugin.enabled:
+            return False, "插件已停用"
+        cfg = self.config.access
+        gid = str(group_id or "").strip()
         if cfg.allow_groups and gid:
             allowed_groups = {str(g).strip() for g in cfg.allow_groups if str(g).strip()}
             if gid not in allowed_groups:
@@ -639,11 +641,13 @@ class RunningHubGenericPlugin(TaskRuntimeMixin, NaturalLanguageMixin, MediaConte
         **kwargs: Any,
     ) -> dict[str, Any]:
         """查找工作流，构建节点参数，提交任务或进入交互式收集。"""
+        # 命令与插件 API 固定走个人额度；仅 run_workflow 工具使用 Bot 额度。
+        kwargs["trigger"] = "command"
         stream_id = str(kwargs.pop("stream_id", "") or "")
         command_text = str(command_text or "").strip()
         chat_info = self._extract_chat_info(kwargs)
         group_id = str(chat_info.get("group_id") or "")
-        # 命令和工具均使用宿主注入身份；工具 Schema 不暴露身份参数。
+        # 命令使用宿主注入身份，插件 API 使用调用方提供的身份。
         user_id = str(kwargs.get("user_id") or chat_info.get("user_id") or "")
         # 回填 kwargs，保证下游（任务元信息 / 撤回 / 中断权限）能拿到正确用户
         kwargs["user_id"] = user_id

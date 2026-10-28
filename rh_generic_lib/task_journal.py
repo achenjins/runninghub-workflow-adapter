@@ -11,6 +11,7 @@ import copy
 import json
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -130,6 +131,7 @@ class TaskJournal:
                             if asset.get("message_id") else ("media", asset.get("memory_id") or ref["media_id"]))
                 identities[ref["input"]] = identity
             return identities
+        current_references = references(current_plan)
         def same_generation(record):
             previous = record["request"]
             plan = previous.get("plan")
@@ -139,7 +141,7 @@ class TaskJournal:
                     and plan is not None
                     and plan.get("prompt") == current_plan.get("prompt")
                     and (plan.get("references") == current_plan.get("references")
-                         or references(plan) == references(current_plan)))
+                         or references(plan) == current_references))
         return copy.deepcopy(next((r for r in self._records
             if r["user_id"] == user_id and r["stream_id"] == stream_id and r.get("anchor_id") == anchor_id
             and same_generation(r)), None))
@@ -149,9 +151,21 @@ class TaskJournal:
                 or (r["status"] == STATUS_SUCCESS and r.get("delivery_status") in {"pending", "partial", "failed"})]
 
     def quota_used(self, user_id: str, now: float) -> int:
-        return sum(1 for r in self._records if r.get("user_id") == user_id and (
+        """命令和插件 API 的个人小时额度；工具任务不计入。"""
+        return sum(1 for r in self._records if r.get("request", {}).get("trigger") != "natural_language"
+            and r.get("user_id") == user_id and (
             r["status"] == "queued" or
             (float(r.get("submitted_at") or 0) > now - 3600)))
+
+    @staticmethod
+    def _day_start(now: float) -> float:
+        return datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+    def bot_quota_used(self, now: float) -> int:
+        """工具共用 Bot 每日额度；未提交的排队任务也预留名额。"""
+        start = self._day_start(now)
+        return sum(1 for r in self._records if r.get("request", {}).get("trigger") == "natural_language"
+            and (r["status"] == "queued" or float(r.get("submitted_at") or 0) >= start))
 
     async def update(self, task_id: str, *, expected_statuses=None, **updates: Any) -> bool:
         return await self._upsert(task_id, updates, expected_statuses=expected_statuses)
@@ -231,17 +245,23 @@ class TaskJournal:
 
     def _trim_locked(self) -> None:
         """超量时裁掉最旧的已终结记录；pending 永不裁掉。"""
-        while len(self._records) > self.max_records:
-            for index in range(len(self._records) - 1, -1, -1):
-                record = self._records[index]
-                if (record.get("status") not in ACTIVE_STATUSES
-                        and record.get("delivery_status") not in {"pending", "partial", "failed", "sending", "uncertain"}
-                        and float(record.get("submitted_at") or 0) < time.time() - 3600):
-                    self._records.pop(index)
-                    break
+        excess = len(self._records) - self.max_records
+        if excess <= 0:
+            return
+        now = time.time()
+        day_start = self._day_start(now)
+        retained = []
+        # 从旧到新只扫描一次；受保护记录很多时，避免每删一条都重新扫描。
+        for record in reversed(self._records):
+            if (excess > 0 and record.get("status") not in ACTIVE_STATUSES
+                    and record.get("delivery_status") not in {"pending", "partial", "failed", "sending", "uncertain"}
+                    and float(record.get("submitted_at") or 0) < (
+                        day_start if record.get("request", {}).get("trigger") == "natural_language"
+                        else now - 3600)):
+                excess -= 1
             else:
-                # Unfinished work and the current quota window must never be trimmed.
-                return
+                retained.append(record)
+        self._records = retained[::-1]
 
     async def _write_locked(self) -> None:
         """调用方必须持有 self._lock。

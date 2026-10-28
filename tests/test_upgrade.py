@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from plugin import RunningHubGenericPlugin, WorkflowItemSection, InputNodeSection, GenericConfig
 from rh_generic_lib.delivery import NapcatDelivery, DeliveryUncertain
 from rh_generic_lib.file_source import extract_files_from_message, extract_bytes_from_napcat_result
+from rh_generic_lib.media_context import BOT_SCOPE_USER
 from rh_generic_lib.media_plan import bind_plan, validate_parameter, validate_workflow, PlanError
 from rh_generic_lib.media_context import assets_from_message
 from rh_generic_lib.runninghub_client import RunningHubBusyError, RunningHubClient, RunningHubError, RunningHubTransportError
@@ -112,41 +113,41 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse({p["name"] for p in component["metadata"]["parameters"]} & {"user_id", "group_id", "stream_id", "chat_id"})
 
     async def test_missing_identity_and_cross_context_fail(self):
-        # 完全未知身份（无 user_id、钩子也没记录过该会话）时保持 fail-closed
-        self.p._stream_senders.pop("s1", None)
-        self.assertFalse((await self.p.handle_run_workflow("draw", "cat", stream_id="s1"))["success"])
+        self.assertFalse((await self.p.handle_run_workflow("draw", "cat"))["success"])
         ctx = await self.p.handle_rh_context(user_id="11", stream_id="s1")
         bad = await self.p.handle_run_workflow("draw", "cat", context_id=ctx["context_id"], user_id="66", stream_id="s1")
         self.assertFalse(bad["success"])
         self.client.submit.assert_not_awaited()
 
-    async def test_group_tool_identity_falls_back_to_hook_sender(self):
-        # MaiBot 群聊工具上下文只注入 chat_id/group_id（会话级 user_id 被上游清空，
-        # 见 chat_manager._update_session_identity），插件回退到 before_process 记录的最近发言人
+    async def test_group_tool_without_requester_uses_bot_scope_without_sender_expiry(self):
         result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
         self.assertTrue(result["success"], result.get("message"))
         await self.settled()
         record = self.p._task_journal.get(result["task_id"])
-        self.assertEqual(record["user_id"], "11")
+        self.assertEqual(record["user_id"], BOT_SCOPE_USER)
         self.assertEqual((record["status"], record["delivery_status"]), ("success", "sent"))
         self.client.submit.assert_awaited_once()
-        # 超时限的发言人记录不得冒用（后台主动回复等无新消息场景保持 fail-closed）
-        self.p._stream_senders["s1"] = {"11": time.time() - 2000}
-        stale = await self.p.handle_run_workflow("draw", "another cat", chat_id="s1", group_id="22")
-        self.assertFalse(stale["success"])
-        self.client.submit.assert_awaited_once()
+        with patch("rh_generic_lib.media_context.time.time", return_value=time.time() + 2000):
+            followup = await self.p.handle_run_workflow("draw", "another cat", chat_id="s1", group_id="22")
+        self.assertTrue(followup["success"], followup)
+        await self.settled()
+        self.assertEqual(self.p._task_journal.get(followup["task_id"])["user_id"], BOT_SCOPE_USER)
+        self.assertEqual(self.client.submit.await_count, 2)
 
     async def test_group_tool_identity_allows_other_recent_speakers(self):
-        self.p._stream_senders["s1"]["77"] = time.time() - 10
+        now = time.time()
+        with patch("rh_generic_lib.media_context.time.time", return_value=now - 10):
+            self.p._remember_anchor(message(mid="b1", uid="77"))
+        self.p._remember_anchor(self.messages["m1"])
         result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
         self.assertTrue(result["success"], result.get("message"))
         await self.settled()
         record = self.p._task_journal.get(result["task_id"])
-        self.assertEqual(record["user_id"], "11")
+        self.assertEqual(record["user_id"], BOT_SCOPE_USER)
         self.assertEqual((record["status"], record["delivery_status"]), ("success", "sent"))
         self.client.submit.assert_awaited_once()
 
-    async def test_group_tool_identity_uses_latest_hook_sender_in_active_group(self):
+    async def test_group_tool_uses_chat_message_as_anchor_without_borrowing_its_author(self):
         now = time.time()
         for mid, uid, text, age in (("a1", "11", "帮我画一只猫", 60), ("b1", "77", "画一只狗", 10)):
             self.messages[mid] = message(mid=mid, uid=uid, text=text)
@@ -157,7 +158,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["success"], result.get("message"))
         await self.settled()
         record = self.p._task_journal.get(result["task_id"])
-        self.assertEqual((record["user_id"], record["anchor_id"]), ("77", "b1"))
+        self.assertEqual((record["user_id"], record["anchor_id"]), (BOT_SCOPE_USER, "b1"))
         self.assertEqual((record["status"], record["delivery_status"]), ("success", "sent"))
         self.client.submit.assert_awaited_once()
 
@@ -172,27 +173,29 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((record["user_id"], record["anchor_id"]), ("11", "a1"))
         self.client.submit.assert_awaited_once()
 
-    async def test_group_tool_identity_accepts_whitelisted_latest_sender(self):
+    async def test_group_tool_does_not_need_a_whitelisted_sender(self):
         self.set_config(workflow(), access={"allow_users": ["77"]})
         self.p._remember_anchor(message(mid="a1", uid="11", text="哈哈"))
         self.p._remember_anchor(message(mid="b1", uid="77", text="帮我画一只猫"))
         result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
         self.assertTrue(result["success"], result.get("message"))
         await self.settled()
-        self.assertEqual(self.p._task_journal.get(result["task_id"])["user_id"], "77")
+        self.assertEqual(self.p._task_journal.get(result["task_id"])["user_id"], BOT_SCOPE_USER)
         self.client.submit.assert_awaited_once()
 
     async def test_group_tool_identity_allows_active_groups_with_access_limits(self):
         for index, access in enumerate(({"allow_users": ["11", "77"]}, {"max_per_user_per_hour": 5})):
             with self.subTest(access=access):
                 self.set_config(workflow(), access=access)
-                self.p._remember_anchor(message(mid=f"request-{index}", uid="11"))
                 now = time.time()
-                self.p._stream_senders["s1"] = {"77": now - 130, "11": now - 2}
+                with patch("rh_generic_lib.media_context.time.time", return_value=now - 130):
+                    self.p._remember_anchor(message(mid=f"other-{index}", uid="77"))
+                with patch("rh_generic_lib.media_context.time.time", return_value=now - 2):
+                    self.p._remember_anchor(message(mid=f"request-{index}", uid="11"))
                 result = await self.p.handle_run_workflow("draw", "cat", chat_id="s1", group_id="22")
                 self.assertTrue(result["success"], result.get("message"))
                 await self.settled()
-                self.assertEqual(self.p._task_journal.get(result["task_id"])["user_id"], "11")
+                self.assertEqual(self.p._task_journal.get(result["task_id"])["user_id"], BOT_SCOPE_USER)
         self.assertEqual(self.client.submit.await_count, 2)
 
     async def test_natural_language_bypasses_user_whitelist_through_submission(self):
@@ -203,8 +206,9 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["success"], result.get("message"))
         await self.settled()
         record = self.p._task_journal.get(result["task_id"])
-        self.assertEqual((record["user_id"], record["status"], record["delivery_status"]), ("77", "success", "sent"))
-        self.assertEqual(self.p._task_journal.quota_used("77", time.time()), 1)
+        self.assertEqual((record["user_id"], record["status"], record["delivery_status"]), (BOT_SCOPE_USER, "success", "sent"))
+        self.assertEqual(self.p._task_journal.quota_used("77", time.time()), 0)
+        self.assertEqual(self.p._task_journal.bot_quota_used(time.time()), 1)
         self.client.submit.assert_awaited_once()
 
     async def test_commands_and_plugin_api_keep_user_whitelist(self):
@@ -224,7 +228,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.p._task_journal.records(), [])
         self.client.submit.assert_not_awaited()
 
-    async def test_natural_generation_quota_stays_with_host_requester(self):
+    async def test_natural_generation_does_not_charge_host_requester_hourly_quota(self):
         self.set_config(workflow(), access={"allow_users": ["99"], "allow_groups": ["22"], "max_per_user_per_hour": 1})
         first_message = message(mid="a1", uid="11")
         self.p._remember_anchor(first_message)
@@ -234,22 +238,22 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         await self.settled()
         journal = self.p._task_journal
         self.assertEqual(journal.get(first["task_id"])["user_id"], "11")
-        self.assertEqual(journal.quota_used("11", time.time()), 1)
+        self.assertEqual(journal.quota_used("11", time.time()), 0)
         self.assertEqual(journal.quota_used("77", time.time()), 0)
         second_message = message(mid="a2", uid="11")
         self.p._remember_anchor(second_message)
-        limited = await self.p.handle_run_workflow("draw", "another cat", chat_id="s1", group_id="22", message=second_message)
-        self.assertFalse(limited["success"])
-        self.assertIn("本小时的生成次数已达上限", limited["message"])
+        second = await self.p.handle_run_workflow("draw", "another cat", chat_id="s1", group_id="22", message=second_message)
+        self.assertTrue(second["success"], second)
         other_message = message(mid="b2", uid="77")
         self.p._remember_anchor(other_message)
         other = await self.p.handle_run_workflow("draw", "dog", chat_id="s1", group_id="22", message=other_message)
         self.assertTrue(other["success"], other.get("message"))
         await self.settled()
-        self.assertEqual(journal.quota_used("11", time.time()), 1)
-        self.assertEqual(journal.quota_used("77", time.time()), 1)
-        self.assertEqual(len(journal.records()), 2)
-        self.assertEqual(self.client.submit.await_count, 2)
+        self.assertEqual(journal.quota_used("11", time.time()), 0)
+        self.assertEqual(journal.quota_used("77", time.time()), 0)
+        self.assertEqual(journal.bot_quota_used(time.time()), 3)
+        self.assertEqual(len(journal.records()), 3)
+        self.assertEqual(self.client.submit.await_count, 3)
 
     async def test_natural_queue_rechecks_group_whitelist(self):
         self.set_config(workflow(), access={"allow_users": ["99"], "allow_groups": ["22"]})
@@ -559,10 +563,12 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.messages["m1"] = message(images=1)
         self.p._remember_anchor(self.messages["m1"])
         ctx = await self.p.handle_rh_context(user_id="11", stream_id="s1")
-        for _ in range(2):
-            result = await self.p.handle_rh_inspect_media(ctx["context_id"], ctx["media"][0]["media_id"], user_id="11", stream_id="s1")
-            self.assertTrue(result["success"])
-            self.assertEqual(result["message"], "enhanced")
+        with patch("rh_generic_lib.natural_language.base64.b64encode", wraps=base64.b64encode) as encode:
+            for _ in range(2):
+                result = await self.p.handle_rh_inspect_media(ctx["context_id"], ctx["media"][0]["media_id"], user_id="11", stream_id="s1")
+                self.assertTrue(result["success"])
+                self.assertEqual(result["message"], "enhanced")
+            encode.assert_called_once_with(PNG)
         self.ctx.llm.generate.assert_awaited_once()
         call = self.ctx.llm.generate.await_args.kwargs
         self.assertEqual(call["model"], "vlm")
