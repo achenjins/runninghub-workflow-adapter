@@ -45,7 +45,7 @@ class NaturalLanguageMixin:
         try:
             if not self.config.natural_language.enabled:
                 raise PlanError("自然语言生成已关闭")
-            uid, stream = self._trusted_scope(kwargs)
+            uid, stream = self._trusted_scope(kwargs, allow_bot=True)
             self._trusted_group(kwargs, uid, stream)
             workflows = [w for w in self.config.workflows.items if self._is_llm_callable_workflow(w)]
             if workflow_name:
@@ -66,7 +66,7 @@ class NaturalLanguageMixin:
                 raise PlanError("自然语言生成已关闭")
             if source not in {"all", "current", "reply", "recent", "memory", "result", "avatar"} or media_type not in {"", "image", "video", "audio"}:
                 raise PlanError("素材来源或类型无效")
-            uid, stream = self._trusted_scope(kwargs)
+            uid, stream = self._trusted_scope(kwargs, allow_bot=True)
             snapshot = await self._media_snapshot(kwargs, source=source, media_type=media_type)
             draft = (self._drafts.get((uid, stream)) or {}).get("plan")
             media = [a for a in _public_media(snapshot)
@@ -113,21 +113,17 @@ class NaturalLanguageMixin:
             data = await self._resolve_asset(asset, client)
             if len(data) > 10 * 1024 * 1024:
                 raise PlanError("图片超过视觉工具 10MB 上限，请发送较小的参考预览")
-            encoded = base64.b64encode(data).decode("ascii")
-            mime = self._image_mime(data)
-            warning = ""
-            if self.config.natural_language.vision_model:
-                try:
-                    summary = await self._describe_image(data)
-                    saved = await self._remember_image_usage(asset, data, snapshot["user_id"], snapshot["stream_id"], description=summary)
-                    return _tool_result({"success": True, "media_id": saved["memory_id"] if saved else media_id, "message": summary})
-                except Exception as exc:
-                    warning = f"视觉摘要不可用：{str(exc) or type(exc).__name__}。已返回原图，请直接查看。"
-                    self.ctx.logger.warning("参考图视觉摘要失败: %s", exc)
+            try:
+                summary = await self._describe_image(data)
+                saved = await self._remember_image_usage(asset, data, snapshot["user_id"], snapshot["stream_id"], description=summary)
+                return _tool_result({"success": True, "media_id": saved["memory_id"] if saved else media_id, "message": summary})
+            except Exception as exc:
+                warning = f"视觉摘要不可用：{str(exc) or type(exc).__name__}。已返回原图，请直接查看。"
+                self.ctx.logger.warning("参考图视觉摘要失败: %s", exc)
             saved = await self._remember_image_usage(asset, data, snapshot["user_id"], snapshot["stream_id"], description="")
             return _tool_result({"success": True, "media_id": saved["memory_id"] if saved else media_id,
-                    "message": warning or "已返回所选参考图。",
-                    "content_items": [{"type": "image", "data": encoded, "mime_type": mime,
+                    "message": warning,
+                    "content_items": [{"type": "image", "data": base64.b64encode(data).decode("ascii"), "mime_type": self._image_mime(data),
                     "name": media_id, "description": asset["description"] or "本次参考图片"}]})
         except Exception as exc:
             return {"success": False, "message": str(exc) if isinstance(exc, PlanError) else "素材读取失败，请重新发送参考图"}
@@ -190,8 +186,8 @@ class NaturalLanguageMixin:
         try:
             if not self.config.natural_language.enabled:
                 raise PlanError("自然语言生成已关闭")
-            uid, stream = self._trusted_scope(kwargs)
-            allowed, reason = self._check_access(uid, str(kwargs.get("group_id") or ""), natural_language=True)
+            uid, stream = self._trusted_scope(kwargs, allow_bot=True)
+            allowed, reason = self._check_tool_access(str(kwargs.get("group_id") or ""))
             if not allowed:
                 raise PlanError(reason)
             kwargs.update(user_id=uid, stream_id=stream)
@@ -334,7 +330,7 @@ class NaturalLanguageMixin:
     async def handle_rh_task(self, action="status", task_id="", resume=False, **kwargs):
         """resume 只由 /rh状态 命令传入：用户排查后恢复「需人工处理」的任务；模型查询状态不会触发重试。"""
         try:
-            uid, stream = self._trusted_scope(kwargs)
+            uid, stream = self._trusted_scope(kwargs, allow_bot=True)
             journal = await self._load_task_journal()
             admin = self._is_admin(uid)
             # 管理员额外能看到其他会话里等待核对的任务：这些任务占着全局名额
@@ -374,6 +370,11 @@ class NaturalLanguageMixin:
     @Command("rh状态", description="查看任务状态并恢复查询", pattern=r"^/rh状态(?:\s+(?P<task_id>\S+))?\s*$")
     async def handle_rh_status(self, task_id="", **kwargs):
         task_id = task_id or str((kwargs.get("matched_groups") or {}).get("task_id") or "")
+        try:
+            self._trusted_scope(kwargs)
+        except PlanError as exc:
+            await self.ctx.send.text(str(exc), str(kwargs.get("stream_id") or kwargs.get("chat_id") or ""))
+            return True, "", 1
         result = await self.handle_rh_task(task_id=task_id, resume=True, **kwargs)
         # 详细说明只给命令用户看，工具返回给模型的只有状态。
         tasks = [self._task_journal.get(r["task_id"]) for r in result.get("tasks", [])]
@@ -384,6 +385,11 @@ class NaturalLanguageMixin:
     @Command("rh补发", description="仅补发生成成功但未发出的结果", pattern=r"^/rh补发\s+(?P<task_id>\S+)\s*$")
     async def handle_rh_retry(self, task_id="", **kwargs):
         task_id = task_id or str((kwargs.get("matched_groups") or {}).get("task_id") or "")
+        try:
+            self._trusted_scope(kwargs)
+        except PlanError as exc:
+            await self.ctx.send.text(str(exc), str(kwargs.get("stream_id") or kwargs.get("chat_id") or ""))
+            return True, "", 1
         result = await self.handle_rh_task("retry_delivery", task_id, **kwargs)
         await self.ctx.send.text(result["message"], str(kwargs.get("stream_id") or kwargs.get("chat_id") or ""))
         return True, "", 1

@@ -72,7 +72,7 @@ class PluginMetaSection(PluginConfigBase):
     """由宿主管理。"""
     __ui_label__ = "插件状态"
 
-    config_version: str = _setting("1.3.0", "配置版本", "由插件维护。", ui={"hidden": True})
+    config_version: str = _setting("1.3.2", "配置版本", "由插件维护。", ui={"hidden": True})
     enabled: bool = _setting(True, "启用插件", "由宿主控制。", ui={"hidden": True})
 
 
@@ -120,7 +120,7 @@ class AccessSection(PluginConfigBase):
                                  json_schema_extra={"label": "允许的用户", "placeholder": "用户号码，每行一个"})
     allow_groups: list[str] = Field(default_factory=list, description="留空允许所有群，私聊不受此项限制。",
                                   json_schema_extra={"label": "允许的群", "placeholder": "群号，每行一个"})
-    max_per_user_per_hour: int = _setting(0, "每人每小时次数", "包含排队任务，填零不限次数。", ge=0)
+    max_per_user_per_hour: int = _setting(0, "每人每小时次数", "仅限制命令和其他插件调用，包含排队任务，填零不限次数。", ge=0)
     admin_users: list[str] = Field(default_factory=list, description="可导入工作流、管理当前会话任务。",
                                   json_schema_extra={"label": "管理员", "placeholder": "用户号码，每行一个"})
     manage_workflows_admin_only: bool = _setting(True, "仅管理员导入", "限制通过聊天识别并保存工作流。")
@@ -132,6 +132,7 @@ class NaturalLanguageSection(PluginConfigBase):
     __ui_label__ = "聊天生成"
 
     enabled: bool = _setting(True, "启用聊天生成", "允许通过自然语言生成或修改媒体。")
+    max_workflows_per_day: int = _setting(0, "Bot 工作流每日限制", "所有会话的工具生成共用每日额度，包含排队任务；按服务器本地日期重置，填零不限次数。", ge=0)
     planner_model: ModelTask = _setting("utils", "工作流选择模型", "有多个候选且未指定名称时使用。")
     vision_model: ModelTask = _setting("vlm", "视觉模型", "默认使用宿主视觉模型；识图失败仍上传原图。")
     recent_images: int = _setting(20, "最近图片数量", "每人每个会话最多保留的原图与简短描述数量，填零关闭并清空。", ge=0, le=20)

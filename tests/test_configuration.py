@@ -25,7 +25,7 @@ def sample_config():
         "generation": {"max_queued": 0, "query_retries": 0, "delivery_retries": 0},
         "feature": {"model": "planner", "enhance_model": "replyer", "recall_seconds": 0},
         "access": {"allow_users": ["fake-user"], "allow_groups": ["fake-group"], "admin_users": ["fake-admin"]},
-        "natural_language": {"planner_model": "utils", "vision_model": "vlm"},
+        "natural_language": {"planner_model": "utils", "vision_model": "vlm", "max_workflows_per_day": 8},
         "workflows": {"items": [{
             "name": "测试工作流", "workflow_id": "12345", "region": "domestic",
             "instance_type": "Plus", "capability": "image_to_image", "output_type": "image",
@@ -48,6 +48,15 @@ def sample_config():
 class ConfigurationTests(unittest.TestCase):
     def setUp(self):
         self.plugin = RunningHubGenericPlugin()
+
+    def test_bot_daily_limit_defaults_and_webui(self):
+        self.plugin.set_plugin_config({})
+        self.assertEqual(self.plugin.config.natural_language.max_workflows_per_day, 0)
+        with self.assertRaises(ValueError):
+            GenericConfig.model_validate({"natural_language": {"max_workflows_per_day": -1}})
+        field = self.plugin.get_webui_config_schema()["sections"]["natural_language"]["fields"]["max_workflows_per_day"]
+        self.assertEqual(field["label"], "Bot 工作流每日限制")
+        self.assertEqual(field["default"], 0)
 
     def save_and_reload(self, plugin=None):
         """Exercise the actual atomic TOML writer in an isolated directory."""
@@ -241,7 +250,11 @@ class ConfigurationTests(unittest.TestCase):
                 with self.subTest(field=name):
                     for key in ("label", "description"):
                         self.assertRegex(field[key], r"[\u4e00-\u9fff]")
-                        self.assertNotRegex(field[key], r"[A-Za-z]")
+                        text = field[key]
+                        if name == "max_workflows_per_day" and key == "label":
+                            self.assertEqual(text, "Bot 工作流每日限制")
+                            text = text.removeprefix("Bot ")
+                        self.assertNotRegex(text, r"[A-Za-z]")
                     if field.get("choices"):
                         if name in {"model", "enhance_model", "planner_model", "vision_model"}:
                             self.assertEqual(field["choices"], ["replyer", "planner", "utils", "vlm"])

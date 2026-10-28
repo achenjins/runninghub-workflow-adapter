@@ -9,10 +9,8 @@ import uuid
 from .file_source import detect_file_type_from_name, extract_files_from_message, fetch_file_bytes, extract_bytes_from_napcat_result
 from .media_plan import PlanError
 
-# 群聊工具上下文缺少 user_id 时，钩子记录的发言人身份可回退使用的时限（秒）；
-# 超时后后台主动回复等无新消息场景不会冒用旧身份。
-# 生成一张图常要几分钟，AI 在出图后接着补图时用户可能已有一阵没说话，所以留 30 分钟。
-_FALLBACK_SENDER_TTL = 1800.0
+# 未注入请求人时，工具的任务和素材使用 Bot 会话作用域，不冒用群成员身份。
+BOT_SCOPE_USER = "__runninghub_bot__"
 
 
 def unwrap(value):
@@ -180,32 +178,24 @@ class MediaContextMixin:
         for key, lock in list(self._vision_locks.items()):
             if not lock.locked() and key not in self._vision_cache:
                 self._vision_locks.pop(key, None)
-        now = time.time()
-        for stream, senders in list(self._stream_senders.items()):
-            for uid in [u for u, seen in senders.items() if now - seen > _FALLBACK_SENDER_TTL]:
-                senders.pop(uid)
-            if not senders:
-                self._stream_senders.pop(stream)
 
     def _remember_anchor(self, message):
         uid, stream = identity(message)
         if not uid or not stream:
             return
         self._prune_context()
-        # 钩子消息由宿主序列化产生，发言人身份与命令 kwargs 同级可信；
-        # 记录会话内近期发言人，供群聊工具上下文缺少 user_id 时限时回退。
-        self._stream_senders.setdefault(stream, {})[uid] = time.time()
+        now = time.time()
         # Keep bounded metadata; obtain binary payload from message.get_by_id only when selected.
         stripped = {k: message[k] for k in ("message_id", "timestamp", "session_id", "stream_id", "chat_id", "message_info", "reply_to") if k in message}
         stripped["raw_message"] = [{k: v for k, v in s.items() if k in {"type", "data", "binary_hash", "description"}} for s in segments(message)[:64]]
         for s in stripped["raw_message"]:
             if len(json.dumps(s.get("data"), ensure_ascii=False)) > 10000:
                 s["data"] = ""
-        stripped.pop("message_segments", None)
-        stripped.pop("message", None)
-        self._anchors[(uid, stream)] = {"created_at": time.time(), "message": stripped}
+        self._anchors[(uid, stream)] = {"created_at": now, "message": stripped}
+        # Bot 只记会话消息作为素材与去重锚点；消息作者不授予工具任何个人权限。
+        self._anchors[(BOT_SCOPE_USER, stream)] = {"created_at": now, "message": stripped}
 
-    def _trusted_scope(self, kwargs):
+    def _trusted_scope(self, kwargs, *, allow_bot=False):
         # These fields are deliberately absent from every Tool schema. Only host injection supplies them.
         uid = str(kwargs.get("user_id") or "").strip()
         stream = str(kwargs.get("chat_id") or kwargs.get("stream_id") or "").strip()
@@ -214,14 +204,8 @@ class MediaContextMixin:
             if (uid and message_uid and uid != message_uid) or (stream and message_stream and stream != message_stream):
                 raise PlanError("宿主消息与调用上下文身份不一致")
             uid, stream = uid or message_uid, stream or message_stream
-        if not uid and stream:
-            # 群聊工具上下文可能只有会话身份，沿用 before_process 记录的最近发言人。
-            # 多人连续发言是正常群聊，不作为拒绝工具调用的条件。
-            now = time.time()
-            senders = sorted(((seen, u) for u, seen in self._stream_senders.get(stream, {}).items()
-                              if now - seen <= _FALLBACK_SENDER_TTL), reverse=True)
-            if senders:
-                uid = senders[0][1]
+        if not uid and stream and allow_bot:
+            uid = BOT_SCOPE_USER
         if not uid or not stream:
             raise PlanError("宿主没有提供可信用户／会话身份，请使用 /rh运行 命令")
         return uid, stream
@@ -230,12 +214,12 @@ class MediaContextMixin:
         anchor = kwargs.get("message") or (self._anchors.get((uid, stream)) or {}).get("message") or {}
         group = (anchor.get("message_info") or {}).get("group_info") or {}
         gid = str(group.get("group_id") or anchor.get("group_id") or kwargs.get("group_id") or "")
-        self._check_snapshot_access(kwargs, gid, uid)
+        self._check_snapshot_access(kwargs, gid)
         return gid
 
     async def _memory_snapshot(self, kwargs):
         """Saved image IDs are scoped by host identity, independent of messages/tokens."""
-        uid, stream = self._trusted_scope(kwargs)
+        uid, stream = self._trusted_scope(kwargs, allow_bot=True)
         gid = self._trusted_group(kwargs, uid, stream)
         anchor = kwargs.get("message") or (self._anchors.get((uid, stream)) or {}).get("message") or {}
         token = uuid.uuid4().hex
@@ -258,7 +242,7 @@ class MediaContextMixin:
 
     async def _media_snapshot(self, kwargs, context_id="", *, media_ids=(), source="all", media_type="",
                               for_generation=False):
-        uid, stream = self._trusted_scope(kwargs)
+        uid, stream = self._trusted_scope(kwargs, allow_bot=True)
         previous = self._contexts.get(context_id) if context_id else None
         if previous and (previous["user_id"] != uid or previous["stream_id"] != stream):
             raise PlanError("素材上下文不属于当前用户会话")
@@ -267,7 +251,7 @@ class MediaContextMixin:
         if context_id:
             snapshot = previous
             if snapshot:
-                self._check_snapshot_access(kwargs, snapshot.get("group_id", ""), uid)
+                self._check_snapshot_access(kwargs, snapshot.get("group_id", ""))
                 snapshot["last_used_at"] = time.time()
                 await self._apply_image_memory(snapshot)
                 if not for_generation:
@@ -297,10 +281,11 @@ class MediaContextMixin:
             except Exception:
                 warnings.append("聊天历史读取失败；已保存图片仍可查询")
         recent = [m for m in recent if isinstance(m, dict) and identity(m)[1] in {"", stream}]
-        if anchor and (identity(anchor)[0] != uid or identity(anchor)[1] not in {"", stream}):
+        if anchor and ((uid != BOT_SCOPE_USER and identity(anchor)[0] != uid)
+                       or identity(anchor)[1] not in {"", stream}):
             raise PlanError("触发消息身份与宿主用户／会话不一致")
         if not anchor:
-            own = [m for m in recent if identity(m)[0] == uid]
+            own = [m for m in recent if uid == BOT_SCOPE_USER or identity(m)[0] == uid]
             def timestamp(m):
                 try:
                     return float(m.get("timestamp") or 0)
@@ -315,7 +300,7 @@ class MediaContextMixin:
             return snapshot
         group_info = (anchor.get("message_info") or {}).get("group_info") or {}
         gid = str(group_info.get("group_id") or anchor.get("group_id") or kwargs.get("group_id") or "").strip()
-        self._check_snapshot_access(kwargs, gid, uid)
+        self._check_snapshot_access(kwargs, gid)
         assets = assets_from_message(anchor, stream, "current", group_id=gid)
         reply_ids = [(d := s.get("data", {})).get("target_message_id") or d.get("message_id")
                      for s in segments(anchor) if s.get("type") == "reply" and isinstance(s.get("data"), dict)]
@@ -351,7 +336,7 @@ class MediaContextMixin:
             except (TypeError, ValueError):
                 return 0
         for message in sorted(recent, key=timestamp, reverse=True):
-            if identity(message)[0] == uid:
+            if uid == BOT_SCOPE_USER or identity(message)[0] == uid:
                 try:
                     fresh = float(message.get("timestamp") or 0) >= time.time() - self.config.natural_language.media_ttl_seconds
                 except (TypeError, ValueError):
@@ -360,30 +345,35 @@ class MediaContextMixin:
                     assets.extend(assets_from_message(message, stream, "recent", group_id=gid))
         if self.config.natural_language.avatar_candidates:
             # 头像不是消息段：以宿主可信的 uid/群号为目标生成候选，LLM 只能引用不能指定
-            assets.append({"media_id": f"avatar:{uid}", "type": "image", "origin": "avatar",
-                           "description": "当前用户的 QQ 头像（画我/用我头像类请求绑定它）", "stream_id": stream})
+            if uid != BOT_SCOPE_USER:
+                assets.append({"media_id": f"avatar:{uid}", "type": "image", "origin": "avatar",
+                               "description": "当前用户的 QQ 头像（画我/用我头像类请求绑定它）", "stream_id": stream})
+            else:
+                warnings.append("请求人未知，仅提供本会话素材；个人头像需要明确的请求人身份。")
             if gid and gid != uid:
                 assets.append({"media_id": f"avatar-group:{gid}", "type": "image", "origin": "avatar",
                                "description": "本群的群头像", "stream_id": stream})
-        journal = await self._load_task_journal()
-        for record in sorted(journal.records(), key=lambda r: float(r.get("updated_at") or 0), reverse=True):
-            if record["user_id"] != uid or record["stream_id"] != stream or record["status"] != "success":
-                continue
-            if float(record.get("updated_at") or 0) < time.time() - max(
-                    self.config.natural_language.media_ttl_seconds, self.config.natural_language.image_ttl_seconds):
-                continue
-            for index, item in enumerate(record["outputs"]):
-                declared = str(item.get("type") or "").lower()
-                kind = "image" if self._is_image_url(item["url"], declared) else "video" if self._is_video_url(item["url"], declared) else "audio" if declared == "audio" or declared.startswith("audio/") else detect_file_type_from_name(item["url"])
-                if kind in {"image", "audio", "video"}:
-                    ttl = (self.config.natural_language.image_ttl_seconds if kind == "image"
-                           else self.config.natural_language.media_ttl_seconds)
-                    if float(record.get("updated_at") or 0) < time.time() - ttl:
-                        continue
-                    assets.append({"media_id": f"{record['task_id']}:{index}", "task_id": record["task_id"],
-                                   "type": kind, "origin": "result", "source": item["url"], "stream_id": stream,
-                                   "description": f"{record['workflow']} 结果 {index + 1}",
-                                   "timestamp": record["updated_at"]})
+        if source in {"all", "result"}:
+            journal = await self._load_task_journal()
+            now = time.time()
+            cfg = self.config.natural_language
+            cutoff = now - max(cfg.media_ttl_seconds, cfg.image_ttl_seconds)
+            records = [r for r in journal.records()
+                       if r["user_id"] == uid and r["stream_id"] == stream and r["status"] == "success"
+                       and float(r.get("updated_at") or 0) >= cutoff]
+            for record in sorted(records, key=lambda r: float(r.get("updated_at") or 0), reverse=True):
+                updated = float(record.get("updated_at") or 0)
+                for index, item in enumerate(record["outputs"]):
+                    declared = str(item.get("type") or "").lower()
+                    kind = "image" if self._is_image_url(item["url"], declared) else "video" if self._is_video_url(item["url"], declared) else "audio" if declared == "audio" or declared.startswith("audio/") else detect_file_type_from_name(item["url"])
+                    if kind in {"image", "audio", "video"}:
+                        ttl = cfg.image_ttl_seconds if kind == "image" else cfg.media_ttl_seconds
+                        if updated < now - ttl:
+                            continue
+                        assets.append({"media_id": f"{record['task_id']}:{index}", "task_id": record["task_id"],
+                                       "type": kind, "origin": "result", "source": item["url"], "stream_id": stream,
+                                       "description": f"{record['workflow']} 结果 {index + 1}",
+                                       "timestamp": record["updated_at"]})
         unique = {}
         for asset in assets:
             if source != "all" and asset["origin"] != source:
@@ -406,11 +396,11 @@ class MediaContextMixin:
                                       if a["media_id"] in media_ids and a["media_id"] not in present)
         return await self._add_memory_aliases(snapshot, media_ids)
 
-    def _check_snapshot_access(self, kwargs, group_id, user_id):
+    def _check_snapshot_access(self, kwargs, group_id):
         injected = str(kwargs.get("group_id") or "").strip()
         if injected and injected != group_id:
             raise PlanError("触发消息与宿主群聊身份不一致")
-        allowed, reason = self._check_access(user_id, group_id, natural_language=True)
+        allowed, reason = self._check_tool_access(group_id)
         if not allowed:
             raise PlanError(reason)
 

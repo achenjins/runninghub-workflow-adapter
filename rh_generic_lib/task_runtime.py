@@ -22,6 +22,11 @@ _BUSY_RESUBMIT_LIMIT = 1800
 
 
 class TaskRuntimeMixin:
+    def _check_task_access(self, request, user_id, group_id):
+        if request.get("trigger") == "natural_language":
+            return self._check_tool_access(group_id)
+        return self._check_access(user_id, group_id)
+
     @asynccontextmanager
     async def _job_slot(self, task_id):
         def external_reservations():
@@ -67,13 +72,17 @@ class TaskRuntimeMixin:
                 if existing:
                     return {"success": True, "duplicate": True, "task_id": existing["task_id"],
                             "status": existing["status"], "message": "本条请求已记录，请勿重复提交"}
-                allowed, reason = self._check_access(kwargs["user_id"], kwargs.get("group_id", ""),
-                                                     natural_language=request["trigger"] == "natural_language")
+                allowed, reason = self._check_task_access(request, kwargs["user_id"], kwargs.get("group_id", ""))
                 if not allowed:
                     raise PlanError(reason)
-                limit = self.config.access.max_per_user_per_hour
-                if limit > 0 and journal.quota_used(kwargs["user_id"], time.time()) >= limit:
-                    raise PlanError("你本小时的生成次数已达上限（包含排队任务）")
+                if request["trigger"] == "natural_language":
+                    limit = self.config.natural_language.max_workflows_per_day
+                    if limit > 0 and journal.bot_quota_used(time.time()) >= limit:
+                        raise PlanError("Bot 今日工作流次数已达上限（包含排队任务）")
+                else:
+                    limit = self.config.access.max_per_user_per_hour
+                    if limit > 0 and journal.quota_used(kwargs["user_id"], time.time()) >= limit:
+                        raise PlanError("你本小时的生成次数已达上限（包含排队任务）")
                 records = journal.records()
                 blocked = sum(r["status"] in ADMIN_REVIEW_STATUSES for r in records)
                 active = sum(r["status"] in ACTIVE_STATUSES for r in records)
@@ -178,8 +187,7 @@ class TaskRuntimeMixin:
                         return
                 if record["status"] == "queued":
                     request = record["request"]
-                    allowed, reason = self._check_access(record["user_id"], record["group_id"],
-                                                         natural_language=request.get("trigger") == "natural_language")
+                    allowed, reason = self._check_task_access(request, record["user_id"], record["group_id"])
                     if not allowed:
                         raise PlanError(reason)
                     await self._announce_job_start(record)
@@ -196,8 +204,7 @@ class TaskRuntimeMixin:
                     # Cancellation or an access update during preparation must prevent submission.
                     if journal.get(task_id)["status"] == "cancelled":
                         return
-                    allowed, reason = self._check_access(record["user_id"], record["group_id"],
-                                                         natural_language=request.get("trigger") == "natural_language")
+                    allowed, reason = self._check_task_access(request, record["user_id"], record["group_id"])
                     if not allowed:
                         raise PlanError(reason)
                     if not await journal.update(task_id, status="submitting", submitted_at=time.time(),

@@ -3,6 +3,7 @@ import asyncio
 import json
 import time
 import unittest
+from unittest.mock import patch
 
 import test_upgrade as helpers
 from rh_generic_lib.media_context import assets_from_message
@@ -140,7 +141,7 @@ class MediaToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(r["success"] and r["status"] == "queued" for r in results), results)
             self.assertEqual(len({r["task_id"] for r in results}), 3, results)
             self.assertFalse(any(r.get("duplicate") for r in results), results)
-            self.assertEqual(self.p._task_journal.quota_used("11", time.time()), 3)
+            self.assertEqual(self.p._task_journal.bot_quota_used(time.time()), 3)
             self.client.submit.assert_not_awaited()
         await self.settled()
         self.assertEqual(self.client.submit.await_count, 3)
@@ -216,12 +217,12 @@ class MediaToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(r["success"] for r in results), results)
             self.assertEqual(len({r["task_id"] for r in results}), 1, results)
             self.assertEqual(sum(bool(r.get("duplicate")) for r in results), 2)
-            self.assertEqual(self.p._task_journal.quota_used("11", time.time()), 1)
+            self.assertEqual(self.p._task_journal.bot_quota_used(time.time()), 1)
         await self.settled()
         self.client.submit.assert_awaited_once()
 
-    async def test_distinct_same_message_requests_obey_hourly_quota(self):
-        self.set_config(helpers.workflow(), access={"max_per_user_per_hour": 1})
+    async def test_distinct_same_message_requests_obey_bot_daily_quota(self):
+        self.set_config(helpers.workflow(), natural_language={"max_workflows_per_day": 1})
         args = dict(user_id="11", stream_id="s1", group_id="22")
         async with self.p._limiter.slot():
             first = await self.p.handle_run_workflow("draw", "cat", **args)
@@ -229,7 +230,7 @@ class MediaToolTests(unittest.IsolatedAsyncioTestCase):
             retry = await self.p.handle_run_workflow("draw", "cat", **args)
             self.assertTrue(first["success"], first)
             self.assertFalse(second["success"], second)
-            self.assertIn("本小时的生成次数已达上限", second["message"])
+            self.assertIn("Bot 今日工作流次数已达上限", second["message"])
             self.assertTrue(retry.get("duplicate"), retry)
             self.assertEqual(retry["task_id"], first["task_id"])
             self.assertEqual(len(self.p._task_journal.records()), 1)
@@ -346,6 +347,26 @@ class MediaToolTests(unittest.IsolatedAsyncioTestCase):
         avatar = await self.p.handle_rh_media(source="avatar", user_id="11", stream_id="s1")
         self.assertEqual(avatar["count"], 1)
         self.assertEqual(avatar["media"][0]["media_id"], "avatar:11")
+
+    async def test_result_query_preserves_scope_order_and_media_expiry(self):
+        self.set_config(helpers.workflow(), natural_language={"recent_images": 0, "avatar_candidates": False,
+                        "max_candidates": 2, "media_ttl_seconds": 60, "image_ttl_seconds": 600})
+        journal = await self.p._load_task_journal()
+        now = time.time()
+        for task_id, uid, stream, age, kind in (("old", "11", "s1", 300, "image"),
+                ("other-user", "77", "s1", 2, "image"), ("new", "11", "s1", 5, "image"),
+                ("other-stream", "11", "s2", 1, "image"), ("expired", "11", "s1", 700, "image"),
+                ("old-video", "11", "s1", 300, "video")):
+            ext = "png" if kind == "image" else "mp4"
+            with patch("rh_generic_lib.task_journal.time.time", return_value=now - age):
+                await journal.update(task_id, status="success", delivery_status="sent", user_id=uid,
+                                     stream_id=stream, workflow="draw", outputs=[{
+                                         "url": f"https://example.test/{task_id}.{ext}", "type": kind}])
+        result = await self.p.handle_rh_media(source="result", user_id="11", stream_id="s1")
+        self.assertTrue(result["success"], result)
+        self.assertEqual([a["media_id"] for a in result["media"]], ["new:0", "old:0"])
+        recent = await self.p.handle_rh_media(source="recent", user_id="11", stream_id="s1")
+        self.assertEqual(recent["media"], [])
 
     async def test_automatic_selection_uses_overviews_and_selection_errors_do_too(self):
         first = helpers.workflow(parameter=True)
