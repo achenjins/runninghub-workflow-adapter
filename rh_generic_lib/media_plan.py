@@ -17,10 +17,6 @@ class PlanError(ValueError):
     """An input that must be corrected before uploading or submitting."""
 
 
-class ParameterError(PlanError):
-    """A parameter error needs its schema, not a fresh list of media candidates."""
-
-
 def input_key(node: Any) -> str:
     return str(getattr(node, "input_key", "") or "").strip() or f"{node.node_id}.{node.field_name}"
 
@@ -112,33 +108,33 @@ def workflow_card(workflow: Any) -> dict[str, Any]:
 def validate_parameter(node: Any, value: Any) -> str:
     key = input_key(node)
     if isinstance(value, (dict, list)) or value is None:
-        raise ParameterError(f"参数 {key} 必须是单个值")
+        raise PlanError(f"参数 {key} 必须是单个值")
     text = str(value).strip()
     if len(text) > 8000:
-        raise ParameterError(f"参数 {key} 过长")
+        raise PlanError(f"参数 {key} 过长")
     kind = getattr(node, "parameter_type", "string")
     if kind in ("integer", "number"):
         try:
             number = float(text)
         except (TypeError, ValueError):
-            raise ParameterError(f"参数 {key} 必须是数字") from None
+            raise PlanError(f"参数 {key} 必须是数字") from None
         if isinstance(value, bool) or not math.isfinite(number):
-            raise ParameterError(f"参数 {key} 必须是有限数字")
+            raise PlanError(f"参数 {key} 必须是有限数字")
         if kind == "integer":
             if not number.is_integer():
-                raise ParameterError(f"参数 {key} 必须是整数")
+                raise PlanError(f"参数 {key} 必须是整数")
             # Keep large seeds exact instead of round-tripping through float.
             try:
                 text = str(int(text))
             except ValueError:
-                raise ParameterError(f"参数 {key} 必须使用整数字面值") from None
+                raise PlanError(f"参数 {key} 必须使用整数字面值") from None
         for attr, failed in (("minimum", lambda x: number < x), ("maximum", lambda x: number > x)):
             bound = _optional_bound(node, attr)
             if bound is not None and failed(bound):
-                raise ParameterError(f"参数 {key} 超出允许范围：{getattr(node, 'minimum', None)}～{getattr(node, 'maximum', None)}")
+                raise PlanError(f"参数 {key} 超出允许范围：{getattr(node, 'minimum', None)}～{getattr(node, 'maximum', None)}")
     elif kind == "boolean":
         if text.lower() not in {"true", "false"}:
-            raise ParameterError(f"参数 {key} 必须是 true 或 false")
+            raise PlanError(f"参数 {key} 必须是 true 或 false")
         text = text.lower()
     choices = [str(x) for x in getattr(node, "choices", [])]
     if choices and text not in choices:
@@ -146,7 +142,7 @@ def validate_parameter(node: Any, value: Any) -> str:
         wanted = text.replace("：", ":").casefold()
         matched = [c for c in choices if wanted in (c.replace("：", ":").casefold(), short_choice(c).replace("：", ":").casefold())]
         if len(matched) != 1:
-            raise ParameterError(f"参数 {key} 可选值：{'、'.join(choices)}")
+            raise PlanError(f"参数 {key} 可选值：{'、'.join(choices)}")
         text = matched[0]
     return text
 
@@ -214,7 +210,7 @@ def bind_plan(workflow: Any, prompt: str, references: list[dict], parameters: di
     for key in parameters:
         if key not in nodes or resolve_value_type(nodes[key]) != "text":
             text_keys = "、".join(k for k, n in nodes.items() if resolve_value_type(n) == "text") or "无"
-            raise ParameterError(f"参数 {key} 不允许修改；可改参数：{text_keys}")
+            raise PlanError(f"参数 {key} 不允许修改；可改参数：{text_keys}")
 
     # Only a unique current/quoted asset and a unique empty slot may bind automatically.
     # Multiple roles must be selected explicitly, never assigned by arrival order.

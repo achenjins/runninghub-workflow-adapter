@@ -3,7 +3,7 @@
 # 配置键名保留兼容。实际配置文件已排除在版本控制之外。
 
 [plugin]
-config_version = "4.0.1"
+config_version = "1.3.2"
 
 [server]
 base_url = "https://www.runninghub.ai"

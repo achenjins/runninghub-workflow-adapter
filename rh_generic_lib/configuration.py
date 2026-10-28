@@ -72,7 +72,7 @@ class PluginMetaSection(PluginConfigBase):
     """由宿主管理。"""
     __ui_label__ = "插件状态"
 
-    config_version: str = _setting("4.0.1", "配置版本", "由插件维护。", ui={"hidden": True})
+    config_version: str = _setting("1.3.2", "配置版本", "由插件维护。", ui={"hidden": True})
     enabled: bool = _setting(True, "启用插件", "由宿主控制。", ui={"hidden": True})
 
 
